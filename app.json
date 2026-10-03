@@ -1,0 +1,62 @@
+{
+  "expo": {
+    "name": "ProdPulse",
+    "slug": "technico-management",
+    "owner": "prateek_katiyar612",
+    "version": "1.0.1",
+
+    "orientation": "portrait",
+
+    "icon": "./assets/logo.png",
+
+    "userInterfaceStyle": "light",
+
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.technicoindustries.prodpulse",
+      "buildNumber": "2",
+
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+
+    "android": {
+      "package": "com.technicoindustries.prodpulse",
+      "versionCode": 8,
+
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/logo.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/logo.png"
+      },
+
+      "predictiveBackGestureEnabled": false
+    },
+
+    "web": {
+      "favicon": "./assets/logo.png"
+    },
+
+    "extra": {
+      "eas": {
+        "projectId": "464bfb70-4868-4fba-85e0-d70fba2a3299"
+      }
+    },
+
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+
+    "updates": {
+      "url": "https://u.expo.dev/464bfb70-4868-4fba-85e0-d70fba2a3299"
+    },
+
+    "plugins": [
+      "expo-font",
+      "expo-sharing",
+      "expo-status-bar"
+    ]
+  }
+}
