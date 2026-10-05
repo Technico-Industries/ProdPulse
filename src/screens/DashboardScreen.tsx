@@ -16,6 +16,10 @@ import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { collection, getDocs, onSnapshot, query, where, orderBy, Timestamp, doc, updateDoc, serverTimestamp } from 'firebase/firestore';
 import { db } from '../services/firebase';
 import { useAuthStore } from '../stores/authStore';
+import { ADMIN_MENU_ITEMS } from '../constants/adminMenu';
+import AdminOverviewScreen from './AdminOverviewScreen';
+import { SUPERVISOR_MENU_ITEMS } from '../constants/supervisorMenu';
+import SupervisorOverviewScreen from './SupervisorOverviewScreen';
 
 type IconName = keyof typeof Ionicons.glyphMap;
 
@@ -28,107 +32,22 @@ interface OptionConfig {
   route: string;
 }
 
-const ADMIN_OPTIONS: OptionConfig[] = [
-  {
-    key: 'register-line',
-    title: 'Register New Line',
-    subtitle: 'Add a production line and its models',
-    icon: 'add-circle',
-    accent: '#3E7CB1',
-    route: 'RegisterLine',
-  },
-  {
-    key: 'manage-lines',
-    title: 'Manage Lines',
-    subtitle: 'Edit existing lines and models',
-    icon: 'create',
-    accent: '#4C9A6A',
-    route: 'ManageLines',
-  },
-  {
-    key: 'register-incharge',
-    title: 'Register New Incharge',
-    subtitle: 'Create a plant floor incharge account',
-    icon: 'person-add',
-    accent: '#F2A93B',
-    route: 'RegisterIncharge',
-  },
-  {
-    key: 'manage-incharge',
-    title: 'Manage Incharge',
-    subtitle: 'Edit accounts, status, and password resets',
-    icon: 'people',
-    accent: '#4C9A6A',
-    route: 'ManageIncharge',
-  },
-  {
-    key: 'generate-report',
-    title: 'Generate Report',
-    subtitle: 'Export production data for a line, shift, or date range',
-    icon: 'bar-chart',
-    accent: '#3E7CB1',
-    route: 'GenerateReport',
-  },
-  {
-    key: 'kpi-analysis',
-    title: 'KPI Analysis',
-    subtitle: 'Track efficiency, downtime, and rejection trends',
-    icon: 'analytics',
-    accent: '#F2A93B',
-    route: 'KPIAnalysis',
-  },
-  {
-    key: 'quality-analysis',
-    title: 'Quality Analysis',
-    subtitle: 'Rejections, near-miss, and poka-yoke trends across lines',
-    icon: 'shield-checkmark',
-    accent: '#4C9A6A',
-    route: 'QualityAnalysis',
-  },
-  {
-    key: 'prodpulse-ai',
-    title: 'ProdPulse AI',
-    subtitle: 'AI assistant for production insights and database queries',
-    icon: 'sparkles',
-    accent: '#8A5CF5',
-    route: 'AIAssistant',
-  },
-];
+// The Admin entries used to live here as dashboard cards. The Admin main
+// dashboard is now AdminOverviewScreen (a digital production overview), so
+// the same list is the hamburger drawer's menu instead — see
+// src/constants/adminMenu.ts and src/components/AppDrawer.tsx. Nothing
+// was deleted; only the entry point moved. Kept aliased here so the
+// `options` selection below stays unchanged for every other role.
+const ADMIN_OPTIONS: OptionConfig[] = ADMIN_MENU_ITEMS;
 
-const SUPERVISOR_OPTIONS: OptionConfig[] = [
-  {
-    key: 'record-production',
-    title: 'Record Production',
-    subtitle: 'Log output for this shift',
-    icon: 'construct',
-    accent: '#F2A93B',
-    route: 'RecordProduction',
-  },
-  {
-    key: 'material-order',
-    title: 'Material Order',
-    subtitle: 'Request materials for a line',
-    icon: 'cube',
-    accent: '#3E7CB1',
-    route: 'MaterialOrder',
-  },
-  {
-    key: 'kpi-report',
-    title: 'KPI Report',
-    subtitle: 'Your production performance at a glance',
-    icon: 'speedometer',
-    accent: '#4C9A6A',
-    route: 'KPIReport',
-  },
-  {
-    key: 'manage-manpower',
-    title: 'Manage Manpower',
-    subtitle: 'Register new operators, Delete operator ',
-    icon: 'people-circle',
-    accent: '#8A5CF5',
-    route: 'ManageManpower',
-  },
-];
+// The Supervisor entries used to live here as dashboard cards. The
+// Supervisor main dashboard is now SupervisorOverviewScreen (a digital
+// active-session overview), so the same list is that screen's hamburger
+// drawer instead — see src/constants/supervisorMenu.ts and
+// src/components/AppDrawer.tsx. Nothing was deleted; only the entry point
+// moved. Kept aliased here so the `options` selection below is unchanged
+// for every other role.
+const SUPERVISOR_OPTIONS: OptionConfig[] = SUPERVISOR_MENU_ITEMS;
 
 // Quality Control's own card list — the QualityControlPlaceholder "Coming
 // Soon" screen only shows when this list is empty (see the render check
@@ -1154,6 +1073,22 @@ export default function DashboardScreen() {
     : isQualityControl
     ? 'Quality Control Dashboard'
     : 'Supervisor Dashboard';
+
+  // Admin's main dashboard is the digital production overview — its own
+  // header (hamburger + ProdPulse + ADMIN) lives inside that screen, so it
+  // deliberately replaces this screen's generic header/card list rather
+  // than rendering below it. Every other role is untouched.
+  if (isAdmin) {
+    return <AdminOverviewScreen />;
+  }
+
+  // Plain Supervisor (assign 'Supervisor' or unset) gets the digital
+  // active-session overview, with its own header + hamburger drawer. The
+  // Technician, Restocker and Quality Control branches below are
+  // deliberately untouched — they keep the original header and card list.
+  if (!isTechnician && !isRestocker && !isQualityControl) {
+    return <SupervisorOverviewScreen />;
+  }
 
   return (
     <SafeAreaView style={styles.safeArea}>

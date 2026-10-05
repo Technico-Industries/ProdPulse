@@ -462,25 +462,24 @@ export default function GenerateReportScreen() {
     try {
       const fromTs = Timestamp.fromDate(new Date(`${fromDate}T00:00:00`));
       const toTs = Timestamp.fromDate(new Date(`${toDate}T23:59:59.999`));
-      // Only range-filter in Firestore (createdAt); everything else is filtered
-      // client-side below to avoid needing composite indexes.
-      // Exception: when a specific line is selected, lineId is pushed into
-      // the query too — this is the one added server-side constraint.
+      // Only range-filter in Firestore (createdAt); everything else —
+      // including a selected line — is filtered client-side below.
+      //
+      // selectedLineId used to be pushed into the query as an extra
+      // equality constraint, which needs a composite
+      // (lineId ASC, createdAt ASC) index this project doesn't define, so
+      // generating a report for one specific line failed with "The query
+      // requires an index". The client-side `filtered` pass below already
+      // re-checks `r.lineId !== selectedLineId`, so dropping it from the
+      // query changes nothing about the result — only which indexes
+      // Firestore needs.
       console.log('[GenerateReport] selectedLineId at query time:', selectedLineId);
-      const q = selectedLineId
-        ? query(
-            collection(db, 'productionRecords'),
-            where('createdAt', '>=', fromTs),
-            where('createdAt', '<=', toTs),
-            where('lineId', '==', selectedLineId),
-            orderBy('createdAt', 'asc')
-          )
-        : query(
-            collection(db, 'productionRecords'),
-            where('createdAt', '>=', fromTs),
-            where('createdAt', '<=', toTs),
-            orderBy('createdAt', 'asc')
-          );
+      const q = query(
+        collection(db, 'productionRecords'),
+        where('createdAt', '>=', fromTs),
+        where('createdAt', '<=', toTs),
+        orderBy('createdAt', 'asc')
+      );
 
       // TEMPORARY DEBUG LOGGING — confirms at runtime which collection and
       // filters this query actually used. Safe to remove once the
@@ -615,14 +614,21 @@ export default function GenerateReportScreen() {
       const fromTs = Timestamp.fromDate(new Date(`${fromDate}T00:00:00`));
       const toTs = Timestamp.fromDate(new Date(`${toDate}T23:59:59.999`));
 
-      // Exact Firestore lineId for this line, plus the currently selected
-      // From/To range — same composite pattern as the selectedLineId branch
-      // in handleGenerate above. If this needs a composite index Firestore
-      // doesn't already have, that error is surfaced as-is below rather
-      // than worked around.
+      // Range-filter on createdAt ONLY — lineId is applied client-side
+      // below, with the Shift/Part filters.
+      //
+      // This deliberately does NOT push `where('lineId', '==', lineId)`
+      // into the query. Combining an equality filter on one field with a
+      // range filter + orderBy on another requires a composite
+      // (lineId ASC, createdAt ASC) index, which this project doesn't
+      // define — Firestore rejected the query outright with "The query
+      // requires an index", so expanding a line's slot records always
+      // failed. Every other query on this screen already range-filters on
+      // createdAt alone and narrows the rest in memory for exactly this
+      // reason; this one is now consistent with them, and needs only the
+      // automatic single-field index on createdAt.
       const q = query(
         collection(db, 'productionRecords'),
-        where('lineId', '==', lineId),
         where('createdAt', '>=', fromTs),
         where('createdAt', '<=', toTs),
         orderBy('createdAt', 'asc')
@@ -679,9 +685,14 @@ export default function GenerateReportScreen() {
         };
       });
 
-      // lineId is already server-side filtered above; only the currently
-      // selected Shift and Part filters need applying client-side here.
+      // lineId is matched here rather than in the query (see the index
+      // note above), alongside the currently selected Shift and Part
+      // filters. Compared against the record's own raw lineId — the
+      // `resolved` pass only overwrites plant/workshop/division/lineName,
+      // never lineId itself, so this is the same value the old server-side
+      // equality filter used.
       const filtered = resolved.filter((r) => {
+        if (r.lineId !== lineId) return false;
         if (partFilter && !sameValue(r.partName, partFilter)) return false;
         if (shiftFilter !== 'All' && r.shift !== shiftFilter) return false;
         return true;
