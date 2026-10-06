@@ -20,6 +20,8 @@ import { ADMIN_MENU_ITEMS } from '../constants/adminMenu';
 import AdminOverviewScreen from './AdminOverviewScreen';
 import { SUPERVISOR_MENU_ITEMS } from '../constants/supervisorMenu';
 import SupervisorOverviewScreen from './SupervisorOverviewScreen';
+import { QUALITY_MENU_ITEMS } from '../constants/qualityMenu';
+import QualityOverviewScreen from './QualityOverviewScreen';
 
 type IconName = keyof typeof Ionicons.glyphMap;
 
@@ -49,28 +51,12 @@ const ADMIN_OPTIONS: OptionConfig[] = ADMIN_MENU_ITEMS;
 // for every other role.
 const SUPERVISOR_OPTIONS: OptionConfig[] = SUPERVISOR_MENU_ITEMS;
 
-// Quality Control's own card list — the QualityControlPlaceholder "Coming
-// Soon" screen only shows when this list is empty (see the render check
-// below), so adding more QC cards here later is the only change needed to
-// grow this dashboard further.
-const QUALITY_OPTIONS: OptionConfig[] = [
-  {
-    key: 'record-rejection',
-    title: 'Record Rejection',
-    subtitle: 'Log rejected parts for a line',
-    icon: 'close-circle',
-    accent: '#D64545',
-    route: 'RecordRejection',
-  },
-  {
-    key: 'quality-analysis',
-    title: 'Quality Analysis',
-    subtitle: 'Rejections, near-miss, and poka-yoke trends across lines',
-    icon: 'shield-checkmark',
-    accent: '#4C9A6A',
-    route: 'QualityAnalysis',
-  },
-];
+// The Quality Control entries used to live here as dashboard cards. The
+// Quality main dashboard is now QualityOverviewScreen (a digital quality
+// overview), so the same list is that screen's hamburger drawer instead —
+// see src/constants/qualityMenu.ts and src/components/AppDrawer.tsx.
+// Nothing was deleted; only the entry point moved.
+const QUALITY_OPTIONS: OptionConfig[] = QUALITY_MENU_ITEMS;
 
 function OptionCard({ config }: { config: OptionConfig }) {
   const navigation = useNavigation<any>();
@@ -1082,11 +1068,17 @@ export default function DashboardScreen() {
     return <AdminOverviewScreen />;
   }
 
+  // Quality Control gets the digital quality overview, with its own header
+  // + hamburger drawer (Record Rejection / Quality Analysis live there now).
+  if (isQualityControl) {
+    return <QualityOverviewScreen />;
+  }
+
   // Plain Supervisor (assign 'Supervisor' or unset) gets the digital
   // active-session overview, with its own header + hamburger drawer. The
-  // Technician, Restocker and Quality Control branches below are
-  // deliberately untouched — they keep the original header and card list.
-  if (!isTechnician && !isRestocker && !isQualityControl) {
+  // Technician and Restocker branches below are deliberately untouched —
+  // they keep the original header and lists.
+  if (!isTechnician && !isRestocker) {
     return <SupervisorOverviewScreen />;
   }
 

@@ -15,7 +15,6 @@
       "supportsTablet": true,
       "bundleIdentifier": "com.technicoindustries.prodpulse",
       "buildNumber": "2",
-
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
       }
@@ -23,7 +22,7 @@
 
     "android": {
       "package": "com.technicoindustries.prodpulse",
-      "versionCode": 8,
+      "versionCode": 18,
 
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
