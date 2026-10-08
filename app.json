@@ -22,7 +22,7 @@
 
     "android": {
       "package": "com.technicoindustries.prodpulse",
-      "versionCode": 18,
+      "versionCode": 21,
 
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
