@@ -47,19 +47,21 @@ import {
   useWindowDimensions,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useNavigation } from '@react-navigation/native';
 import { collection, getDocs, query, where } from 'firebase/firestore';
 import { PieChart } from 'react-native-gifted-charts';
 import { db } from '../services/firebase';
 import AppDrawer from '../components/AppDrawer';
 import { QUALITY_MENU_ITEMS } from '../constants/qualityMenu';
-import { PLANTS } from '../constants/lineOptions';
+import { PLANTS, WORKSHOPS, DIVISIONS } from '../constants/lineOptions';
 
 // ─── Types (QualityAnalysisScreen's RejectionRecord, same mapping) ────────────
 
 interface RejectionRecord {
   id: string;
   date: string | null;
+  shift: string | null;
   plant: string | null;
   workshop: string | null;
   division: string | null;
@@ -278,7 +280,96 @@ function DateRangeModal({
   );
 }
 
+// ─── Saved filters ────────────────────────────────────────────────────────────
+//
+// Report period + Plant/Shift/Workshop/Division survive a page reload / app
+// restart until the user changes them. Same AsyncStorage approach
+// (localStorage on web) as AdminOverviewScreen.
+
+const PREFS_KEY = 'prodpulse.qualityOverview.filters.v1';
+
+interface SavedFilters {
+  range: DateRange;
+  shift: string | null;
+  plant: string | null;
+  workshop: string | null;
+  division: string | null;
+}
+
 // ─── Small presentational pieces ──────────────────────────────────────────────
+
+// Compact dropdown for the dashboard filter row: a box showing the current
+// value that opens a list (with an "All" option) in a modal.
+function FilterDropdown({
+  label,
+  allLabel,
+  value,
+  options,
+  onChange,
+  formatOption = (o) => o,
+  disabled = false,
+}: {
+  label: string;
+  allLabel: string;
+  value: string | null;
+  options: readonly string[];
+  onChange: (next: string | null) => void;
+  formatOption?: (o: string) => string;
+  disabled?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const items: (string | null)[] = [null, ...options];
+  return (
+    <View style={styles.filterItem}>
+      <Text style={styles.filterLabel} numberOfLines={1}>{label.toUpperCase()}</Text>
+      <Pressable
+        onPress={() => setOpen(true)}
+        disabled={disabled}
+        style={({ pressed }) => [
+          styles.filterBox,
+          value !== null && styles.filterBoxActive,
+          disabled && styles.filterBoxDisabled,
+          pressed && styles.pressed,
+        ]}
+        accessibilityRole="button"
+        accessibilityLabel={`${label}: ${value ? formatOption(value) : allLabel}`}
+      >
+        <Text style={[styles.filterBoxText, value !== null && styles.filterBoxTextActive]} numberOfLines={1}>
+          {value ? formatOption(value) : 'All'}
+        </Text>
+        <Ionicons name="chevron-down" size={14} color="#8A96A3" />
+      </Pressable>
+
+      <Modal visible={open} transparent animationType="fade" onRequestClose={() => setOpen(false)}>
+        <Pressable style={styles.modalScrim} onPress={() => setOpen(false)}>
+          <Pressable style={styles.modalCard} onPress={(e) => e.stopPropagation()}>
+            <Text style={styles.modalTitle}>Select {label}</Text>
+            <ScrollView style={{ maxHeight: 360 }}>
+              {items.map((o) => {
+                const active = value === o;
+                return (
+                  <Pressable
+                    key={o ?? 'all'}
+                    onPress={() => {
+                      onChange(o);
+                      setOpen(false);
+                    }}
+                    style={({ pressed }) => [styles.filterOption, active && styles.filterOptionActive, pressed && styles.pressed]}
+                  >
+                    <Text style={[styles.filterOptionText, active && styles.filterBoxTextActive]}>
+                      {o ? formatOption(o) : allLabel}
+                    </Text>
+                    {active ? <Ionicons name="checkmark" size={16} color="#4C9A6A" /> : null}
+                  </Pressable>
+                );
+              })}
+            </ScrollView>
+          </Pressable>
+        </Pressable>
+      </Modal>
+    </View>
+  );
+}
 
 function KpiTile({ label, value, color, width }: { label: string; value: string; color?: string; width: string }) {
   return (
@@ -336,8 +427,49 @@ export default function QualityOverviewScreen() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [range, setRange] = useState<DateRange>({ from: todayStr(), to: todayStr() });
-  // Client-side, over the fetched set — the same Plant filter the report has.
+  // Client-side, over the fetched set — the same Shift/Plant/Workshop/Division
+  // filters the report has. Division only exists under the Assembly workshop.
+  const [shift, setShift] = useState<string | null>(null);
   const [plant, setPlant] = useState<string | null>(null);
+  const [workshop, setWorkshop] = useState<string | null>(null);
+  const [division, setDivision] = useState<string | null>(null);
+  const showDivision = !workshop || workshop.toLowerCase().includes('assembly');
+
+  // ── Restore saved filters once, on mount. The first fetch waits for this so
+  // it never loads today's data only to replace it with the saved period's.
+  const [prefsLoaded, setPrefsLoaded] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem(PREFS_KEY);
+        if (!cancelled && raw) {
+          const saved: Partial<SavedFilters> = JSON.parse(raw);
+          const r = saved.range;
+          if (r && isValidDateStr(r.from) && isValidDateStr(r.to) && r.from <= r.to) setRange({ from: r.from, to: r.to });
+          if (saved.shift === 'A' || saved.shift === 'B') setShift(saved.shift);
+          if (saved.plant && PLANTS.includes(saved.plant)) setPlant(saved.plant);
+          if (saved.workshop && WORKSHOPS.includes(saved.workshop)) setWorkshop(saved.workshop);
+          if (saved.division && DIVISIONS.includes(saved.division)) setDivision(saved.division);
+        }
+      } catch (e) {
+        console.warn('[QualityOverview] could not restore saved filters', e);
+      } finally {
+        if (!cancelled) setPrefsLoaded(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // ── Persist on every change (after the restore, so the initial defaults
+  // never overwrite what was stored).
+  useEffect(() => {
+    if (!prefsLoaded) return;
+    const payload: SavedFilters = { range, shift, plant, workshop, division };
+    AsyncStorage.setItem(PREFS_KEY, JSON.stringify(payload)).catch((e) =>
+      console.warn('[QualityOverview] could not save filters', e)
+    );
+  }, [prefsLoaded, range, shift, plant, workshop, division]);
 
   // null while loading, so a new period never shows the previous one's data.
   const [records, setRecords] = useState<RejectionRecord[] | null>(null);
@@ -365,6 +497,7 @@ export default function QualityOverviewScreen() {
           return {
             id: d.id,
             date: data.date ?? null,
+            shift: data.shift ?? null,
             plant: data.plant ?? null,
             workshop: data.workshop ?? null,
             division: data.division ?? null,
@@ -391,12 +524,20 @@ export default function QualityOverviewScreen() {
   }, []);
 
   useEffect(() => {
+    if (!prefsLoaded) return;
     fetchRange(range);
-  }, [range, fetchRange]);
+  }, [prefsLoaded, range, fetchRange]);
 
   const filtered = useMemo(
-    () => (records ?? []).filter((r) => !plant || sameStr(r.plant, plant)),
-    [records, plant]
+    () =>
+      (records ?? []).filter(
+        (r) =>
+          (!shift || r.shift === shift) &&
+          (!plant || sameStr(r.plant, plant)) &&
+          (!workshop || sameStr(r.workshop, workshop)) &&
+          (!division || sameStr(r.division, division))
+      ),
+    [records, shift, plant, workshop, division]
   );
 
   // ── Summary — the report's own summary cards.
@@ -490,6 +631,7 @@ export default function QualityOverviewScreen() {
   const donutRadius = isWide ? 104 : Math.max(78, Math.min(104, (width - 64) / 3.4));
 
   const isMultiDay = range.from !== range.to;
+  const activeFilters = [shift ? `Shift ${shift}` : null, plant, workshop, division].filter(Boolean) as string[];
   const isEmptyPeriod = !loading && !loadError && records !== null && records.length === 0;
   const isEmptyPlant = !loading && !loadError && records !== null && records.length > 0 && filtered.length === 0;
 
@@ -541,19 +683,34 @@ export default function QualityOverviewScreen() {
             )}
             {loading ? <ActivityIndicator size="small" color="#4C9A6A" style={{ marginLeft: 'auto' }} /> : null}
           </View>
-          <View style={styles.presetRow}>
-            {[null, ...PLANTS].map((p) => {
-              const active = plant === p;
-              return (
-                <Pressable
-                  key={p ?? 'all'}
-                  onPress={() => setPlant(p)}
-                  style={[styles.presetChip, active && styles.presetChipActive]}
-                >
-                  <Text style={[styles.presetChipText, active && styles.presetChipTextActive]}>{p ?? 'All plants'}</Text>
-                </Pressable>
-              );
-            })}
+          <View style={styles.filterRow}>
+            <FilterDropdown label="Plant" allLabel="All plants" value={plant} options={PLANTS} onChange={setPlant} />
+            <FilterDropdown
+              label="Shift"
+              allLabel="All shifts"
+              value={shift}
+              options={['A', 'B']}
+              formatOption={(o) => `Shift ${o}`}
+              onChange={setShift}
+            />
+            <FilterDropdown
+              label="Workshop"
+              allLabel="All workshops"
+              value={workshop}
+              options={WORKSHOPS}
+              onChange={(w) => {
+                setWorkshop(w);
+                if (w && !w.toLowerCase().includes('assembly')) setDivision(null);
+              }}
+            />
+            <FilterDropdown
+              label="Division"
+              allLabel="All divisions"
+              value={division}
+              options={DIVISIONS}
+              onChange={setDivision}
+              disabled={!showDivision}
+            />
           </View>
         </View>
 
@@ -591,7 +748,7 @@ export default function QualityOverviewScreen() {
             <Text style={styles.stateTitle}>NO QUALITY DATA</Text>
             <Text style={styles.stateText}>
               {isEmptyPlant
-                ? `${records?.length} rejection records exist for this period, but none for ${plant}.`
+                ? `${records?.length} rejection records exist for this period, but none match ${activeFilters.join(' · ')}.`
                 : 'No quality/rejection records were found for the selected period.'}
             </Text>
             <Text style={styles.stateDate}>{rangeLabel(range)}</Text>
@@ -610,10 +767,10 @@ export default function QualityOverviewScreen() {
                   <Ionicons name="calendar-outline" size={13} color="#8A96A3" />
                   <Text style={styles.heroChipText}>{rangeLabel(range)}</Text>
                 </View>
-                {plant ? (
+                {activeFilters.length ? (
                   <View style={[styles.heroChip, styles.heroChipScoped]}>
                     <Ionicons name="business-outline" size={13} color="#4C9A6A" />
-                    <Text style={[styles.heroChipText, { color: '#4C9A6A' }]}>{plant}</Text>
+                    <Text style={[styles.heroChipText, { color: '#4C9A6A' }]}>{activeFilters.join(' · ')}</Text>
                   </View>
                 ) : null}
               </View>
@@ -875,6 +1032,35 @@ const styles = StyleSheet.create({
   todayLink: { paddingVertical: 4 },
   todayLinkText: { color: '#3E7CB1', fontSize: 12.5, fontWeight: '700' },
   presetRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  filterRow: { flexDirection: 'row', gap: 8 },
+  filterItem: { flex: 1, minWidth: 0, gap: 4 },
+  filterLabel: { color: '#5C6670', fontSize: 10, fontWeight: '800', letterSpacing: 1 },
+  filterBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 4,
+    height: 38,
+    paddingHorizontal: 10,
+    borderWidth: 1,
+    borderColor: '#2C343C',
+    backgroundColor: '#1D2329',
+    borderRadius: 9,
+  },
+  filterBoxActive: { borderColor: '#4C9A6A', backgroundColor: '#4C9A6A22' },
+  filterBoxDisabled: { opacity: 0.4 },
+  filterBoxText: { flex: 1, minWidth: 0, color: '#8A96A3', fontSize: 12.5, fontWeight: '600' },
+  filterBoxTextActive: { color: '#4C9A6A' },
+  filterOption: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    borderRadius: 8,
+  },
+  filterOptionActive: { backgroundColor: '#4C9A6A18' },
+  filterOptionText: { color: '#ECEFF2', fontSize: 14 },
   presetChip: {
     borderWidth: 1,
     borderColor: '#2C343C',

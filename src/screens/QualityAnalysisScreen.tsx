@@ -46,11 +46,14 @@ type Line = {
 const REJECTION_STAGES = ['Visual', 'Process', 'Dimension'] as const;
 type RejectionStage = (typeof REJECTION_STAGES)[number];
 
+const SHIFTS = ['A', 'B'] as const;
+
 const RESPONSIBILITIES = ['Stamping', 'Plating', 'Assy', 'Welding', 'BOP', 'Bolt Sticking'] as const;
 
 interface RejectionRecord {
   id: string;
   date: string | null;
+  shift: string | null;
   plant: string | null;
   workshop: string | null;
   division: string | null;
@@ -294,6 +297,7 @@ export default function QualityAnalysisScreen() {
   // ── Filters
   const [fromDate, setFromDate] = useState(dateStrDaysAgo(30));
   const [toDate, setToDate] = useState(todayStr());
+  const [shift, setShift] = useState<string | null>(null);
   const [plant, setPlant] = useState<string | null>(null);
   const [workshop, setWorkshop] = useState<string | null>(null);
   const [division, setDivision] = useState<string | null>(null);
@@ -396,6 +400,7 @@ export default function QualityAnalysisScreen() {
         return {
           id: d.id,
           date: data.date ?? null,
+          shift: data.shift ?? null,
           plant: data.plant ?? null,
           workshop: data.workshop ?? null,
           division: data.division ?? null,
@@ -438,6 +443,7 @@ export default function QualityAnalysisScreen() {
         filters: {
           fromDate,
           toDate,
+          shift,
           plant,
           workshop,
           division,
@@ -461,6 +467,7 @@ export default function QualityAnalysisScreen() {
 
   const filteredRecords = useMemo(() => {
     return records.filter((r) => {
+      if (shift && r.shift !== shift) return false;
       if (plant && !sameStr(r.plant, plant)) return false;
       if (workshop && !sameStr(r.workshop, workshop)) return false;
       if (division && !sameStr(r.division, division)) return false;
@@ -470,7 +477,7 @@ export default function QualityAnalysisScreen() {
       if (responsibility && !sameStr(r.responsibility, responsibility)) return false;
       return true;
     });
-  }, [records, plant, workshop, division, selectedLineId, selectedPart, stage, responsibility]);
+  }, [records, shift, plant, workshop, division, selectedLineId, selectedPart, stage, responsibility]);
 
   const sortedRecords = useMemo(
     () => filteredRecords.slice().sort((a, b) => (b.createdAtMs ?? 0) - (a.createdAtMs ?? 0)),
@@ -559,6 +566,20 @@ export default function QualityAnalysisScreen() {
               placeholder="YYYY-MM-DD"
               placeholderTextColor="#5C6670"
             />
+          </View>
+        </View>
+
+        <View style={styles.field}>
+          <Text style={styles.fieldLabel}>SHIFT</Text>
+          <View style={styles.chipsRow}>
+            {SHIFTS.map((s) => {
+              const selected = shift === s;
+              return (
+                <Pressable key={s} onPress={() => setShift(selected ? null : s)} style={[styles.chip, selected && styles.chipSelected]}>
+                  <Text style={[styles.chipText, selected && styles.chipTextSelected]}>Shift {s}</Text>
+                </Pressable>
+              );
+            })}
           </View>
         </View>
 

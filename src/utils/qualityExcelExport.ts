@@ -5,6 +5,7 @@ import * as Sharing from 'expo-sharing';
 
 export interface QualityExcelRecord {
   date: string | null;
+  shift: string | null;
   plant: string | null;
   workshop: string | null;
   division: string | null;
@@ -30,6 +31,7 @@ export interface QualityExcelParetoRow {
 export interface QualityExcelFilters {
   fromDate: string;
   toDate: string;
+  shift: string | null;
   plant: string | null;
   workshop: string | null;
   division: string | null;
@@ -183,6 +185,7 @@ export async function exportQualityToExcel(params: {
   const summaryRows: CellValue[][] = [
     ['From Date', safe(filters.fromDate)],
     ['To Date', safe(filters.toDate)],
+    ['Shift', safe(filters.shift)],
     ['Plant', safe(filters.plant)],
     ['Workshop', safe(filters.workshop)],
     ['Division', safe(filters.division)],
@@ -198,6 +201,7 @@ export async function exportQualityToExcel(params: {
   ];
   const detailRows: CellValue[][] = records.map((record) => [
     safe(record.date),
+    safe(record.shift),
     safe(record.plant),
     safe(record.workshop),
     safe(record.division),
@@ -236,10 +240,10 @@ export async function exportQualityToExcel(params: {
     buildTableSheet(
       'DETAILED REJECTION RECORDS',
       dateRange,
-      ['Date', 'Plant', 'Workshop', 'Division', 'Line', 'Part', 'Stage', 'Defect', 'Rejection Qty', 'Responsibility', 'Remarks', 'Reported By', 'Created At'],
+      ['Date', 'Shift', 'Plant', 'Workshop', 'Division', 'Line', 'Part', 'Stage', 'Defect', 'Rejection Qty', 'Responsibility', 'Remarks', 'Reported By', 'Created At'],
       detailRows,
-      [14, 16, 18, 16, 18, 22, 14, 22, 15, 18, 40, 24, 26],
-      { 8: '#,##0' },
+      [14, 10, 16, 18, 16, 18, 22, 14, 22, 15, 18, 40, 24, 26],
+      { 9: '#,##0' },
     ),
     'DETAILED RECORDS',
   );
