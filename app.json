@@ -1,57 +1,45 @@
 {
   "expo": {
     "name": "ProdPulse",
-    "slug": "technico-management",
-    "owner": "prateek_katiyar612",
+    "slug": "technico-industries",
+    "owner": "technico-industriess-team",
     "version": "1.0.1",
-
     "orientation": "portrait",
-
     "icon": "./assets/logo.png",
-
     "userInterfaceStyle": "light",
-
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.technicoindustries.prodpulse",
+      "bundleIdentifier": "com.technicoindustries.prodpulse2",
       "buildNumber": "2",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
       }
     },
-
     "android": {
-      "package": "com.technicoindustries.prodpulse",
+      "package": "com.technicoindustries.prodpulse2",
       "versionCode": 21,
-
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/logo.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/logo.png"
       },
-
       "predictiveBackGestureEnabled": false
     },
-
     "web": {
       "favicon": "./assets/logo.png"
     },
-
     "extra": {
       "eas": {
-        "projectId": "464bfb70-4868-4fba-85e0-d70fba2a3299"
+        "projectId": "861b5f9f-be83-4146-aa7c-7e95158f6f02"
       }
     },
-
     "runtimeVersion": {
       "policy": "appVersion"
     },
-
     "updates": {
-      "url": "https://u.expo.dev/464bfb70-4868-4fba-85e0-d70fba2a3299"
+      "url": "https://u.expo.dev/861b5f9f-be83-4146-aa7c-7e95158f6f02"
     },
-
     "plugins": [
       "expo-font",
       "expo-sharing",

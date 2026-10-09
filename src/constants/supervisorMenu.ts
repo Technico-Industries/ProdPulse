@@ -23,6 +23,14 @@ export const SUPERVISOR_MENU_ITEMS: AdminMenuItem[] = [
     route: 'RecordProduction',
   },
   {
+    key: 'record-rejection',
+    title: 'Record Rejection',
+    subtitle: 'Log rejected parts for a line',
+    icon: 'close-circle',
+    accent: '#D64545',
+    route: 'RecordRejection',
+  },
+  {
     key: 'material-order',
     title: 'Material Order',
     subtitle: 'Request materials for a line',
