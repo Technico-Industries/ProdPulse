@@ -13,7 +13,7 @@
 // listed with a −/+ stepper, and one Save writes one record per type with a
 // quantity > 0 in a single batch. Each record's `stage` is the type's
 // automatic category, or the user's Visual/Process pick for FOULING. The
-// already-recorded total per type for the current date/line/part is read
+// already-recorded total per type for the current date/shift/line/part is read
 // back and shown separately from the quantity being entered.
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -65,6 +65,9 @@ const DROPDOWN_TITLES: Record<DropdownKind, string> = {
   line: 'Select Line',
   part: 'Select Part',
 };
+
+const SHIFTS = ['A', 'B'] as const;
+type Shift = (typeof SHIFTS)[number];
 
 // Same rule RecordProductionScreen uses to decide when Division applies.
 function isAssemblyWorkshop(w: string | null) {
@@ -236,6 +239,7 @@ export default function RecordRejectionScreen() {
 
   // ── Rejection-specific fields
   const [date, setDate] = useState(todayKey());
+  const [shift, setShift] = useState<Shift | null>(null);
   // Quantity being entered NOW per type (not the historical total), and the
   // Visual/Process pick for types without an automatic category (FOULING),
   // keyed by type name so one type's pick can never apply to another.
@@ -387,13 +391,13 @@ export default function RecordRejectionScreen() {
   }, [visibleTypes, entryQty]);
 
   // ── Already-recorded totals: SUM(rejectionQty) for the exact current context
-  // (date + plant + workshop + division + line + part). One Firestore query
+  // (date + shift + plant + workshop + division + line + part). One Firestore query
   // on equality filters only (no composite index needed), the rest of the
   // context is matched locally, then aggregated into { defect: qty }.
   const selectedPartName =
     selectedLine && selectedPartIndex != null ? selectedLine.parts?.[selectedPartIndex]?.name ?? null : null;
   const contextComplete =
-    isValidDateKey(date) && !!plant && !!workshop && (!isAssemblyWorkshop(workshop) || !!division) &&
+    isValidDateKey(date) && !!shift && !!plant && !!workshop && (!isAssemblyWorkshop(workshop) || !!division) &&
     !!selectedLineId && !!selectedPartName;
 
   const [counts, setCounts] = useState<Record<string, number> | null>(null);
@@ -429,7 +433,7 @@ export default function RecordRejectionScreen() {
           snap.docs
             .map((d) => d.data() as any)
             .filter((data) =>
-              data.plant === plant && data.workshop === workshop && (data.division ?? null) === (division ?? null)
+              data.shift === shift && data.plant === plant && data.workshop === workshop && (data.division ?? null) === (division ?? null)
             )
         );
         if (countsRequestId.current === requestId) setCounts(totals);
@@ -440,15 +444,15 @@ export default function RecordRejectionScreen() {
         if (countsRequestId.current === requestId) setCountsLoading(false);
       }
     })();
-  }, [contextComplete, date, plant, workshop, division, selectedLineId, selectedPartName, countsVersion]);
+  }, [contextComplete, date, shift, plant, workshop, division, selectedLineId, selectedPartName, countsVersion]);
 
   const countsNote = countsError
     ? 'Could not load already-recorded totals.'
     : !contextComplete
-      ? 'Select date, location, line and part to start entering rejections.'
+      ? 'Select date, shift, location, line and part to start entering rejections.'
       : null;
 
-  // After a successful save only the entry sheet resets — date, location,
+  // After a successful save only the entry sheet resets — date, shift, location,
   // line and part stay selected so the inspector can log the next batch for
   // the same part straight away.
   function resetRejectionFields() {
@@ -458,6 +462,7 @@ export default function RecordRejectionScreen() {
 
   async function handleSave() {
     if (!isValidDateKey(date)) { notify('Invalid date', 'Enter the date as YYYY-MM-DD.'); return; }
+    if (!shift) { notify('Missing field', 'Select a shift.'); return; }
     if (!plant) { notify('Missing field', 'Select a plant.'); return; }
     if (!workshop) { notify('Missing field', 'Select a workshop.'); return; }
     if (isAssemblyWorkshop(workshop) && !division) { notify('Missing field', 'Select a division.'); return; }
@@ -479,6 +484,7 @@ export default function RecordRejectionScreen() {
       const batch = writeBatch(db);
       const shared = {
         date,
+        shift,
         plant,
         workshop,
         division: division ?? null,
@@ -522,7 +528,7 @@ export default function RecordRejectionScreen() {
         <Text style={styles.title}>Record Rejection</Text>
         <Text style={styles.subtitle}>Log rejected parts for a line</Text>
 
-        <Text style={styles.sectionLabel}>DATE</Text>
+        <Text style={styles.sectionLabel}>DATE & SHIFT</Text>
         <View style={styles.field}>
           <Text style={styles.label}>Date</Text>
           <TextInput
@@ -533,6 +539,24 @@ export default function RecordRejectionScreen() {
             placeholderTextColor="#5C6670"
             autoCapitalize="none"
           />
+        </View>
+        <View style={styles.field}>
+          <Text style={styles.label}>Shift</Text>
+          <View style={styles.chipsRow}>
+            {SHIFTS.map((s) => (
+              <Pressable
+                key={s}
+                onPress={() => {
+                  if (s !== shift) clearEntries();
+                  setShift(s);
+                }}
+                style={[styles.chip, shift === s && styles.chipSelected]}
+                accessibilityLabel={`Shift ${s}`}
+              >
+                <Text style={[styles.chipText, shift === s && styles.chipTextSelected]}>Shift {s}</Text>
+              </Pressable>
+            ))}
+          </View>
         </View>
 
         <Text style={[styles.sectionLabel, { marginTop: 8 }]}>LOCATION</Text>
