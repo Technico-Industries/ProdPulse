@@ -80,20 +80,18 @@ export function sumQtyByRejectionType(records: Iterable<{ defect?: unknown; reje
   return totals;
 }
 
-export type RejectionEntry = { type: RejectionType; qty: number; stage: RejectionCategory; responsibility: string };
+export type RejectionEntry = { type: RejectionType; qty: number; stage: RejectionCategory };
 
 /**
- * Turns the entry sheet (qty, manual category pick and responsibility per
- * type) into one entry per type with qty > 0, in sheet order. Zero rows are
+ * Turns the entry sheet (qty and manual category pick per type) into one
+ * entry per type with qty > 0, in sheet order. Zero rows are
  * dropped. A manual pick only applies to its own type and must be one of that
  * type's allowed categories. Returns an error message instead when a non-zero
- * type is missing its category (FOULING) or responsibility, or when nothing
- * was entered.
+ * type is missing its category (FOULING), or when nothing was entered.
  */
 export function buildRejectionEntries(
   qtyByType: Record<string, number>,
-  manualPicks: Record<string, RejectionCategory | null>,
-  responsibilities: Record<string, string | null>
+  manualPicks: Record<string, RejectionCategory | null>
 ): { entries: RejectionEntry[]; error: null } | { entries: null; error: string } {
   const entries: RejectionEntry[] = [];
   for (const type of REJECTION_TYPES) {
@@ -102,9 +100,7 @@ export function buildRejectionEntries(
     const pick = manualPicks[type.name] ?? null;
     const stage = type.category ?? (pick && type.manualCategories?.includes(pick) ? pick : null);
     if (!stage) return { entries: null, error: `Please select Visual or Process for ${type.name}.` };
-    const responsibility = responsibilities[type.name] ?? null;
-    if (!responsibility) return { entries: null, error: `Select a responsibility for ${type.name}.` };
-    entries.push({ type, qty, stage, responsibility });
+    entries.push({ type, qty, stage });
   }
   if (entries.length === 0) return { entries: null, error: 'Enter at least one rejection quantity.' };
   return { entries, error: null };

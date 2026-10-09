@@ -55,7 +55,7 @@ type Line = {
   parts?: { name: string; cycleTimeSeconds: number }[];
 };
 
-type DropdownKind = 'plant' | 'workshop' | 'division' | 'line' | 'part' | 'responsibility';
+type DropdownKind = 'plant' | 'workshop' | 'division' | 'line' | 'part';
 type DropdownOption = { key: string; label: string; sublabel?: string };
 
 const DROPDOWN_TITLES: Record<DropdownKind, string> = {
@@ -64,10 +64,7 @@ const DROPDOWN_TITLES: Record<DropdownKind, string> = {
   division: 'Select Division',
   line: 'Select Line',
   part: 'Select Part',
-  responsibility: 'Select Responsibility',
 };
-
-const RESPONSIBILITIES = ['Stamping', 'Plating', 'Assy', 'Welding', 'BOP', 'Bolt Sticking'] as const;
 
 // Same rule RecordProductionScreen uses to decide when Division applies.
 function isAssemblyWorkshop(w: string | null) {
@@ -133,30 +130,25 @@ function PickerBox({
 
 // ─── One line of the rejection entry sheet: type + category on the left,
 // −/qty/+ stepper on the right. Wraps to two lines on narrow screens rather
-// than overflowing. Once a type has a quantity it shows its own
-// Responsibility picker; types without an automatic category (FOULING) also
-// get a Visual/Process chip row. Memoised so tapping +/− on one row
+// than overflowing. Types without an automatic category (FOULING) get a
+// Visual/Process chip row. Memoised so tapping +/− on one row
 // doesn't re-render the other 34.
 const RejectionEntryRow = React.memo(function RejectionEntryRow({
   type,
   qty,
   manualCategory,
-  responsibility,
   recordedQty,
   disabled,
   onChangeQty,
   onSelectCategory,
-  onPickResponsibility,
 }: {
   type: RejectionType;
   qty: number;
   manualCategory: RejectionCategory | null;
-  responsibility: string | null;
   recordedQty: number | null;
   disabled: boolean;
   onChangeQty: (name: string, delta: number) => void;
   onSelectCategory: (name: string, category: RejectionCategory) => void;
-  onPickResponsibility: (name: string) => void;
 }) {
   const isManual = type.category === null;
   const missingCategory = isManual && qty > 0 && !manualCategory;
@@ -220,23 +212,6 @@ const RejectionEntryRow = React.memo(function RejectionEntryRow({
           ) : null}
         </View>
       ) : null}
-
-      {qty > 0 ? (
-        <View style={styles.rowResponsibility}>
-          <Text style={styles.label}>Responsibility *</Text>
-          <Pressable
-            onPress={() => onPickResponsibility(type.name)}
-            disabled={disabled}
-            style={[styles.rowPickerBox, !responsibility && styles.rowPickerBoxEmpty]}
-            accessibilityLabel={`Responsibility for ${type.name}`}
-          >
-            <Text style={[styles.pickerBoxText, !responsibility && styles.rowPickerPlaceholder]} numberOfLines={1}>
-              {responsibility || 'Select responsibility'}
-            </Text>
-            <Ionicons name="chevron-down" size={16} color="#8A96A3" />
-          </Pressable>
-        </View>
-      ) : null}
     </View>
   );
 });
@@ -266,10 +241,6 @@ export default function RecordRejectionScreen() {
   // keyed by type name so one type's pick can never apply to another.
   const [entryQty, setEntryQty] = useState<Record<string, number>>(emptyEntryQty);
   const [manualCategories, setManualCategories] = useState<Record<string, RejectionCategory | null>>({});
-  // Responsibility is chosen per rejection type; responsibilityTarget is the
-  // type whose picker is open in the shared dropdown modal.
-  const [responsibilities, setResponsibilities] = useState<Record<string, string | null>>({});
-  const [responsibilityTarget, setResponsibilityTarget] = useState<string | null>(null);
   const [remarks, setRemarks] = useState('');
 
   const [activeDropdown, setActiveDropdown] = useState<DropdownKind | null>(null);
@@ -338,8 +309,6 @@ export default function RecordRejectionScreen() {
         }));
       case 'part':
         return (selectedLine?.parts ?? []).map((p, i) => ({ key: String(i), label: p.name }));
-      case 'responsibility':
-        return RESPONSIBILITIES.map((r) => ({ key: r, label: r }));
       default:
         return [];
     }
@@ -352,21 +321,19 @@ export default function RecordRejectionScreen() {
       case 'division': return division ?? '';
       case 'line': return selectedLineId ?? '';
       case 'part': return selectedPartIndex != null ? String(selectedPartIndex) : '';
-      case 'responsibility': return (responsibilityTarget && responsibilities[responsibilityTarget]) ?? '';
       default: return '';
     }
-  }, [activeDropdown, plant, workshop, division, selectedLineId, selectedPartIndex, responsibilityTarget, responsibilities]);
+  }, [activeDropdown, plant, workshop, division, selectedLineId, selectedPartIndex]);
 
   // Entries belong to one location/line/part — any change there discards
   // them so they can't be saved against a different part by accident.
   function clearEntries() {
     setEntryQty(emptyEntryQty());
     setManualCategories({});
-    setResponsibilities({});
   }
 
   function handleDropdownSelect(key: string) {
-    if (activeDropdown && activeDropdown !== 'responsibility' && key !== dropdownSelectedKey) clearEntries();
+    if (activeDropdown && key !== dropdownSelectedKey) clearEntries();
     switch (activeDropdown) {
       case 'plant':
         setPlant(key);
@@ -388,12 +355,6 @@ export default function RecordRejectionScreen() {
       case 'part':
         setSelectedPartIndex(Number(key));
         break;
-      case 'responsibility':
-        if (responsibilityTarget) {
-          const target = responsibilityTarget;
-          setResponsibilities((prev) => ({ ...prev, [target]: key }));
-        }
-        break;
     }
     setActiveDropdown(null);
   }
@@ -401,11 +362,6 @@ export default function RecordRejectionScreen() {
   // ── Entry sheet handlers (stable so memoised rows don't re-render).
   const handleChangeQty = useCallback((name: string, delta: number) => {
     setEntryQty((prev) => ({ ...prev, [name]: Math.max(0, (prev[name] ?? 0) + delta) }));
-  }, []);
-
-  const handlePickResponsibility = useCallback((name: string) => {
-    setResponsibilityTarget(name);
-    setActiveDropdown('responsibility');
   }, []);
 
   const handleSelectCategory = useCallback((name: string, category: RejectionCategory) => {
@@ -510,7 +466,7 @@ export default function RecordRejectionScreen() {
     if (!part) { notify('Missing field', 'Select a part.'); return; }
 
     // One entry per type with qty > 0 — never one per tap.
-    const built = buildRejectionEntries(entryQty, manualCategories, responsibilities);
+    const built = buildRejectionEntries(entryQty, manualCategories);
     if (built.error !== null) {
       notify('Cannot save', built.error); return;
     }
@@ -538,7 +494,6 @@ export default function RecordRejectionScreen() {
           stage: e.stage,
           rejectionQty: e.qty,
           defect: e.type.name,
-          responsibility: e.responsibility,
           createdAt: serverTimestamp(),
         });
       }
@@ -673,12 +628,10 @@ export default function RecordRejectionScreen() {
             type={t}
             qty={entryQty[t.name] ?? 0}
             manualCategory={manualCategories[t.name] ?? null}
-            responsibility={responsibilities[t.name] ?? null}
             recordedQty={counts ? counts[t.name] ?? 0 : null}
             disabled={!contextComplete || saving}
             onChangeQty={handleChangeQty}
             onSelectCategory={handleSelectCategory}
-            onPickResponsibility={handlePickResponsibility}
           />
         ))}
 
@@ -721,9 +674,6 @@ export default function RecordRejectionScreen() {
         <View style={styles.modalOverlay}>
           <View style={styles.modalCard}>
             <Text style={styles.modalTitle}>{activeDropdown ? DROPDOWN_TITLES[activeDropdown] : ''}</Text>
-            {activeDropdown === 'responsibility' && responsibilityTarget ? (
-              <Text style={[styles.muted, { marginBottom: 8 }]}>For {responsibilityTarget}</Text>
-            ) : null}
             <ScrollView contentContainerStyle={styles.modalScroll}>
               {dropdownOptions.length === 0 ? (
                 <Text style={styles.muted}>No options available</Text>
@@ -818,13 +768,6 @@ const styles = StyleSheet.create({
   stepperBtnDisabled: { opacity: 0.35 },
   stepperValue: { minWidth: 40, textAlign: 'center', color: '#8A96A3', fontSize: 18, fontWeight: '800', fontVariant: ['tabular-nums'] },
   stepperValueActive: { color: '#F2A93B' },
-  rowResponsibility: { marginTop: 10, paddingTop: 10, borderTopWidth: 1, borderTopColor: '#2C343C' },
-  rowPickerBox: {
-    backgroundColor: '#14181C', borderWidth: 1, borderColor: '#2C343C', borderRadius: 10,
-    paddingHorizontal: 12, height: 44, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-  },
-  rowPickerBoxEmpty: { borderColor: '#F2A93B66' },
-  rowPickerPlaceholder: { color: '#F2A93B' },
   manualCategoryBlock: { marginTop: 10, paddingTop: 10, borderTopWidth: 1, borderTopColor: '#2C343C' },
   totalBar: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: '#1D2329', borderWidth: 1, borderColor: '#2C343C', borderRadius: 10, paddingHorizontal: 14, paddingVertical: 12, marginTop: 4 },
   totalBarLabel: { color: '#ECEFF2', fontSize: 14, fontWeight: '700' },
