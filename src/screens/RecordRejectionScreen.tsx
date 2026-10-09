@@ -31,6 +31,7 @@ import {
   Platform,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useNavigation } from '@react-navigation/native';
 import { collection, doc, getDocs, serverTimestamp, query, where, writeBatch } from 'firebase/firestore';
 import { db } from '../services/firebase';
@@ -68,6 +69,25 @@ const DROPDOWN_TITLES: Record<DropdownKind, string> = {
 
 const SHIFTS = ['A', 'B'] as const;
 type Shift = (typeof SHIFTS)[number];
+
+// ─── Saved form ───────────────────────────────────────────────────────────
+//
+// Date, shift, location, line and remarks survive a page reload / app
+// restart and a save, so the inspector lands back on the form as they left
+// it. Part and the rejection quantities are deliberately not kept. Same
+// AsyncStorage approach (localStorage on web) as AdminOverviewScreen.
+
+const PREFS_KEY = 'prodpulse.recordRejection.form.v1';
+
+interface SavedForm {
+  date: string;
+  shift: Shift | null;
+  plant: string | null;
+  workshop: string | null;
+  division: string | null;
+  lineId: string | null;
+  remarks: string;
+}
 
 // Same rule RecordProductionScreen uses to decide when Division applies.
 function isAssemblyWorkshop(w: string | null) {
@@ -132,7 +152,7 @@ function PickerBox({
 }
 
 // ─── One line of the rejection entry sheet: type + category on the left,
-// −/qty/+ stepper on the right. Wraps to two lines on narrow screens rather
+// −/qty/+ stepper on the right (the qty box can also be typed into). Wraps to two lines on narrow screens rather
 // than overflowing. Types without an automatic category (FOULING) get a
 // Visual/Process chip row. Memoised so tapping +/− on one row
 // doesn't re-render the other 34.
@@ -143,6 +163,7 @@ const RejectionEntryRow = React.memo(function RejectionEntryRow({
   recordedQty,
   disabled,
   onChangeQty,
+  onSetQty,
   onSelectCategory,
 }: {
   type: RejectionType;
@@ -151,6 +172,7 @@ const RejectionEntryRow = React.memo(function RejectionEntryRow({
   recordedQty: number | null;
   disabled: boolean;
   onChangeQty: (name: string, delta: number) => void;
+  onSetQty: (name: string, qty: number) => void;
   onSelectCategory: (name: string, category: RejectionCategory) => void;
 }) {
   const isManual = type.category === null;
@@ -182,7 +204,19 @@ const RejectionEntryRow = React.memo(function RejectionEntryRow({
           >
             <Ionicons name="remove" size={22} color="#ECEFF2" />
           </Pressable>
-          <Text style={[styles.stepperValue, qty > 0 && styles.stepperValueActive]}>{qty}</Text>
+          <TextInput
+            style={[styles.stepperValue, styles.stepperInput, qty > 0 && styles.stepperValueActive]}
+            value={String(qty)}
+            onChangeText={(text) => {
+              const digits = text.replace(/[^0-9]/g, '');
+              onSetQty(type.name, digits ? parseInt(digits, 10) : 0);
+            }}
+            editable={!disabled}
+            keyboardType="number-pad"
+            selectTextOnFocus
+            maxLength={5}
+            accessibilityLabel={`${type.name} quantity`}
+          />
           <Pressable
             onPress={() => onChangeQty(type.name, 1)}
             disabled={disabled}
@@ -249,6 +283,49 @@ export default function RecordRejectionScreen() {
 
   const [activeDropdown, setActiveDropdown] = useState<DropdownKind | null>(null);
   const [saving, setSaving] = useState(false);
+
+  // ── Restore the saved form once, on mount. Setters are called directly
+  // (not via handleDropdownSelect) so the cascade resets don't wipe it.
+  const [prefsLoaded, setPrefsLoaded] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem(PREFS_KEY);
+        if (!cancelled && raw) {
+          const saved: Partial<SavedForm> = JSON.parse(raw);
+          if (typeof saved.date === 'string' && isValidDateKey(saved.date)) setDate(saved.date);
+          if (saved.shift && SHIFTS.includes(saved.shift)) setShift(saved.shift);
+          if (saved.plant && PLANTS.includes(saved.plant)) setPlant(saved.plant);
+          if (saved.workshop && WORKSHOPS.includes(saved.workshop)) setWorkshop(saved.workshop);
+          if (saved.division && DIVISIONS.includes(saved.division)) setDivision(saved.division);
+          if (typeof saved.lineId === 'string') setSelectedLineId(saved.lineId);
+          if (typeof saved.remarks === 'string') setRemarks(saved.remarks);
+        }
+      } catch (e) {
+        console.warn('[RecordRejection] could not restore saved form', e);
+      } finally {
+        if (!cancelled) setPrefsLoaded(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // ── Persist on every change (after the restore, so the initial defaults
+  // never overwrite what was stored).
+  useEffect(() => {
+    if (!prefsLoaded) return;
+    const payload: SavedForm = { date, shift, plant, workshop, division, lineId: selectedLineId, remarks };
+    AsyncStorage.setItem(PREFS_KEY, JSON.stringify(payload)).catch((e) =>
+      console.warn('[RecordRejection] could not save form', e)
+    );
+  }, [prefsLoaded, date, shift, plant, workshop, division, selectedLineId, remarks]);
+
+  // A restored line that no longer exists is dropped once lines have loaded.
+  useEffect(() => {
+    if (!prefsLoaded || loadingLines || !selectedLineId) return;
+    if (!allLines.some((l) => l.id === selectedLineId)) setSelectedLineId(null);
+  }, [prefsLoaded, loadingLines, allLines, selectedLineId]);
 
   // Same productionLines collection and field-fallback shape RecordProductionScreen
   // reads — read-only here, nothing about it is modified.
@@ -368,6 +445,10 @@ export default function RecordRejectionScreen() {
     setEntryQty((prev) => ({ ...prev, [name]: Math.max(0, (prev[name] ?? 0) + delta) }));
   }, []);
 
+  const handleSetQty = useCallback((name: string, qty: number) => {
+    setEntryQty((prev) => ({ ...prev, [name]: Math.max(0, qty) }));
+  }, []);
+
   const handleSelectCategory = useCallback((name: string, category: RejectionCategory) => {
     setManualCategories((prev) => ({ ...prev, [name]: category }));
   }, []);
@@ -452,12 +533,12 @@ export default function RecordRejectionScreen() {
       ? 'Select date, shift, location, line and part to start entering rejections.'
       : null;
 
-  // After a successful save only the entry sheet resets — date, shift, location,
-  // line and part stay selected so the inspector can log the next batch for
-  // the same part straight away.
+  // After a successful save only the quantities and part reset — date, shift,
+  // location, line and remarks stay so the inspector can pick the next part
+  // and log straight away.
   function resetRejectionFields() {
     clearEntries();
-    setRemarks('');
+    setSelectedPartIndex(null);
   }
 
   async function handleSave() {
@@ -655,6 +736,7 @@ export default function RecordRejectionScreen() {
             recordedQty={counts ? counts[t.name] ?? 0 : null}
             disabled={!contextComplete || saving}
             onChangeQty={handleChangeQty}
+            onSetQty={handleSetQty}
             onSelectCategory={handleSelectCategory}
           />
         ))}
@@ -792,6 +874,10 @@ const styles = StyleSheet.create({
   stepperBtnDisabled: { opacity: 0.35 },
   stepperValue: { minWidth: 40, textAlign: 'center', color: '#8A96A3', fontSize: 18, fontWeight: '800', fontVariant: ['tabular-nums'] },
   stepperValueActive: { color: '#F2A93B' },
+  stepperInput: {
+    minWidth: 56, height: 40, paddingVertical: 0, paddingHorizontal: 6, borderWidth: 1, borderColor: '#2C343C',
+    borderRadius: 8, backgroundColor: '#14181C',
+  },
   manualCategoryBlock: { marginTop: 10, paddingTop: 10, borderTopWidth: 1, borderTopColor: '#2C343C' },
   totalBar: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: '#1D2329', borderWidth: 1, borderColor: '#2C343C', borderRadius: 10, paddingHorizontal: 14, paddingVertical: 12, marginTop: 4 },
   totalBarLabel: { color: '#ECEFF2', fontSize: 14, fontWeight: '700' },
