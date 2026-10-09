@@ -9,14 +9,14 @@
     "userInterfaceStyle": "light",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.technicoindustries.prodpulse2",
+      "bundleIdentifier": "com.technicoindustries.prodpulse",
       "buildNumber": "2",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
-      "package": "com.technicoindustries.prodpulse2",
+      "package": "com.technicoindustries.prodpulse",
       "versionCode": 21,
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
