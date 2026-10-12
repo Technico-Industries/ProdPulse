@@ -17,7 +17,7 @@ import { collection, getDocs, onSnapshot, query, where, orderBy, Timestamp, doc,
 import { db } from '../services/firebase';
 import { useAuthStore } from '../stores/authStore';
 import { ADMIN_MENU_ITEMS } from '../constants/adminMenu';
-import AdminOverviewScreen from './AdminOverviewScreen';
+import AdminDashboardPager from '../components/AdminDashboardPager';
 import { SUPERVISOR_MENU_ITEMS } from '../constants/supervisorMenu';
 import SupervisorOverviewScreen from './SupervisorOverviewScreen';
 import { QUALITY_MENU_ITEMS } from '../constants/qualityMenu';
@@ -1063,9 +1063,10 @@ export default function DashboardScreen() {
   // Admin's main dashboard is the digital production overview — its own
   // header (hamburger + ProdPulse + ADMIN) lives inside that screen, so it
   // deliberately replaces this screen's generic header/card list rather
-  // than rendering below it. Every other role is untouched.
+  // than rendering below it. Swiping left shows the quality overview (see
+  // AdminDashboardPager). Every other role is untouched.
   if (isAdmin) {
-    return <AdminOverviewScreen />;
+    return <AdminDashboardPager />;
   }
 
   // Quality Control gets the digital quality overview, with its own header

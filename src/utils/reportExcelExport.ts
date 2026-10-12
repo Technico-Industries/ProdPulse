@@ -115,6 +115,10 @@ export interface ExcelHourlySourceRow {
   // null when a record genuinely has no slot timing.
   slotStartMinutesAbs: number | null;
   slotEndMinutesAbs: number | null;
+  // Nominal clock hour the slot belongs to (records saved after the lunch
+  // schedule fix). The 1–2 PM slot starts at 12:45, so its own start would
+  // floor into the 12 PM bucket — this keeps it in 1 PM. null on older records.
+  hourStartMinutesAbs?: number | null;
   planned: number;
   produced: number;
   lossParts: number;
@@ -488,7 +492,9 @@ type HourlyGroup = {
 function aggregateHourly(rows: ExcelHourlySourceRow[]): HourlyGroup[] {
   const map = new Map<string, HourlyGroup>();
   rows.forEach((row) => {
-    const hourStartAbs = hourBucketStart(row.slotStartMinutesAbs);
+    const hourStartAbs = typeof row.hourStartMinutesAbs === 'number'
+      ? row.hourStartMinutesAbs
+      : hourBucketStart(row.slotStartMinutesAbs);
     const key = [row.productionDate ?? '\u0000', row.shift ?? '\u0000', row.lineName ?? '\u0000', hourStartAbs ?? 'x'].join('__');
     let g = map.get(key);
     if (!g) {

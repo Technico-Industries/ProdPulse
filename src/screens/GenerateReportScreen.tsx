@@ -75,6 +75,8 @@ interface ProductionRecord {
   slotLabel: string | null;
   slotStartMinutesAbs: number | null;
   slotEndMinutesAbs: number | null;
+  // Nominal clock hour of the slot (newer records only) — see reportExcelExport hourBucketStart.
+  hourStartMinutesAbs: number | null;
   productionDate: string | null;
   // expectedParts = this slot/segment's own target (cycle time × its duration)
   expectedParts: number | null;
@@ -515,6 +517,7 @@ export default function GenerateReportScreen() {
           slotLabel: data.slotLabel ?? null,
           slotStartMinutesAbs: data.slotStartMinutesAbs ?? null,
           slotEndMinutesAbs: data.slotEndMinutesAbs ?? null,
+          hourStartMinutesAbs: data.hourStartMinutesAbs ?? null,
           productionDate: data.productionDate ?? null,
           expectedParts: data.expectedParts ?? null,
           producedThisSlot: data.producedThisSlot ?? null,
@@ -655,6 +658,7 @@ export default function GenerateReportScreen() {
           slotLabel: data.slotLabel ?? null,
           slotStartMinutesAbs: data.slotStartMinutesAbs ?? null,
           slotEndMinutesAbs: data.slotEndMinutesAbs ?? null,
+          hourStartMinutesAbs: data.hourStartMinutesAbs ?? null,
           productionDate: data.productionDate ?? null,
           expectedParts: data.expectedParts ?? null,
           producedThisSlot: data.producedThisSlot ?? null,
@@ -1191,6 +1195,7 @@ export default function GenerateReportScreen() {
           partName: r.partName,
           slotStartMinutesAbs: r.slotStartMinutesAbs,
           slotEndMinutesAbs: r.slotEndMinutesAbs,
+          hourStartMinutesAbs: r.hourStartMinutesAbs,
           planned,
           produced,
           lossParts: r.lossParts ?? Math.max(0, planned - produced),

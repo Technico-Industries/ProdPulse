@@ -38,6 +38,7 @@ import {
   Pressable,
   StyleSheet,
   ScrollView,
+  RefreshControl,
   TextInput,
   Modal,
   ActivityIndicator,
@@ -422,12 +423,15 @@ export default function AdminOverviewScreen() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [hasLoaded, setHasLoaded] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
 
   // One query per date change. Everything on this screen is derived from
   // its result set in the useMemo below.
-  const fetchDay = useCallback(async (dateStr: string) => {
+  // `silent` (pull-to-refresh) keeps the current figures on screen instead
+  // of swapping them for the loading state while the new ones arrive.
+  const fetchDay = useCallback(async (dateStr: string, silent = false) => {
     if (!isValidDateStr(dateStr)) return;
-    setLoading(true);
+    if (!silent) setLoading(true);
     setLoadError(null);
     try {
       // Local business day → the same Timestamp range GenerateReportScreen
@@ -546,39 +550,46 @@ export default function AdminOverviewScreen() {
   // ── productionLines, fetched once. Not per date: the line roster doesn't
   // change between days, and it's what resolves each record's real
   // plant/workshop/division below.
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const snap = await getDocs(collection(db, 'productionLines'));
-        if (cancelled) return;
-        setAllLines(
-          snap.docs.map((d) => {
-            const data: any = d.data();
-            return {
-              id: d.id,
-              plant: data.plant ?? null,
-              workshop: data.workshop ?? null,
-              division: data.division ?? null,
-              lineName: data.lineName ?? null,
-            };
-          })
-        );
-      } catch (e) {
-        // Non-fatal: without the roster each record falls back to its own
-        // stamped plant/workshop/division (see resolvedRecords).
-        console.warn('[AdminOverview] productionLines fetch failed', e);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
+  const fetchLines = useCallback(async () => {
+    try {
+      const snap = await getDocs(collection(db, 'productionLines'));
+      setAllLines(
+        snap.docs.map((d) => {
+          const data: any = d.data();
+          return {
+            id: d.id,
+            plant: data.plant ?? null,
+            workshop: data.workshop ?? null,
+            division: data.division ?? null,
+            lineName: data.lineName ?? null,
+          };
+        })
+      );
+    } catch (e) {
+      // Non-fatal: without the roster each record falls back to its own
+      // stamped plant/workshop/division (see resolvedRecords).
+      console.warn('[AdminOverview] productionLines fetch failed', e);
+    }
   }, []);
+
+  useEffect(() => {
+    fetchLines();
+  }, [fetchLines]);
 
   useEffect(() => {
     if (!prefsLoaded) return;
     fetchDay(selectedDate);
   }, [prefsLoaded, selectedDate, fetchDay]);
+
+  // Pull-to-refresh: re-reads the line roster and the selected day.
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await Promise.all([fetchLines(), fetchDay(selectedDate, true)]);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [fetchLines, fetchDay, selectedDate]);
 
   // ── Same fix GenerateReportScreen applies: some already-saved records
   // carry a null or mismatched plant/workshop/division (a supervisor-side
@@ -705,6 +716,7 @@ export default function AdminOverviewScreen() {
         style={{ flex: 1 }}
         contentContainerStyle={styles.scroll}
         showsVerticalScrollIndicator={false}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#3E7CB1" colors={['#3E7CB1']} />}
       >
         {/* ── Date selector ──────────────────────────────────────────── */}
         <View style={styles.dateBlock}>

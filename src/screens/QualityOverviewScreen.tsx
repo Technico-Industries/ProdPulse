@@ -41,6 +41,7 @@ import {
   Pressable,
   StyleSheet,
   ScrollView,
+  RefreshControl,
   TextInput,
   Modal,
   ActivityIndicator,
@@ -476,16 +477,21 @@ export default function QualityOverviewScreen() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [refreshing, setRefreshing] = useState(false);
 
   // Drops a slow response for a previously selected period.
   const requestId = useRef(0);
 
   // The Quality Report's exact query (QualityAnalysisScreen.handleSearch).
-  const fetchRange = useCallback(async (r: DateRange) => {
+  // `silent` (pull-to-refresh) keeps the current period's data on screen
+  // until the fresh result replaces it.
+  const fetchRange = useCallback(async (r: DateRange, silent = false) => {
     const id = ++requestId.current;
-    setLoading(true);
     setLoadError(null);
-    setRecords(null);
+    if (!silent) {
+      setLoading(true);
+      setRecords(null);
+    }
     try {
       const snap = await getDocs(
         query(collection(db, 'rejectionRecords'), where('date', '>=', r.from), where('date', '<=', r.to))
@@ -527,6 +533,15 @@ export default function QualityOverviewScreen() {
     if (!prefsLoaded) return;
     fetchRange(range);
   }, [prefsLoaded, range, fetchRange]);
+
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await fetchRange(range, true);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [fetchRange, range]);
 
   const filtered = useMemo(
     () =>
@@ -657,7 +672,12 @@ export default function QualityOverviewScreen() {
         </View>
       </View>
 
-      <ScrollView style={{ flex: 1 }} contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false}>
+      <ScrollView
+        style={{ flex: 1 }}
+        contentContainerStyle={styles.scroll}
+        showsVerticalScrollIndicator={false}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#4C9A6A" colors={['#4C9A6A']} />}
+      >
         {/* ── Period + plant ─────────────────────────────────────────── */}
         <View style={styles.block}>
           <Text style={styles.sectionLabel}>REPORT PERIOD</Text>

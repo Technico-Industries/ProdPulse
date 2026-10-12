@@ -42,6 +42,7 @@
     "web": "expo start --web",
     "seed:hh": "tsx scripts/seedHHProduction.ts",
     "clear:hh": "tsx scripts/seedHHProduction.ts --clear",
+    "test:schedule": "tsx scripts/testProductionSchedule.ts",
     "build": "expo export --platform web"
   },
   "private": true
