@@ -49,10 +49,34 @@ import {
   setDoc,
   updateDoc,
   deleteDoc,
+  query,
+  where,
 } from 'firebase/firestore';
 import { db } from '../services/firebase';
 import { useAuthStore } from '../stores/authStore';
+import { productionDayKeyFor, resolveSessionProductionDate, timestampToMillis } from '../utils/productionDay';
 import { PLANTS, WORKSHOPS, DIVISIONS } from '../constants/lineOptions';
+import {
+  SHIFT_A_START,
+  SHIFT_A_END,
+  SHIFT_B_START,
+  SHIFT_B_END_ABS,
+  LUNCH_BREAK,
+  ScheduleSlot,
+  TimeInterval,
+  buildSlots,
+  scheduledNonProductive,
+  changeoverSegmentWindows,
+  changeoverSegmentMinutes,
+  expectedPartsFor,
+  formatAbsMinutesToAmPm,
+  formatTimeInput,
+  isChangeoverAtSlotStart,
+  parseTimeInput,
+  placeChangeoverTime,
+  timeOfDayToShiftAbs,
+  validateChangeoverInterval,
+} from '../utils/productionSchedule';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -66,18 +90,18 @@ type Line = {
   parts?: { name: string; cycleTimeSeconds: number }[];
 };
 
-type Slot = {
-  index: number;
-  startMinutesAbs: number;
-  endMinutesAbs: number;
-  durationMinutes: number;
-  label: string;
-  productiveMinutes: number;
-};
+type Slot = ScheduleSlot;
 
 type ChangeoverInfo = {
   slotIndex: number;
+  // Changeover start (kept under its original name for stored sessions and
+  // productionRecords.changeoverInfo).
   atAbs: number;
+  // Manually entered changeover interval, [startAbs, endAbs). Missing on
+  // changeovers recorded before manual entry, which were an instant at atAbs.
+  startAbs?: number;
+  endAbs?: number;
+  durationMinutes?: number;
   oldPartIndex: number;
   newPartIndex: number;
   beforeMinutes: number;
@@ -122,6 +146,120 @@ interface ActiveSessionDoc {
   lineStopped: boolean;        // true if any stop is currently running
   startedAt: any;              // serverTimestamp
   updatedAt: any;              // serverTimestamp
+}
+
+// ─── Production record upsert ─────────────────────────────────────────────────
+// One productionRecords doc per logical slot: re-saving a slot (or Finalize
+// writing a slot that was already saved) updates that doc instead of adding
+// another. A slot is identified by productionDate + lineId + shift +
+// slotIndex + segment ('full' for a normal slot, 'before'/'after' for the
+// two halves of a changeover slot).
+
+type SlotSegment = 'full' | 'before' | 'after';
+
+interface ProductionSlotIdentity {
+  productionDate: string;
+  lineId: string;
+  shift: string;
+  slotIndex: number;
+  segment: SlotSegment;
+}
+
+// Deterministic doc ID. Each part is URI-encoded, so it can never contain
+// '/' (illegal in an ID) or the '|' separator — distinct identities can't
+// collide.
+function productionRecordId(id: ProductionSlotIdentity): string {
+  return ['pr', id.productionDate, id.lineId, id.shift, String(id.slotIndex), id.segment]
+    .map((v) => encodeURIComponent(v))
+    .join('|');
+}
+
+// Resolves the doc a slot should be written to, in order:
+//   1. the canonical (deterministic-ID) doc, if it already exists;
+//   2. a legacy addDoc() record for the same slot — records saved before
+//      this change have random IDs, and creating a canonical doc next to one
+//      would double-count the slot. If several legacy duplicates already
+//      exist, the earliest-created one is updated and the rest are left
+//      untouched (logged for manual cleanup) — nothing is deleted here;
+//   3. otherwise the canonical doc, which will be created.
+// Firestore is the source of truth for "was this slot saved" — React state
+// (savedSlotIndices) isn't restored with a resumed session.
+async function resolveProductionRecordRef(id: ProductionSlotIdentity) {
+  const canonicalRef = doc(db, 'productionRecords', productionRecordId(id));
+  const canonicalSnap = await getDoc(canonicalRef);
+  if (canonicalSnap.exists()) return { ref: canonicalRef, exists: true };
+
+  const legacySnap = await getDocs(
+    query(
+      collection(db, 'productionRecords'),
+      where('productionDate', '==', id.productionDate),
+      where('lineId', '==', id.lineId),
+      where('shift', '==', id.shift),
+      where('slotIndex', '==', id.slotIndex)
+    )
+  );
+  const legacy = legacySnap.docs
+    .filter((d) => {
+      const seg = (d.data() as any).partSegment ?? null;
+      return id.segment === 'full' ? seg == null : seg === id.segment;
+    })
+    .sort((a, b) => {
+      const ta = (a.data() as any).createdAt?.toMillis?.() ?? 0;
+      const tb = (b.data() as any).createdAt?.toMillis?.() ?? 0;
+      return ta - tb || a.id.localeCompare(b.id);
+    });
+  if (legacy.length > 1) {
+    console.warn(
+      '[productionRecords] legacy duplicates for one slot — updating the earliest, the rest need manual cleanup',
+      { identity: id, kept: legacy[0].id, duplicates: legacy.slice(1).map((d) => d.id) }
+    );
+  }
+  if (legacy.length) return { ref: legacy[0].ref, exists: true };
+  return { ref: canonicalRef, exists: false };
+}
+
+// Creates the slot's record on first save, otherwise overwrites it with the
+// latest values. createdAt is only written on create (the original creation
+// time is kept on every later save); updatedAt is stamped every time.
+// `resolved` caches which doc each slot resolved to, so later saves in the
+// same session skip the lookup and always hit the same document.
+async function upsertProductionRecord(
+  id: ProductionSlotIdentity,
+  data: Record<string, any>,
+  resolved: Map<string, string>
+) {
+  const { createdAt: _createdAt, ...fields } = data;
+  const key = productionRecordId(id);
+  const cachedDocId = resolved.get(key);
+  if (cachedDocId) {
+    await setDoc(doc(db, 'productionRecords', cachedDocId), { ...fields, updatedAt: serverTimestamp() }, { merge: true });
+    return;
+  }
+  const { ref, exists } = await resolveProductionRecordRef(id);
+  if (exists) {
+    await setDoc(ref, { ...fields, updatedAt: serverTimestamp() }, { merge: true });
+  } else {
+    await setDoc(ref, { ...fields, createdAt: serverTimestamp(), updatedAt: serverTimestamp() });
+  }
+  resolved.set(key, ref.id);
+}
+
+// A slot is stored either as one 'full' record or as 'before' + 'after'.
+// When its shape changes after it was saved (a changeover added to, or
+// removed from, an already-saved slot), the superseded record(s) are
+// deleted so the slot is never counted twice. Call after writing `keep`.
+async function removeSupersededProductionRecords(
+  slot: Omit<ProductionSlotIdentity, 'segment'>,
+  keep: 'full' | 'split',
+  resolved: Map<string, string>
+) {
+  const stale: SlotSegment[] = keep === 'full' ? ['before', 'after'] : ['full'];
+  for (const segment of stale) {
+    const id: ProductionSlotIdentity = { ...slot, segment };
+    const { ref, exists } = await resolveProductionRecordRef(id);
+    if (exists) await deleteDoc(ref);
+    resolved.delete(productionRecordId(id));
+  }
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -214,11 +352,6 @@ function PickerBox({
     </View>
   );
 }
-
-const SHIFT_A_START = 7 * 60;
-const SHIFT_A_END = 15 * 60 + 30;
-const SHIFT_B_START = 19 * 60;
-const SHIFT_B_END_ABS = 24 * 60 + 3 * 60 + 30;
 
 // ─── Floating calculator ────────────────────────────────────────────────────
 // A small floating icon, always on top of whichever phase (setup/active) is
@@ -471,49 +604,8 @@ function CalculatorButton() {
   );
 }
 
-const BREAKS: { start: number; end: number }[] = [
-  { start: 9 * 60 + 30, end: 9 * 60 + 40 },
-  { start: 12 * 60 + 15, end: 12 * 60 + 45 },
-  { start: 14 * 60, end: 14 * 60 + 10 },
-];
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function formatAbsMinutesToAmPm(mAbs: number) {
-  const m = ((mAbs % 1440) + 1440) % 1440;
-  const hh = Math.floor(m / 60);
-  const mm = m % 60;
-  const suffix = hh >= 12 ? 'PM' : 'AM';
-  const hour12 = hh % 12 === 0 ? 12 : hh % 12;
-  return `${hour12.toString().padStart(2, '0')}:${mm.toString().padStart(2, '0')} ${suffix}`;
-}
-
-function overlapMinutes(aStart: number, aEnd: number, bStart: number, bEnd: number) {
-  return Math.max(0, Math.min(aEnd, bEnd) - Math.max(aStart, bStart));
-}
-
-// ─── Production day ──────────────────────────────────────────────────────────
-// A "production day" runs from 6:30 AM to the next day's 6:30 AM - chosen
-// because it's 30 min before Shift A starts (7:00 AM) and ~3 hours after
-// Shift B ends (3:30 AM), so no shift is ever active across that boundary.
-// This is what lets Shift B (7:00 PM - 3:30 AM) keep the SAME production
-// date all night, even though the real calendar date changes at midnight:
-// a session started at 7:00 PM on the 22nd is still "22nd" at 2:00 AM,
-// because 2:00 AM is before the 6:30 AM cutover into the 23rd.
-const PRODUCTION_DAY_CUTOVER_MINUTES = 6 * 60 + 30; // 6:30 AM
-
-function productionDayKeyFor(epochMs: number): string {
-  const d = new Date(epochMs);
-  const minutesOfDay = d.getHours() * 60 + d.getMinutes();
-  const effective = new Date(d);
-  if (minutesOfDay < PRODUCTION_DAY_CUTOVER_MINUTES) {
-    effective.setDate(effective.getDate() - 1);
-  }
-  const y = effective.getFullYear();
-  const m = String(effective.getMonth() + 1).padStart(2, '0');
-  const day = String(effective.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}
+// Production day (6:30 AM cutover) and session date pinning live in
+// src/utils/productionDay.ts.
 
 function formatProductionDayDisplay(key: string | null): string {
   if (!key) return '—';
@@ -534,42 +626,6 @@ function formatSessionStartedAt(ms: number | null): string {
 // exact label in lineOptions.ts changes (e.g. "Assembly" vs "Assembly Shop").
 function isAssemblyWorkshop(w: string | null) {
   return !!w && w.toLowerCase().includes('assembly');
-}
-
-function buildSlots(shift: 'A' | 'B', otHours: number): Slot[] {
-  const startAbs = shift === 'A' ? SHIFT_A_START : SHIFT_B_START;
-  const endAbs = shift === 'A' ? SHIFT_A_END : SHIFT_B_END_ABS;
-  const fullEnd = endAbs + otHours * 60;
-  const allBreaks = [...BREAKS];
-  if (otHours > 0) allBreaks.push({ start: 16 * 60, end: 16 * 60 + 10 });
-
-  const result: Slot[] = [];
-  let cursor = startAbs;
-  let idx = 0;
-  while (cursor < fullEnd) {
-    const next = Math.min(fullEnd, cursor + 60);
-    const duration = next - cursor;
-    // Every slot is 60 wall-clock minutes except: the very first slot of the
-    // day, which reserves 10 minutes for startup, and the 1:00 PM – 2:00 PM
-    // slot, which is a 50-minute production slot (its clock range and every
-    // other slot's boundaries are unaffected — only its own productive
-    // capacity is reduced).
-    const reserve = cursor === startAbs || cursor === 13 * 60 ? 10 : 0;
-    let breakOverlap = 0;
-    allBreaks.forEach((b) => { breakOverlap += overlapMinutes(cursor, next, b.start, b.end); });
-    const productive = Math.max(0, Math.round((duration - reserve - breakOverlap) * 100) / 100);
-    result.push({
-      index: idx,
-      startMinutesAbs: cursor,
-      endMinutesAbs: next,
-      durationMinutes: duration,
-      productiveMinutes: productive,
-      label: `${formatAbsMinutesToAmPm(cursor)} - ${formatAbsMinutesToAmPm(next)}${duration < 60 ? ' (partial)' : ''}`,
-    });
-    cursor = next;
-    idx++;
-  }
-  return result;
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
@@ -635,7 +691,10 @@ export default function RecordProductionScreen() {
   // where a closure over state captured at call time would otherwise be stale.
   const stopsBySlotRef = useRef<Record<number, StopEvent[]>>({});
   useEffect(() => { stopsBySlotRef.current = stopsBySlot; }, [stopsBySlot]);
-  const [changeovers, setChangeovers] = useState<Record<number, ChangeoverInfo | null>>({});
+  // Changeovers as entered/restored. Everything else reads `changeovers`
+  // below, which recomputes each one's segment minutes from the shared
+  // schedule (see the Derived section).
+  const [storedChangeovers, setChangeovers] = useState<Record<number, ChangeoverInfo | null>>({});
   const [producedSegment, setProducedSegment] = useState<Record<string, number | null>>({});
 
   // ─── Navigation ────────────────────────────────────────────────────────
@@ -690,6 +749,11 @@ export default function RecordProductionScreen() {
   // ── Modal states
   const [changeModalVisible, setChangeModalVisible] = useState(false);
   const [changeModalNewPartIndex, setChangeModalNewPartIndex] = useState<number | null>(null);
+  // Manually entered changeover time, 24-hour "HH:MM" (display string; the
+  // colon is inserted automatically) — never taken from the device clock.
+  // Parsed with parseTimeInput into minutes; the string itself is never used
+  // in calculations.
+  const [changeTimeText, setChangeTimeText] = useState('');
   const [stopModalVisible, setStopModalVisible] = useState(false);
   const [stopModalSlotIndex, setStopModalSlotIndex] = useState<number | null>(null);
   const [stopModalReason, setStopModalReason] = useState<string | null>(null);
@@ -715,11 +779,103 @@ export default function RecordProductionScreen() {
 
   // ── Saving
   const [saving, setSaving] = useState(false);
+  // Synchronous guard against overlapping writes from rapid taps — `saving`
+  // only disables the button after the next render.
+  const savingSlotsRef = useRef<Set<number>>(new Set());
+  // Slot identity → productionRecords doc ID it resolved to (see
+  // upsertProductionRecord).
+  const resolvedRecordIdsRef = useRef<Map<string, string>>(new Map());
+  // Original start time of the current session (epoch ms) — last-resort
+  // source for its production date (see resolveActiveSessionProductionDate).
+  const sessionStartedAtMsRef = useRef<number | null>(null);
   const [startingProduction, setStartingProduction] = useState(false);
   const [persistingSession, setPersistingSession] = useState(false);
 
   // ── Derived
-  const slots = useMemo(() => buildSlots(selectedShift, otHours), [selectedShift, otHours]);
+  // Every changeover's [start, end) interval. Legacy changeovers (recorded
+  // before manual entry) are an instant at atAbs.
+  const changeoverIntervals = useMemo<TimeInterval[]>(
+    () =>
+      Object.values(storedChangeovers)
+        .filter((co): co is ChangeoverInfo => !!co)
+        .map((co) => ({ start: co.startAbs ?? co.atAbs, end: co.endAbs ?? co.atAbs })),
+    [storedChangeovers]
+  );
+
+  // Hourly slots from the shared schedule (src/utils/productionSchedule.ts):
+  // lunch-adjusted windows, with breaks, startup reserve and changeover time
+  // already taken out of productiveMinutes — so a changeover that runs past
+  // its own slot's end reduces the following slot too.
+  const slots = useMemo(
+    () => buildSlots(selectedShift, otHours, changeoverIntervals),
+    [selectedShift, otHours, changeoverIntervals]
+  );
+
+  // Every changeover with its BEFORE/AFTER productive minutes recomputed
+  // from the same schedule, so removing or adding another changeover, or
+  // changing OT, can never leave stale minutes behind. This is what gets
+  // persisted, validated and listed.
+  const allChangeovers = useMemo(() => {
+    const nonProductive = [...scheduledNonProductive(selectedShift, otHours), ...changeoverIntervals];
+    const result: Record<number, ChangeoverInfo | null> = {};
+    Object.entries(storedChangeovers).forEach(([k, co]) => {
+      if (!co) return;
+      const slot = slots.find((s) => s.index === co.slotIndex);
+      if (!slot) return;
+      const startAbs = co.startAbs ?? co.atAbs;
+      const endAbs = co.endAbs ?? co.atAbs;
+      // A changeover on the slot's start switches the part for the whole
+      // slot: no BEFORE time, the slot's full minutes go to the new part.
+      const { beforeMinutes, afterMinutes } = isChangeoverAtSlotStart(slot, { start: startAbs, end: endAbs })
+        ? { beforeMinutes: 0, afterMinutes: slot.productiveMinutes }
+        : changeoverSegmentMinutes(slot, { start: startAbs, end: endAbs }, nonProductive);
+      const oldCycle = selectedLine?.parts?.[co.oldPartIndex]?.cycleTimeSeconds ?? 0;
+      const newCycle = selectedLine?.parts?.[co.newPartIndex]?.cycleTimeSeconds ?? 0;
+      result[Number(k)] = {
+        ...co,
+        atAbs: startAbs,
+        startAbs,
+        endAbs,
+        durationMinutes: endAbs - startAbs,
+        beforeMinutes,
+        afterMinutes,
+        expectedBefore: expectedPartsFor(oldCycle, beforeMinutes),
+        expectedAfter: expectedPartsFor(newCycle, afterMinutes),
+      };
+    });
+    return result;
+  }, [storedChangeovers, slots, selectedShift, otHours, changeoverIntervals, selectedLine]);
+
+  // Changeovers that SPLIT their slot into BEFORE/AFTER cards and records.
+  // A changeover exactly on a slot's start is left out: that slot stays one
+  // full card (segment 'full') on the new part — see activePartIndexBySlot —
+  // so no zero-length BEFORE card or record is ever created.
+  const changeovers = useMemo(() => {
+    const result: Record<number, ChangeoverInfo | null> = {};
+    for (const [k, co] of Object.entries(allChangeovers)) {
+      const slot = co && slots.find((s) => s.index === co.slotIndex);
+      if (co && slot && isChangeoverAtSlotStart(slot, { start: co.atAbs, end: co.endAbs ?? co.atAbs })) continue;
+      result[Number(k)] = co;
+    }
+    return result;
+  }, [allChangeovers, slots]);
+
+  // The part running in each slot (for a split slot: the part at its start).
+  // Carried forward through every changeover, including a part switch at a
+  // slot's start, which takes effect for that slot itself. Every path that
+  // needs "which part is this slot on" — cards, saves, Finalize, totals —
+  // reads this one map.
+  const activePartIndexBySlot = useMemo(() => {
+    const map: Record<number, number> = {};
+    let active = selectedPartIndex;
+    for (const s of slots) {
+      const co = allChangeovers[s.index];
+      if (co && !changeovers[s.index]) active = co.newPartIndex; // switch at slot start
+      map[s.index] = active;
+      if (co && changeovers[s.index]) active = co.newPartIndex;
+    }
+    return map;
+  }, [slots, selectedPartIndex, allChangeovers, changeovers]);
 
   // Slots the supervisor hasn't deleted — this is what planning totals and
   // the card list are built from, so a deleted hourly card is excluded from
@@ -741,7 +897,7 @@ export default function RecordProductionScreen() {
     if (!selectedLine) return 0;
     const cycle = selectedLine.parts?.[selectedPartIndex]?.cycleTimeSeconds ?? 0;
     if (!cycle) return 0;
-    return visibleSlots.reduce((sum, s) => sum + Math.floor((s.productiveMinutes * 60) / cycle), 0);
+    return visibleSlots.reduce((sum, s) => sum + expectedPartsFor(cycle, s.productiveMinutes), 0);
   }, [visibleSlots, selectedLine, selectedPartIndex]);
 
   // Part Target Summary — redistributes the FIXED shiftPlannedTotal across
@@ -767,7 +923,6 @@ export default function RecordProductionScreen() {
 
     const minutesByName: Record<string, number> = {};
     let totalMinutes = 0;
-    let active = selectedPartIndex;
     for (const s of visibleSlots) {
       const co = changeovers[s.index];
       if (co) {
@@ -776,9 +931,8 @@ export default function RecordProductionScreen() {
         minutesByName[oldName] = (minutesByName[oldName] ?? 0) + co.beforeMinutes;
         minutesByName[newName] = (minutesByName[newName] ?? 0) + co.afterMinutes;
         totalMinutes += co.beforeMinutes + co.afterMinutes;
-        active = co.newPartIndex;
       } else {
-        const name = nameFor(active);
+        const name = nameFor(activePartIndexBySlot[s.index] ?? selectedPartIndex);
         minutesByName[name] = (minutesByName[name] ?? 0) + s.productiveMinutes;
         totalMinutes += s.productiveMinutes;
       }
@@ -802,7 +956,7 @@ export default function RecordProductionScreen() {
     return raw
       .map((r) => ({ name: r.name, target: r.floor }))
       .sort((a, b) => b.target - a.target);
-  }, [selectedLine, visibleSlots, changeovers, selectedPartIndex, shiftPlannedTotal]);
+  }, [selectedLine, visibleSlots, changeovers, activePartIndexBySlot, selectedPartIndex, shiftPlannedTotal]);
 
   const anyStopRunning = useMemo(
     () => Object.values(stopsBySlot).some((arr) => arr.some((s) => s.running)),
@@ -1036,12 +1190,25 @@ export default function RecordProductionScreen() {
     setProducedSegment(sd.producedSegment ?? {});
     setDeletedSlotIndices(new Set(sd.deletedSlotIndices ?? []));
 
-    // Sessions started before this feature existed won't have a
-    // productionDate field - fall back to computing it from startedAt (or
-    // now, as a last resort) so old in-flight sessions don't immediately
-    // look "rolled over" the moment this update ships.
-    const startedAtMs = (sd as any).startedAt?.toMillis ? (sd as any).startedAt.toMillis() : Date.now();
-    setProductionDate((sd as any).productionDate ?? productionDayKeyFor(startedAtMs));
+    // Keep the session's ORIGINAL production date — reopening the app or
+    // resuming the session on a later day must never move its records to
+    // today. Sessions started before the productionDate field existed derive
+    // it from their original startedAt, and get it written back so it's
+    // pinned from now on. Only when neither exists (shouldn't happen —
+    // startedAt is written on create) is the current day used, and that is
+    // pinned too, so Finalize can't pick a different date later.
+    const storedDate = (sd as any).productionDate;
+    let pd = resolveSessionProductionDate({ storedDate, startedAt: sd.startedAt });
+    if (!pd) {
+      console.warn('[restoreSession] session has no productionDate or startedAt — pinning the current production day', { docId });
+      pd = productionDayKeyFor(Date.now());
+    }
+    sessionStartedAtMsRef.current = timestampToMillis(sd.startedAt);
+    setProductionDate(pd);
+    if (storedDate !== pd) {
+      updateDoc(doc(db, 'activeSessions', docId), { productionDate: pd })
+        .catch((e) => console.error('[restoreSession] failed to pin productionDate', e));
+    }
 
     setSessionLineId(docId);
     setPhase('active');
@@ -1072,7 +1239,7 @@ export default function RecordProductionScreen() {
     const stopsStr: Record<string, StopEvent[]> = {};
     Object.entries(stopsToSave).forEach(([k, v]) => { stopsStr[k] = v; });
     const coStr: Record<string, ChangeoverInfo | null> = {};
-    Object.entries(changeovers).forEach(([k, v]) => { coStr[k] = v; });
+    Object.entries(allChangeovers).forEach(([k, v]) => { coStr[k] = v; });
 
     // Compute downtime per-slot and totals. For running stops, use nowMs for end.
     const stopsSummaryBySlot: Record<string, { totalDowntimeMinutes: number; stopCount: number }> = {};
@@ -1092,13 +1259,7 @@ export default function RecordProductionScreen() {
     // Total rejections across slots
     const totalRejections = Object.values(rejectionsBySlot).reduce((s, v) => s + (v ?? 0), 0);
 
-    // Production-day key (YYYY-MM-DD), pinned at session start via the
-    // 6:30 AM cutover - this is what stays stable across midnight during
-    // Shift B, unlike a raw new Date() calendar date would.
-    const pd = productionDate ?? productionDayKeyFor(Date.now());
-
     const sessionData: Omit<ActiveSessionDoc, 'startedAt'> & { startedAt?: any; updatedAt: any } & {
-      productionDate: string;
       totalDowntimeMinutes: number;
       totalRejections: number;
       stopsSummaryBySlot: Record<string, { totalDowntimeMinutes: number; stopCount: number }>;
@@ -1129,8 +1290,9 @@ export default function RecordProductionScreen() {
       lineStopped: stopped,
       updatedAt: serverTimestamp(),
 
-      // new structured summaries
-      productionDate: pd,
+      // new structured summaries. productionDate is deliberately NOT part
+      // of this payload — it's pinned when the session starts and an update
+      // must never overwrite it (see the create branch below).
       plannedProductionTotal: shiftPlannedTotal,
       totalDowntimeMinutes,
       totalRejections,
@@ -1140,9 +1302,14 @@ export default function RecordProductionScreen() {
     const docRef = doc(db, 'activeSessions', sessionLineId ?? selectedLineId);
     try {
       if (!sessionLineId) {
-        // create doc (set startedAt only first time)
-        await setDoc(docRef, { ...sessionData, startedAt: serverTimestamp() });
+        // create doc (set startedAt and productionDate only first time) —
+        // this is a genuinely new session, so its production day is pinned
+        // here, from now.
+        const pd = productionDate ?? productionDayKeyFor(Date.now());
+        await setDoc(docRef, { ...sessionData, productionDate: pd, startedAt: serverTimestamp() });
         setSessionLineId(selectedLineId);
+        setProductionDate(pd);
+        sessionStartedAtMsRef.current = Date.now();
       } else {
         // update existing
         await updateDoc(docRef, sessionData as any);
@@ -1164,7 +1331,11 @@ export default function RecordProductionScreen() {
     if (!hasOperator) { Alert.alert('Add operator', 'Enter at least one operator name.'); return; }
 
     setStartingProduction(true);
-    const pd = productionDayKeyFor(Date.now());
+    // The ONLY place a session's production date is calculated from the
+    // current time (persistSession's create branch aside) — see
+    // resolveActiveSessionProductionDate for every later read.
+    const startedMs = Date.now();
+    const pd = productionDayKeyFor(startedMs);
     try {
       const docRef = doc(db, 'activeSessions', selectedLineId);
       await setDoc(docRef, {
@@ -1193,7 +1364,10 @@ export default function RecordProductionScreen() {
         updatedAt: serverTimestamp(),
       });
       setSessionLineId(selectedLineId);
+      // Pinned for the lifetime of this session — every record it writes,
+      // including Finalize after midnight/the cutover, uses this date.
       setProductionDate(pd);
+      sessionStartedAtMsRef.current = startedMs;
       setSavedSlotIndices(new Set());
       setDeletedSlotIndices(new Set());
       setPhase('active');
@@ -1208,6 +1382,32 @@ export default function RecordProductionScreen() {
   // FINALIZE / END SESSION (new)
   // ─────────────────────────────────────────────────────────────────────────────
 
+  // The production date this session's records belong to: the one pinned
+  // in activeSessions/{lineId} when the session started, falling back to
+  // the date pinned in state, then to the session's original startedAt.
+  // Never the current time — a session finalized (or a slot saved) after
+  // midnight / the 6:30 AM cutover keeps its original date. Throws if no
+  // date can be resolved rather than guessing one.
+  async function resolveActiveSessionProductionDate(lineId: string): Promise<string> {
+    let storedDate: unknown;
+    let startedAt: unknown;
+    try {
+      const snap = await getDoc(doc(db, 'activeSessions', lineId));
+      if (snap.exists()) {
+        const data = snap.data() as any;
+        storedDate = data.productionDate;
+        startedAt = data.startedAt;
+      }
+    } catch (e) {
+      console.warn('[productionDate] could not read the active session — using the pinned date', e);
+    }
+    const pd =
+      resolveSessionProductionDate({ storedDate, pinnedDate: productionDate, startedAt }) ??
+      resolveSessionProductionDate({ startedAt: sessionStartedAtMsRef.current });
+    if (!pd) throw new Error('Could not determine the production date of this session. Check your connection and try again.');
+    return pd;
+  }
+
   // Sums planned production (cycle time × FULL slot duration, ignoring
   // downtime — same figure as plannedProduction on each slot doc) and actual
   // output, across only the slots the supervisor actually entered data for.
@@ -1216,13 +1416,12 @@ export default function RecordProductionScreen() {
   function computeShiftTotals() {
     let planned = 0;
     let actual = 0;
-    let activePart = selectedPartIndex;
     for (const s of slots) {
       const co = changeovers[s.index] ?? null;
       if (!co) {
         const produced = producedBySlot[s.index];
         if (produced != null) {
-          planned += expectedParts(activePart, s.productiveMinutes);
+          planned += expectedParts(activePartIndexBySlot[s.index] ?? selectedPartIndex, s.productiveMinutes);
           actual += produced;
         }
       } else {
@@ -1230,7 +1429,6 @@ export default function RecordProductionScreen() {
         const pa = producedSegment[`${s.index}:after`];
         if (pb != null) { planned += expectedParts(co.oldPartIndex, co.beforeMinutes); actual += pb; }
         if (pa != null) { planned += expectedParts(co.newPartIndex, co.afterMinutes); actual += pa; }
-        activePart = co.newPartIndex;
       }
     }
     return { planned, actual };
@@ -1240,10 +1438,12 @@ export default function RecordProductionScreen() {
   // supervisor presses "Finalize & End Session" — the "total expected parts
   // of that shift" figure, saved once rather than re-derived from
   // productionRecords every time it's needed.
-  async function saveShiftSummary(lineId: string) {
+  // prodDate is the session's original production date, resolved once by
+  // Finalize (see resolveActiveSessionProductionDate) so the summary always
+  // matches the productionRecords written alongside it.
+  async function saveShiftSummary(lineId: string, prodDate: string) {
     if (!selectedLine) return;
     const { planned, actual } = computeShiftTotals();
-    const prodDate = productionDate ?? productionDayKeyFor(Date.now());
     const summaryId = `${lineId}_${prodDate}_${selectedShift}`;
     // Part-level planned totals for this same production date + shift,
     // grouped by part name (see partTargetSummary above) — computed once
@@ -1288,7 +1488,10 @@ export default function RecordProductionScreen() {
   // session is closed.
   // ─────────────────────────────────────────────────────────────────────────────
 
-  async function submitUnsavedSlots(lineId: string) {
+  // prodDate: the session's original production date (see
+  // resolveActiveSessionProductionDate) — used for both the record IDs and
+  // the productionDate field, never the time Finalize happens to run.
+  async function submitUnsavedSlots(lineId: string, prodDate: string) {
     if (!selectedLine) return;
     const nowTs = Date.now();
 
@@ -1325,10 +1528,10 @@ export default function RecordProductionScreen() {
     // line was down; only ACTUAL output (producedThisSlot) reflects real
     // stops.
     function frozenExpected(partIdx: number, minutes: number): number {
-      const cycle = selectedLine?.parts?.[partIdx]?.cycleTimeSeconds ?? 0;
-      if (!cycle || minutes <= 0) return 0;
-      return Math.floor((minutes * 60) / cycle);
+      return expectedPartsFor(selectedLine?.parts?.[partIdx]?.cycleTimeSeconds ?? 0, minutes);
     }
+    const slotKey = (slotIndex: number) => ({ productionDate: prodDate, lineId, shift: selectedShift, slotIndex });
+    const slotId = (slotIndex: number, segment: SlotSegment): ProductionSlotIdentity => ({ ...slotKey(slotIndex), segment });
     const base = {
       shift: selectedShift,
       plant: selectedLine.plant ?? plant ?? null,
@@ -1338,21 +1541,26 @@ export default function RecordProductionScreen() {
       lineName: selectedLine.lineName ?? null,
       operators: operators.map((o) => ({ name: o.name, code: o.code })),
       supervisor: { name: supervisorName, code: supervisorCode, uid: user?.uid ?? null },
-      productionDate: productionDate ?? productionDayKeyFor(nowTs),
+      productionDate: prodDate,
       createdAt: serverTimestamp(),
     };
 
-    // BUG FIX: previously every non-changeover slot in this loop used
-    // `selectedPartIndex` directly — the part the session STARTED with —
-    // so any slot after a changeover got saved under the wrong part. Track
-    // the active part forward through the loop instead, the same way the
-    // on-screen cards and activePartIndexBySlot already do.
-    let activePart = selectedPartIndex;
+    // Same changeover rules as an individual save — refuse to write anything
+    // if a changeover (e.g. one restored from an older session) is invalid.
+    for (const co of Object.values(allChangeovers)) {
+      if (!co || deletedSlotIndices.has(co.slotIndex)) continue;
+      const error = changeoverError(co);
+      if (error) throw new Error(`Changeover at ${formatAbsMinutesToAmPm(co.atAbs)}: ${error}`);
+    }
 
     for (const s of slots) {
+      if (s.isBreak) continue; // lunch — no production record
       if (savedSlotIndices.has(s.index)) continue;
       if (deletedSlotIndices.has(s.index)) continue; // deleted card — no record, no target
       const co = changeovers[s.index] ?? null;
+      // The slot's real part (accounts for every changeover, including ones
+      // in slots already saved and skipped above) — same map the cards use.
+      const activePart = activePartIndexBySlot[s.index] ?? selectedPartIndex;
       const stopEventsArr = (frozenStops[s.index] ?? []).map((se) => ({
         reason: se.reason, startAbs: se.startAbs, endAbs: se.endAbs ?? null, durationMinutes: se.durationMinutes ?? null,
       }));
@@ -1367,12 +1575,12 @@ export default function RecordProductionScreen() {
         const expPartsAuto = frozenExpected(activePart, s.productiveMinutes);
         const lossPartsAuto = Math.max(0, expPartsAuto - produced);
         const lossReasonAuto = lossReasonBySlot[String(s.index)] ?? null;
-        await addDoc(collection(db, 'productionRecords'), {
+        await upsertProductionRecord(slotId(s.index, 'full'), {
           ...base,
           partName: selectedLine.parts?.[activePart]?.name ?? null,
           cycleTimeSeconds: selectedLine.parts?.[activePart]?.cycleTimeSeconds ?? null,
           slotIndex: s.index, slotLabel: s.label,
-          slotStartMinutesAbs: s.startMinutesAbs, slotEndMinutesAbs: s.endMinutesAbs,
+          slotStartMinutesAbs: s.startMinutesAbs, slotEndMinutesAbs: s.endMinutesAbs, hourStartMinutesAbs: s.hourStartAbs,
           slotDurationMinutes: s.durationMinutes, productiveMinutes: productive,
           expectedParts: expPartsAuto,
           producedThisSlot: produced,
@@ -1383,7 +1591,8 @@ export default function RecordProductionScreen() {
           lossReasonNote: lossReasonAuto?.note ?? null,
           rejections: rejectionsBySlot[s.index] ?? 0,
           stopEvents: stopEventsArr,
-        });
+        }, resolvedRecordIdsRef.current);
+        await removeSupersededProductionRecords(slotKey(s.index), 'full', resolvedRecordIdsRef.current);
       } else {
         // Changeover — two fully independent records, each with its own
         // produced value as entered (no baseline, no subtraction).
@@ -1397,14 +1606,14 @@ export default function RecordProductionScreen() {
           const expBeforeAuto = frozenExpected(co.oldPartIndex, co.beforeMinutes);
           const lossPartsBeforeAuto = Math.max(0, expBeforeAuto - pb);
           const lossReasonBeforeAuto = lossReasonBySlot[`${s.index}:before`] ?? null;
-          await addDoc(collection(db, 'productionRecords'), {
+          await upsertProductionRecord(slotId(s.index, 'before'), {
             ...base,
             partName: selectedLine.parts?.[co.oldPartIndex]?.name ?? null,
             cycleTimeSeconds: selectedLine.parts?.[co.oldPartIndex]?.cycleTimeSeconds ?? null,
             slotIndex: s.index,
             slotLabel: `${formatAbsMinutesToAmPm(s.startMinutesAbs)} - ${formatAbsMinutesToAmPm(co.atAbs)} — ${selectedLine.parts?.[co.oldPartIndex]?.name ?? 'Part'}`,
-            slotStartMinutesAbs: s.startMinutesAbs, slotEndMinutesAbs: co.atAbs,
-            slotDurationMinutes: co.beforeMinutes, productiveMinutes: prodBefore,
+            slotStartMinutesAbs: s.startMinutesAbs, slotEndMinutesAbs: co.atAbs, hourStartMinutesAbs: s.hourStartAbs,
+            slotDurationMinutes: co.atAbs - s.startMinutesAbs, productiveMinutes: prodBefore,
             expectedParts: expBeforeAuto,
             producedThisSlot: pb,
             lossParts: lossPartsBeforeAuto,
@@ -1414,21 +1623,21 @@ export default function RecordProductionScreen() {
             lossReasonNote: lossReasonBeforeAuto?.note ?? null,
             rejections: rejectionsBySlot[`${s.index}:before`] ?? 0, stopEvents: stopEventsArr,
             changeoverInfo: co, partSegment: 'before',
-          });
+          }, resolvedRecordIdsRef.current);
         }
         const pa = producedSegment[`${s.index}:after`];
         if (pa != null) {
           const expAfterAuto = frozenExpected(co.newPartIndex, co.afterMinutes);
           const lossPartsAfterAuto = Math.max(0, expAfterAuto - pa);
           const lossReasonAfterAuto = lossReasonBySlot[`${s.index}:after`] ?? null;
-          await addDoc(collection(db, 'productionRecords'), {
+          await upsertProductionRecord(slotId(s.index, 'after'), {
             ...base,
             partName: selectedLine.parts?.[co.newPartIndex]?.name ?? null,
             cycleTimeSeconds: selectedLine.parts?.[co.newPartIndex]?.cycleTimeSeconds ?? null,
             slotIndex: s.index,
-            slotLabel: `${formatAbsMinutesToAmPm(co.atAbs)} - ${formatAbsMinutesToAmPm(s.endMinutesAbs)} — ${selectedLine.parts?.[co.newPartIndex]?.name ?? 'Part'}`,
-            slotStartMinutesAbs: co.atAbs, slotEndMinutesAbs: s.endMinutesAbs,
-            slotDurationMinutes: co.afterMinutes, productiveMinutes: prodAfter,
+            slotLabel: `${formatAbsMinutesToAmPm(changeoverAfterStart(s, co))} - ${formatAbsMinutesToAmPm(s.endMinutesAbs)} — ${selectedLine.parts?.[co.newPartIndex]?.name ?? 'Part'}`,
+            slotStartMinutesAbs: changeoverAfterStart(s, co), slotEndMinutesAbs: s.endMinutesAbs, hourStartMinutesAbs: s.hourStartAbs,
+            slotDurationMinutes: s.endMinutesAbs - changeoverAfterStart(s, co), productiveMinutes: prodAfter,
             expectedParts: expAfterAuto,
             producedThisSlot: pa,
             lossParts: lossPartsAfterAuto,
@@ -1438,9 +1647,11 @@ export default function RecordProductionScreen() {
             lossReasonNote: lossReasonAfterAuto?.note ?? null,
             rejections: rejectionsBySlot[`${s.index}:after`] ?? 0, stopEvents: stopEventsArr,
             changeoverInfo: co, partSegment: 'after',
-          });
+          }, resolvedRecordIdsRef.current);
         }
-        activePart = co.newPartIndex;
+        if (pb != null || pa != null) {
+          await removeSupersededProductionRecords(slotKey(s.index), 'split', resolvedRecordIdsRef.current);
+        }
       }
     }
 
@@ -1477,12 +1688,18 @@ export default function RecordProductionScreen() {
         const docId = sessionLineId ?? selectedLineId;
         console.log('[handleFinalizeSession] resolved docId', { docId, sessionLineId, selectedLineId });
         if (docId) {
+          // Resolved ONCE from the session itself and passed to every
+          // write below, so a session finalized after midnight / the 6:30 AM
+          // cutover still files everything under the day it started.
+          const prodDate = await resolveActiveSessionProductionDate(docId);
+          console.log('[handleFinalizeSession] resolved session productionDate', prodDate);
+
           console.log('[handleFinalizeSession] calling submitUnsavedSlots(docId)…');
-          await submitUnsavedSlots(docId);
+          await submitUnsavedSlots(docId, prodDate);
           console.log('[handleFinalizeSession] submitUnsavedSlots resolved');
 
           console.log('[handleFinalizeSession] calling saveShiftSummary(docId)…');
-          await saveShiftSummary(docId);
+          await saveShiftSummary(docId, prodDate);
           console.log('[handleFinalizeSession] saveShiftSummary resolved');
 
           console.log('[handleFinalizeSession] calling deleteDoc(activeSessions/', docId, ')…');
@@ -1570,89 +1787,112 @@ export default function RecordProductionScreen() {
   const openAddChangeover = () => {
     if (!selectedLine?.parts?.length) { Alert.alert('No parts', 'Select a line with parts.'); return; }
     setChangeModalNewPartIndex(null);
+    // Start blank — the supervisor types the actual changeover time.
+    setChangeTimeText('');
     setChangeModalVisible(true);
   };
 
-  const confirmChangeover = () => {
-    console.log('[confirmChangeover] START');
-    try {
-      console.log('[confirmChangeover] state check', {
-        changeModalNewPartIndex,
-        selectedShift,
-        selectedLineId,
-        selectedLine: selectedLine ? { id: selectedLine.id, lineName: selectedLine.lineName, partsCount: selectedLine.parts?.length ?? 0 } : null,
-        visibleSlotsCount: visibleSlots.length,
-      });
+  // Adding or removing a changeover changes how a slot is stored (one
+  // 'full' record vs 'before' + 'after'), so a slot saved earlier must be
+  // saved again — Finalize skips saved slots. The re-save replaces the old
+  // record(s); see removeSupersededProductionRecords.
+  function markSlotUnsaved(slotIndex: number) {
+    setSavedSlotIndices((prev) => {
+      if (!prev.has(slotIndex)) return prev;
+      const next = new Set(prev);
+      next.delete(slotIndex);
+      return next;
+    });
+  }
 
+  // Every OTHER changeover's interval (a single-time changeover is an
+  // instant, start === end), for the overlap check.
+  function otherChangeoverIntervals(slotIndex: number): TimeInterval[] {
+    return Object.values(storedChangeovers)
+      .filter((o): o is ChangeoverInfo => !!o && o.slotIndex !== slotIndex)
+      .map((o) => ({ start: o.startAbs ?? o.atAbs, end: o.endAbs ?? o.atAbs }));
+  }
+
+  // Shared changeover rule check, used when a changeover is added AND again
+  // before any record carrying it is written (individual save and Finalize),
+  // so no save path can store a changeover that falls in lunch, clashes with
+  // another changeover, or lies outside the shift.
+  function changeoverError(co: ChangeoverInfo): string | null {
+    return validateChangeoverInterval({
+      interval: { start: co.startAbs ?? co.atAbs, end: co.endAbs ?? co.atAbs },
+      slots: visibleSlots,
+      otherIntervals: otherChangeoverIntervals(co.slotIndex),
+      // Single-time changeovers are an instant; older sessions may still
+      // hold start/end intervals, which are validated as intervals.
+      allowInstant: true,
+    });
+  }
+
+  // Resolves the typed changeover time to the slot it affects, or explains
+  // why it can't be used. Shared by the live preview in the modal and by
+  // Confirm, so what the supervisor sees is exactly what gets recorded.
+  function resolveChangeoverEntry(text: string):
+    | { ok: true; atAbs: number; slot: Slot; atSlotStart: boolean }
+    | { ok: false; error: string } {
+    const minuteOfDay = parseTimeInput(text);
+    if (minuteOfDay == null) {
+      return { ok: false, error: 'Enter the changeover time as HH:MM in 24-hour format (00–23 : 00–59), e.g. 10:20 or 14:05.' };
+    }
+    const atAbs = timeOfDayToShiftAbs(minuteOfDay, selectedShift);
+    const placement = placeChangeoverTime(atAbs, visibleSlots, otherChangeoverIntervals(-1));
+    if (!placement.ok) return placement;
+    if (storedChangeovers[placement.slot.index]) {
+      return { ok: false, error: `${placement.slot.label} already has a changeover. Remove it first if it needs correcting.` };
+    }
+    return { ok: true, atAbs, slot: placement.slot, atSlotStart: placement.atSlotStart };
+  }
+
+  const confirmChangeover = () => {
+    try {
       if (changeModalNewPartIndex == null) {
-        console.log('[confirmChangeover] EARLY RETURN — no part selected, changeModalNewPartIndex is null');
         Alert.alert('Pick part', 'Select the new part first.');
         return;
       }
 
-      // 1. Read the current local time, 2. convert it to the shift's absolute
-      // minutes (Shift B runs past midnight, so times after midnight but
-      // before noon are shifted +1440 to stay in the same continuously
-      // increasing minute frame the slots themselves use).
-      const now = new Date();
-      let abs = now.getHours() * 60 + now.getMinutes();
-      if (selectedShift === 'B' && now.getHours() < 12) abs += 1440;
-      console.log('[confirmChangeover] computed abs time', { now: now.toString(), hours: now.getHours(), minutes: now.getMinutes(), abs });
-
-      // 3. Find the slot that actually contains this moment — no fallback.
-      // Previously `?? slots[0]` meant that whenever the current time fell
-      // outside every slot's window (before the shift started, after it — or
-      // its OT — ended, etc.) the changeover silently landed on the FIRST
-      // slot instead of the real current one. Require a genuine match; if
-      // there isn't one, tell the supervisor instead of guessing.
-      console.log('[confirmChangeover] visibleSlots windows', visibleSlots.map((s) => ({ index: s.index, label: s.label, startMinutesAbs: s.startMinutesAbs, endMinutesAbs: s.endMinutesAbs })));
-      const slot = visibleSlots.find((s) => abs >= s.startMinutesAbs && abs < s.endMinutesAbs);
-      console.log('[confirmChangeover] visibleSlots.find result', slot ? { index: slot.index, label: slot.label } : undefined);
-      if (!slot) {
-        console.log('[confirmChangeover] EARLY RETURN — no slot contains current time', { abs });
-        Alert.alert(
-          'Outside shift hours',
-          'The current time does not fall within any slot of this shift, so a changeover cannot be recorded right now.'
-        );
+      // The manually entered time is the only source — the device clock is
+      // never used here.
+      const entry = resolveChangeoverEntry(changeTimeText);
+      if (!entry.ok) {
+        if (Platform.OS === 'web') window.alert(entry.error);
+        else Alert.alert('Invalid changeover time', entry.error);
         return;
       }
+      const { atAbs, slot, atSlotStart } = entry;
 
-      const beforeMinutes = Math.max(0, abs - slot.startMinutesAbs);
-      const afterMinutes = Math.max(0, slot.endMinutesAbs - abs);
-      console.log('[confirmChangeover] segment minutes', { beforeMinutes, afterMinutes });
-      // BUG FIX: this used to be hardcoded to `selectedPartIndex` — the part
-      // the session STARTED with — so every changeover after the first one
-      // incorrectly treated the original part as "old," reverting the active
-      // part instead of continuing from wherever it actually was. Use the
-      // real active part for this slot instead, which already accounts for
-      // every earlier changeover (see activePartIndexBySlot below).
+      // The part running in this slot before the changeover — accounts for
+      // every earlier changeover (see activePartIndexBySlot).
       const oldIdx = activePartIndexBySlot[slot.index] ?? selectedPartIndex;
-      const oldCycle = selectedLine?.parts?.[oldIdx]?.cycleTimeSeconds ?? 0;
-      const newCycle = selectedLine?.parts?.[changeModalNewPartIndex]?.cycleTimeSeconds ?? 0;
-      console.log('[confirmChangeover] part resolution', { oldIdx, oldCycle, newIdx: changeModalNewPartIndex, newCycle });
+      if (oldIdx === changeModalNewPartIndex) {
+        Alert.alert('Same part', `${selectedLine?.parts?.[oldIdx]?.name ?? 'This part'} is already running in ${slot.label}. Pick a different part.`);
+        return;
+      }
+      // Stored in the existing changeover shape: one time, so start === end
+      // and duration 0. Segment minutes/expected parts are recomputed from
+      // the shared schedule by the `allChangeovers` memo; stored here only
+      // as a snapshot.
       const info: ChangeoverInfo = {
-        slotIndex: slot.index, atAbs: abs, oldPartIndex: oldIdx, newPartIndex: changeModalNewPartIndex,
-        beforeMinutes, afterMinutes,
-        expectedBefore: oldCycle > 0 ? Math.floor((beforeMinutes * 60) / oldCycle) : 0,
-        expectedAfter: newCycle > 0 ? Math.floor((afterMinutes * 60) / newCycle) : 0,
+        slotIndex: slot.index, atAbs, startAbs: atAbs, endAbs: atAbs, durationMinutes: 0,
+        oldPartIndex: oldIdx, newPartIndex: changeModalNewPartIndex,
+        beforeMinutes: 0, afterMinutes: 0, expectedBefore: 0, expectedAfter: 0,
       };
-      console.log('[confirmChangeover] built ChangeoverInfo', info);
-      const nextChangeovers = { ...changeovers, [slot.index]: info };
-      console.log('[confirmChangeover] calling setChangeovers');
-      setChangeovers(nextChangeovers);
-      console.log('[confirmChangeover] calling setProducedSegment (clear before/after)');
+
+      setChangeovers((p) => ({ ...p, [slot.index]: info }));
       setProducedSegment((p) => ({ ...p, [`${slot.index}:before`]: null, [`${slot.index}:after`]: null }));
-      console.log('[confirmChangeover] calling setChangeModalVisible(false)');
+      markSlotUnsaved(slot.index);
       setChangeModalVisible(false);
       // Persist immediately
-      console.log('[confirmChangeover] scheduling persistSession() via setTimeout');
-      setTimeout(() => {
-        console.log('[confirmChangeover] persistSession() firing now (from setTimeout)');
-        persistSession();
-      }, 100);
-      console.log('[confirmChangeover] about to show success Alert.alert — if this is the last log you see, Alert.alert itself is where web execution appears to stop (it does not render a dialog on web, so its callback, if any, never fires — note this particular alert has NO callback, so the changeover IS already fully applied by this point regardless)');
-      Alert.alert('Changeover recorded', `Recorded at ${formatAbsMinutesToAmPm(abs)} for ${slot.label}`);
-      console.log('[confirmChangeover] END — completed successfully');
+      setTimeout(() => persistSession(), 100);
+      Alert.alert(
+        'Changeover recorded',
+        atSlotStart
+          ? `${formatAbsMinutesToAmPm(atAbs)} — ${slot.label} runs entirely on the new part.`
+          : `${formatAbsMinutesToAmPm(atAbs)} — ${slot.label} split into ${formatAbsMinutesToAmPm(slot.startMinutesAbs)}–${formatAbsMinutesToAmPm(atAbs)} and ${formatAbsMinutesToAmPm(atAbs)}–${formatAbsMinutesToAmPm(slot.endMinutesAbs)}.`
+      );
     } catch (e) {
       console.error('[confirmChangeover] EXCEPTION', e);
       if (Platform.OS === 'web') {
@@ -1820,9 +2060,16 @@ export default function RecordProductionScreen() {
   // co.afterMinutes (raw), not the stop-reduced `productive`/`prodBefore`/
   // `prodAfter` variables.
   function expectedParts(partIdx: number, minutes: number) {
-    const cycle = selectedLine?.parts?.[partIdx]?.cycleTimeSeconds ?? 0;
-    if (!cycle || minutes <= 0) return 0;
-    return Math.floor((minutes * 60) / cycle);
+    return expectedPartsFor(selectedLine?.parts?.[partIdx]?.cycleTimeSeconds ?? 0, minutes);
+  }
+
+  // Where a changeover slot's AFTER segment starts: the changeover's end
+  // time, or the slot's own end when the changeover runs past it.
+  function changeoverAfterStart(slot: Slot, co: ChangeoverInfo) {
+    return changeoverSegmentWindows(
+      { start: slot.startMinutesAbs, end: slot.endMinutesAbs },
+      { start: co.startAbs ?? co.atAbs, end: co.endAbs ?? co.atAbs }
+    ).after.start;
   }
 
   // Time-equivalent of the parts that could not be made, i.e. how many
@@ -1840,17 +2087,6 @@ export default function RecordProductionScreen() {
     const s = Math.max(0, Math.floor((nowMs - startMs) / 1000));
     return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
   }
-
-  const activePartIndexBySlot = useMemo(() => {
-    const map: Record<number, number> = {};
-    let active = selectedPartIndex;
-    for (const s of slots) {
-      map[s.index] = active;
-      const co = changeovers[s.index];
-      if (co) active = co.newPartIndex;
-    }
-    return map;
-  }, [slots, selectedPartIndex, changeovers]);
 
   // The part actually in effect right now — the active part carries forward
   // through every slot after a changeover until another one happens, so
@@ -1872,12 +2108,12 @@ export default function RecordProductionScreen() {
   // find the line. A supervisor who selects a line without first narrowing by
   // Plant/Workshop/Division was getting null location fields on every slot,
   // which then silently failed to match Generate Report's filters.
-  const buildBaseDoc = () => ({
+  const buildBaseDoc = (prodDate: string) => ({
     shift: selectedShift, plant: selectedLine?.plant ?? plant ?? null, workshop: selectedLine?.workshop ?? workshop ?? null,
     division: selectedLine?.division ?? division ?? null, lineId: selectedLineId, lineName: selectedLine?.lineName ?? null,
     operators: operators.map((o) => ({ name: o.name, code: o.code })),
     supervisor: { name: supervisorName, code: supervisorCode, uid: user?.uid ?? null },
-    productionDate: productionDate ?? productionDayKeyFor(Date.now()),
+    productionDate: prodDate,
     createdAt: serverTimestamp(),
   });
 
@@ -2044,7 +2280,9 @@ export default function RecordProductionScreen() {
     if (!co) {
       const produced = producedBySlot[slot.index];
       if (produced == null) { Alert.alert('Missing', 'Enter produced for this slot.'); return; }
-      const expParts = expectedParts(selectedPartIndex, slot.productiveMinutes);
+      // Same part and minutes saveSlot uses, so the loss-reason prompt
+      // matches the loss that actually gets stored.
+      const expParts = expectedParts(activePartIndexBySlot[slot.index] ?? selectedPartIndex, slot.productiveMinutes);
       const loss = Math.max(0, expParts - produced);
       const key = String(slot.index);
       if (loss > 0 && !lossReasonBySlot[key]) {
@@ -2081,9 +2319,26 @@ export default function RecordProductionScreen() {
     if (!selectedLine) { Alert.alert('No line', 'Line not set.'); return; }
     if (anyStopRunning) { Alert.alert('Active stop', 'Resume the line before saving.'); return; }
 
+    if (!selectedLineId) { Alert.alert('No line', 'Line not set.'); return; }
+    if (savingSlotsRef.current.has(slot.index)) return; // a save for this slot is already in flight
+
+    if (slot.isBreak) return; // lunch — nothing to record
+
     const co = changeovers[slot.index] ?? null;
+    if (co) {
+      const error = changeoverError(co);
+      if (error) { Alert.alert('Invalid changeover time', `${error}\n\nRemove this changeover and add it again with valid times.`); return; }
+    }
+    savingSlotsRef.current.add(slot.index);
     setSaving(true);
     try {
+      // The session's original production date (not today's) — the same
+      // date Finalize uses, so a slot saved now and the remaining slots
+      // finalized after the cutover share one date and one set of IDs.
+      const prodDate = await resolveActiveSessionProductionDate(sessionLineId ?? selectedLineId);
+      const baseDoc = buildBaseDoc(prodDate);
+      const slotKey = { productionDate: prodDate, lineId: selectedLineId, shift: selectedShift, slotIndex: slot.index };
+      const slotId = (segment: SlotSegment): ProductionSlotIdentity => ({ ...slotKey, segment });
       if (!co) {
         // Independent record: the operator enters exactly what was produced
         // in this slot — no counter, no baseline, no subtraction.
@@ -2099,12 +2354,12 @@ export default function RecordProductionScreen() {
         const expParts = expectedParts(activePart, slot.productiveMinutes);
         const slotLossParts = Math.max(0, expParts - produced);
         const lossReason = lossReasonBySlot[String(slot.index)] ?? null;
-        await addDoc(collection(db, 'productionRecords'), {
-          ...buildBaseDoc(),
+        await upsertProductionRecord(slotId('full'), {
+          ...baseDoc,
           partName: selectedLine.parts?.[activePart]?.name ?? null,
           cycleTimeSeconds: selectedLine.parts?.[activePart]?.cycleTimeSeconds ?? null,
           slotIndex: slot.index, slotLabel: slot.label,
-          slotStartMinutesAbs: slot.startMinutesAbs, slotEndMinutesAbs: slot.endMinutesAbs,
+          slotStartMinutesAbs: slot.startMinutesAbs, slotEndMinutesAbs: slot.endMinutesAbs, hourStartMinutesAbs: slot.hourStartAbs,
           slotDurationMinutes: slot.durationMinutes, productiveMinutes: productive,
           expectedParts: expParts,
           producedThisSlot: produced,
@@ -2118,7 +2373,8 @@ export default function RecordProductionScreen() {
           lossReasonNote: lossReason?.note ?? null,
           rejections: rejectionsBySlot[slot.index] ?? 0,
           stopEvents: (stopsBySlot[slot.index] ?? []).map((se) => ({ reason: se.reason, startAbs: se.startAbs, endAbs: se.endAbs ?? null, durationMinutes: se.durationMinutes ?? null })),
-        });
+        }, resolvedRecordIdsRef.current);
+        await removeSupersededProductionRecords(slotKey, 'full', resolvedRecordIdsRef.current);
         Alert.alert('Saved', `Slot ${slot.label} saved.`);
         setSavedSlotIndices((prev) => new Set(prev).add(slot.index));
       } else {
@@ -2139,14 +2395,14 @@ export default function RecordProductionScreen() {
         const lossReasonAfter = lossReasonBySlot[`${slot.index}:after`] ?? null;
         const lossPartsBefore = Math.max(0, expBefore - pb);
         const lossPartsAfter = Math.max(0, expAfter - pa);
-        await addDoc(collection(db, 'productionRecords'), {
-          ...buildBaseDoc(),
+        await upsertProductionRecord(slotId('before'), {
+          ...baseDoc,
           partName: selectedLine.parts?.[co.oldPartIndex]?.name ?? null,
           cycleTimeSeconds: selectedLine.parts?.[co.oldPartIndex]?.cycleTimeSeconds ?? null,
           slotIndex: slot.index,
           slotLabel: `${formatAbsMinutesToAmPm(slot.startMinutesAbs)} - ${formatAbsMinutesToAmPm(co.atAbs)} — ${selectedLine.parts?.[co.oldPartIndex]?.name ?? 'Part'}`,
-          slotStartMinutesAbs: slot.startMinutesAbs, slotEndMinutesAbs: co.atAbs,
-          slotDurationMinutes: co.beforeMinutes, productiveMinutes: prodBefore,
+          slotStartMinutesAbs: slot.startMinutesAbs, slotEndMinutesAbs: co.atAbs, hourStartMinutesAbs: slot.hourStartAbs,
+          slotDurationMinutes: co.atAbs - slot.startMinutesAbs, productiveMinutes: prodBefore,
           expectedParts: expBefore,
           producedThisSlot: pb,
           lossParts: lossPartsBefore,
@@ -2156,15 +2412,15 @@ export default function RecordProductionScreen() {
           lossReasonNote: lossReasonBefore?.note ?? null,
           rejections: rejectionsBySlot[`${slot.index}:before`] ?? 0, stopEvents: stopEventsArr,
           changeoverInfo: co, partSegment: 'before',
-        });
-        await addDoc(collection(db, 'productionRecords'), {
-          ...buildBaseDoc(),
+        }, resolvedRecordIdsRef.current);
+        await upsertProductionRecord(slotId('after'), {
+          ...baseDoc,
           partName: selectedLine.parts?.[co.newPartIndex]?.name ?? null,
           cycleTimeSeconds: selectedLine.parts?.[co.newPartIndex]?.cycleTimeSeconds ?? null,
           slotIndex: slot.index,
-          slotLabel: `${formatAbsMinutesToAmPm(co.atAbs)} - ${formatAbsMinutesToAmPm(slot.endMinutesAbs)} — ${selectedLine.parts?.[co.newPartIndex]?.name ?? 'Part'}`,
-          slotStartMinutesAbs: co.atAbs, slotEndMinutesAbs: slot.endMinutesAbs,
-          slotDurationMinutes: co.afterMinutes, productiveMinutes: prodAfter,
+          slotLabel: `${formatAbsMinutesToAmPm(changeoverAfterStart(slot, co))} - ${formatAbsMinutesToAmPm(slot.endMinutesAbs)} — ${selectedLine.parts?.[co.newPartIndex]?.name ?? 'Part'}`,
+          slotStartMinutesAbs: changeoverAfterStart(slot, co), slotEndMinutesAbs: slot.endMinutesAbs, hourStartMinutesAbs: slot.hourStartAbs,
+          slotDurationMinutes: slot.endMinutesAbs - changeoverAfterStart(slot, co), productiveMinutes: prodAfter,
           expectedParts: expAfter,
           producedThisSlot: pa,
           lossParts: lossPartsAfter,
@@ -2174,7 +2430,8 @@ export default function RecordProductionScreen() {
           lossReasonNote: lossReasonAfter?.note ?? null,
           rejections: rejectionsBySlot[`${slot.index}:after`] ?? 0, stopEvents: stopEventsArr,
           changeoverInfo: co, partSegment: 'after',
-        });
+        }, resolvedRecordIdsRef.current);
+        await removeSupersededProductionRecords(slotKey, 'split', resolvedRecordIdsRef.current);
         Alert.alert('Saved', `Slot ${slot.label} saved (split).`);
         setSavedSlotIndices((prev) => new Set(prev).add(slot.index));
       }
@@ -2182,9 +2439,10 @@ export default function RecordProductionScreen() {
       persistSession();
     } catch (err) {
       console.error('saveSlot', err);
-      Alert.alert('Error', 'Could not save slot.');
+      Alert.alert('Error', 'Could not save slot. Your entries are kept — tap Save Slot to retry.');
     } finally {
-      setSaving(false);
+      savingSlotsRef.current.delete(slot.index);
+      setSaving(savingSlotsRef.current.size > 0);
     }
   };
 
@@ -2484,20 +2742,20 @@ export default function RecordProductionScreen() {
             <Text style={styles.sectionLabel}>CHANGEOVERS</Text>
             <Pressable onPress={openAddChangeover} style={styles.addChangeBtn} disabled={isLineStopped}>
               <Ionicons name="shuffle" size={16} color={isLineStopped ? '#5C6670' : '#F2A93B'} />
-              <Text style={[styles.addChangeText, isLineStopped && { color: '#5C6670' }]}>Add (captures now)</Text>
+              <Text style={[styles.addChangeText, isLineStopped && { color: '#5C6670' }]}>Add</Text>
             </Pressable>
           </View>
-          {Object.values(changeovers).length === 0 ? (
+          {Object.values(allChangeovers).length === 0 ? (
             <Text style={styles.muted}>No changeovers</Text>
-          ) : Object.values(changeovers).map((co) => co && (
+          ) : Object.values(allChangeovers).map((co) => co && (
             <View key={co.slotIndex} style={styles.changeRow}>
               <Text style={{ color: '#ECEFF2', fontWeight: '700', fontSize: 12 }}>
                 {slots.find((s) => s.index === co.slotIndex)?.label ?? `Slot ${co.slotIndex}`}
               </Text>
               <Text style={{ color: '#8A96A3', fontSize: 12, flex: 1, marginLeft: 8 }}>
-                {selectedLine?.parts?.[co.oldPartIndex]?.name ?? '?'} → {selectedLine?.parts?.[co.newPartIndex]?.name ?? '?'} @ {formatAbsMinutesToAmPm(co.atAbs)}
+                {selectedLine?.parts?.[co.oldPartIndex]?.name ?? '?'} → {selectedLine?.parts?.[co.newPartIndex]?.name ?? '?'} · {formatAbsMinutesToAmPm(co.startAbs ?? co.atAbs)}{(co.endAbs ?? co.atAbs) > (co.startAbs ?? co.atAbs) ? ` – ${formatAbsMinutesToAmPm(co.endAbs ?? co.atAbs)} (${co.durationMinutes ?? 0} min)` : ''}
               </Text>
-              <Pressable onPress={() => { const idx = co.slotIndex; setChangeovers((p) => { const c = { ...p }; delete c[idx]; return c; }); setTimeout(() => persistSession(), 100); }} style={styles.removeChangeBtn}>
+              <Pressable onPress={() => { const idx = co.slotIndex; setChangeovers((p) => { const c = { ...p }; delete c[idx]; return c; }); markSlotUnsaved(idx); setTimeout(() => persistSession(), 100); }} style={styles.removeChangeBtn}>
                 <Ionicons name="close" size={16} color="#F2A93B" />
               </Pressable>
             </View>
@@ -2509,7 +2767,6 @@ export default function RecordProductionScreen() {
         {/* Slot cards */}
         {(() => {
           const cards: JSX.Element[] = [];
-          let activePart = selectedPartIndex;
 
           // Single shared card renderer used for BOTH a normal (non-changeover)
           // slot and each half of a changeover-split slot. Every card on this
@@ -2670,10 +2927,33 @@ export default function RecordProductionScreen() {
             );
           }
 
+          // Actual production window, shown when it differs from the nominal
+          // hour in the label (the slots either side of lunch).
+          const windowPrefix = (s: Slot) =>
+            s.startMinutesAbs !== s.hourStartAbs || s.endMinutesAbs !== s.hourEndAbs
+              ? `${formatAbsMinutesToAmPm(s.startMinutesAbs)}–${formatAbsMinutesToAmPm(s.endMinutesAbs)} · `
+              : '';
+
           for (const s of visibleSlots) {
             const co = changeovers[s.index] ?? null;
 
+            if (s.isBreak) {
+              cards.push(
+                <View key={`slot-${s.index}`} style={[styles.slotCard, { opacity: 0.6 }]}>
+                  <View style={styles.slotHeader}>
+                    <Text style={styles.slotLabel}>{s.label}</Text>
+                    <Text style={styles.muted}>0 min prod.</Text>
+                  </View>
+                  <Text style={styles.muted}>
+                    Lunch break {formatAbsMinutesToAmPm(LUNCH_BREAK.start)} – {formatAbsMinutesToAmPm(LUNCH_BREAK.end)} · no production
+                  </Text>
+                </View>
+              );
+              continue;
+            }
+
             if (!co) {
+              const activePart = activePartIndexBySlot[s.index] ?? selectedPartIndex;
               const stopped = totalStoppedMinutesForSlot(s.index);
               const productive = Math.max(0, s.productiveMinutes - stopped);
               // Each card is independent — the operator enters exactly what
@@ -2690,7 +2970,7 @@ export default function RecordProductionScreen() {
                 cardKey: `slot-${s.index}`,
                 stopSlotIndex: s.index,
                 timeLabel: s.label,
-                minutesLabel: `${productive} min prod.`,
+                minutesLabel: `${windowPrefix(s)}${productive} min prod.`,
                 partName: selectedLine?.parts?.[activePart]?.name ?? '—',
                 expParts,
                 enteredValue: producedVal,
@@ -2738,7 +3018,7 @@ export default function RecordProductionScreen() {
               cards.push(renderProductionCard({
                 cardKey: `slot-${s.index}-after`,
                 stopSlotIndex: s.index,
-                timeLabel: `${formatAbsMinutesToAmPm(co.atAbs)} – ${formatAbsMinutesToAmPm(s.endMinutesAbs)}`,
+                timeLabel: `${formatAbsMinutesToAmPm(changeoverAfterStart(s, co))} – ${formatAbsMinutesToAmPm(s.endMinutesAbs)}`,
                 minutesLabel: `${prodAfter} min prod.`,
                 partName: selectedLine?.parts?.[co.newPartIndex]?.name ?? '—',
                 expParts: expAfter,
@@ -2750,8 +3030,6 @@ export default function RecordProductionScreen() {
                 onSave: () => attemptSave(s),
                 onDelete: () => handleDeleteSlot(s.index),
               }));
-
-              activePart = co.newPartIndex;
             }
           }
           return cards;
@@ -2773,13 +3051,43 @@ export default function RecordProductionScreen() {
                 </Pressable>
               )) ?? <Text style={styles.muted}>No parts</Text>}
             </ScrollView>
+            {/* Actual changeover time, typed by the supervisor (24-hour) */}
+            <View style={{ marginTop: 10 }}>
+              <Text style={styles.modalLabel}>Changeover time (24-hour)</Text>
+              <TextInput
+                value={changeTimeText}
+                onChangeText={(t) => setChangeTimeText(formatTimeInput(t))}
+                placeholder="HH:MM"
+                placeholderTextColor="#5C6670"
+                keyboardType="number-pad"
+                maxLength={5}
+                style={styles.input}
+              />
+            </View>
+            {(() => {
+              // Live preview: what the entered time will do, or why it can't
+              // be used. Nothing shown until four digits are entered.
+              if (changeTimeText.replace(/\D/g, '').length < 4) {
+                return (
+                  <Text style={[styles.muted, { marginTop: 8 }]}>
+                    Type 4 digits, e.g. 1020 → 10:20. No changeover during lunch ({formatAbsMinutesToAmPm(LUNCH_BREAK.start)} – {formatAbsMinutesToAmPm(LUNCH_BREAK.end)}).
+                  </Text>
+                );
+              }
+              const entry = resolveChangeoverEntry(changeTimeText);
+              if (!entry.ok) return <Text style={[styles.muted, { marginTop: 8, color: '#F0A8A8' }]}>{entry.error}</Text>;
+              const { atAbs, slot, atSlotStart } = entry;
+              return (
+                <Text style={[styles.muted, { marginTop: 8 }]}>
+                  {formatAbsMinutesToAmPm(atAbs)} · {atSlotStart
+                    ? `${slot.label} will run entirely on the new part.`
+                    : `${slot.label} splits into ${formatAbsMinutesToAmPm(slot.startMinutesAbs)}–${formatAbsMinutesToAmPm(atAbs)} (current part) and ${formatAbsMinutesToAmPm(atAbs)}–${formatAbsMinutesToAmPm(slot.endMinutesAbs)} (new part).`}
+                </Text>
+              );
+            })()}
             <View style={styles.modalFooter}>
               <Pressable onPress={() => setChangeModalVisible(false)} style={styles.modalBtn}><Text style={styles.modalBtnText}>Cancel</Text></Pressable>
-              <Pressable onPress={() => {
-                console.log("CONFIRM CLICKED");
-                alert("CONFIRM CLICKED");
-                confirmChangeover();
-              }} style={[styles.modalBtn, styles.modalConfirmBtn]}><Text style={[styles.modalBtnText, styles.modalConfirmBtnText]}>Confirm</Text></Pressable>
+              <Pressable onPress={confirmChangeover} style={[styles.modalBtn, styles.modalConfirmBtn]}><Text style={[styles.modalBtnText, styles.modalConfirmBtnText]}>Confirm</Text></Pressable>
             </View>
           </View>
         </View>

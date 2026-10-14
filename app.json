@@ -9,15 +9,15 @@
     "userInterfaceStyle": "light",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.technicoindustries.prodpulse2",
+      "bundleIdentifier": "com.technicoindustries.prodpulse",
       "buildNumber": "2",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
-      "package": "com.technicoindustries.prodpulse2",
-      "versionCode": 21,
+      "package": "com.technicoindustries.prodpulse",
+      "versionCode": 25,
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/logo.png",

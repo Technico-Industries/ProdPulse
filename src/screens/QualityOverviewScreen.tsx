@@ -41,6 +41,7 @@ import {
   Pressable,
   StyleSheet,
   ScrollView,
+  RefreshControl,
   TextInput,
   Modal,
   ActivityIndicator,
@@ -476,16 +477,21 @@ export default function QualityOverviewScreen() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [refreshing, setRefreshing] = useState(false);
 
   // Drops a slow response for a previously selected period.
   const requestId = useRef(0);
 
   // The Quality Report's exact query (QualityAnalysisScreen.handleSearch).
-  const fetchRange = useCallback(async (r: DateRange) => {
+  // `silent` (pull-to-refresh) keeps the current period's data on screen
+  // until the fresh result replaces it.
+  const fetchRange = useCallback(async (r: DateRange, silent = false) => {
     const id = ++requestId.current;
-    setLoading(true);
     setLoadError(null);
-    setRecords(null);
+    if (!silent) {
+      setLoading(true);
+      setRecords(null);
+    }
     try {
       const snap = await getDocs(
         query(collection(db, 'rejectionRecords'), where('date', '>=', r.from), where('date', '<=', r.to))
@@ -527,6 +533,15 @@ export default function QualityOverviewScreen() {
     if (!prefsLoaded) return;
     fetchRange(range);
   }, [prefsLoaded, range, fetchRange]);
+
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await fetchRange(range, true);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [fetchRange, range]);
 
   const filtered = useMemo(
     () =>
@@ -623,12 +638,14 @@ export default function QualityOverviewScreen() {
   );
 
   // ── Responsive layout — percentage widths in wrapping rows, no overflow.
-  const isWide = width >= 900;
-  const kpiColumns = width >= 1100 ? 5 : width >= 700 ? 3 : 2;
+  // Compact layout: all five KPI tiles on one row from tablet width up, and
+  // a smaller donut, so more of the period fits on screen.
+  const isWide = width >= 760;
+  const kpiColumns = width >= 600 ? 5 : width >= 380 ? 3 : 2;
   const kpiWidth = `${100 / kpiColumns - (kpiColumns === 2 ? 1.6 : 1.2)}%`;
-  const infoColumns = width >= 1100 ? 3 : width >= 700 ? 2 : 1;
+  const infoColumns = width >= 1000 ? 3 : width >= 600 ? 2 : 1;
   const infoWidth = infoColumns === 1 ? '100%' : `${100 / infoColumns - (infoColumns === 2 ? 1.6 : 1.2)}%`;
-  const donutRadius = isWide ? 104 : Math.max(78, Math.min(104, (width - 64) / 3.4));
+  const donutRadius = isWide ? 80 : Math.max(64, Math.min(80, (width - 48) / 4));
 
   const isMultiDay = range.from !== range.to;
   const activeFilters = [shift ? `Shift ${shift}` : null, plant, workshop, division].filter(Boolean) as string[];
@@ -657,7 +674,12 @@ export default function QualityOverviewScreen() {
         </View>
       </View>
 
-      <ScrollView style={{ flex: 1 }} contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false}>
+      <ScrollView
+        style={{ flex: 1 }}
+        contentContainerStyle={styles.scroll}
+        showsVerticalScrollIndicator={false}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#4C9A6A" colors={['#4C9A6A']} />}
+      >
         {/* ── Period + plant ─────────────────────────────────────────── */}
         <View style={styles.block}>
           <Text style={styles.sectionLabel}>REPORT PERIOD</Text>
@@ -967,10 +989,10 @@ const styles = StyleSheet.create({
   header: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 12,
-    paddingHorizontal: 16,
-    paddingTop: 14,
-    paddingBottom: 14,
+    gap: 8,
+    paddingHorizontal: 12,
+    paddingTop: 10,
+    paddingBottom: 10,
     borderBottomWidth: 1,
     borderBottomColor: '#2C343C',
   },
@@ -985,63 +1007,64 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   pressed: { backgroundColor: '#242B32', borderColor: '#3A434C' },
-  brand: { color: '#ECEFF2', fontSize: 19, fontWeight: '900', letterSpacing: 0.3 },
-  brandSub: { color: '#8A96A3', fontSize: 12.5, marginTop: 1 },
+  brand: { color: '#ECEFF2', fontSize: 16, fontWeight: '900', letterSpacing: 0.3 },
+  brandSub: { color: '#8A96A3', fontSize: 11.5, marginTop: 1 },
   rolePill: {
     borderWidth: 1,
     borderColor: '#4C9A6A',
     backgroundColor: '#4C9A6A22',
     borderRadius: 20,
-    paddingHorizontal: 11,
-    paddingVertical: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
   },
-  rolePillText: { color: '#4C9A6A', fontSize: 10.5, fontWeight: '900', letterSpacing: 1 },
+  rolePillText: { color: '#4C9A6A', fontSize: 10, fontWeight: '900', letterSpacing: 1 },
 
-  scroll: { paddingHorizontal: 16, paddingTop: 16, paddingBottom: 40, gap: 16 },
-  sectionLabel: { color: '#5C6670', fontSize: 10.5, fontWeight: '800', letterSpacing: 1.2 },
-  block: { gap: 10 },
-  blockHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10 },
-  grid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
-  footnote: { color: '#5C6670', fontSize: 11 },
+  // Bottom padding clears the dashboard pager's floating page tabs.
+  scroll: { paddingHorizontal: 12, paddingTop: 12, paddingBottom: 72, gap: 11 },
+  sectionLabel: { color: '#5C6670', fontSize: 10, fontWeight: '800', letterSpacing: 1.2 },
+  block: { gap: 7 },
+  blockHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 7 },
+  grid: { flexDirection: 'row', flexWrap: 'wrap', gap: 7 },
+  footnote: { color: '#5C6670', fontSize: 10 },
   rowBorder: { borderTopWidth: 1, borderTopColor: '#2C343C' },
 
   // Period
-  dateRow: { flexDirection: 'row', alignItems: 'center', gap: 10, flexWrap: 'wrap' },
+  dateRow: { flexDirection: 'row', alignItems: 'center', gap: 7, flexWrap: 'wrap' },
   dateButton: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 9,
+    gap: 6,
     backgroundColor: '#1D2329',
     borderWidth: 1,
     borderColor: '#2C343C',
     borderRadius: 10,
-    paddingHorizontal: 14,
-    paddingVertical: 11,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
     flexShrink: 1,
   },
-  dateButtonText: { color: '#ECEFF2', fontSize: 15, fontWeight: '700', flexShrink: 1 },
+  dateButtonText: { color: '#ECEFF2', fontSize: 14, fontWeight: '700', flexShrink: 1 },
   relPill: {
     borderWidth: 1,
     borderColor: '#4C9A6A',
     backgroundColor: '#4C9A6A22',
     borderRadius: 16,
-    paddingHorizontal: 10,
-    paddingVertical: 4,
+    paddingHorizontal: 7,
+    paddingVertical: 3,
   },
-  relPillText: { color: '#4C9A6A', fontSize: 11, fontWeight: '800' },
-  todayLink: { paddingVertical: 4 },
-  todayLinkText: { color: '#3E7CB1', fontSize: 12.5, fontWeight: '700' },
-  presetRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-  filterRow: { flexDirection: 'row', gap: 8 },
-  filterItem: { flex: 1, minWidth: 0, gap: 4 },
+  relPillText: { color: '#4C9A6A', fontSize: 10, fontWeight: '800' },
+  todayLink: { paddingVertical: 3 },
+  todayLinkText: { color: '#3E7CB1', fontSize: 11.5, fontWeight: '700' },
+  presetRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
+  filterRow: { flexDirection: 'row', gap: 6 },
+  filterItem: { flex: 1, minWidth: 0, gap: 3 },
   filterLabel: { color: '#5C6670', fontSize: 10, fontWeight: '800', letterSpacing: 1 },
   filterBox: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    gap: 4,
+    gap: 3,
     height: 38,
-    paddingHorizontal: 10,
+    paddingHorizontal: 7,
     borderWidth: 1,
     borderColor: '#2C343C',
     backgroundColor: '#1D2329',
@@ -1049,28 +1072,28 @@ const styles = StyleSheet.create({
   },
   filterBoxActive: { borderColor: '#4C9A6A', backgroundColor: '#4C9A6A22' },
   filterBoxDisabled: { opacity: 0.4 },
-  filterBoxText: { flex: 1, minWidth: 0, color: '#8A96A3', fontSize: 12.5, fontWeight: '600' },
+  filterBoxText: { flex: 1, minWidth: 0, color: '#8A96A3', fontSize: 11.5, fontWeight: '600' },
   filterBoxTextActive: { color: '#4C9A6A' },
   filterOption: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 12,
-    paddingVertical: 12,
+    paddingHorizontal: 8,
+    paddingVertical: 8,
     borderRadius: 8,
   },
   filterOptionActive: { backgroundColor: '#4C9A6A18' },
-  filterOptionText: { color: '#ECEFF2', fontSize: 14 },
+  filterOptionText: { color: '#ECEFF2', fontSize: 13 },
   presetChip: {
     borderWidth: 1,
     borderColor: '#2C343C',
     backgroundColor: '#1D2329',
     borderRadius: 16,
-    paddingHorizontal: 13,
-    paddingVertical: 7,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
   },
   presetChipActive: { borderColor: '#4C9A6A', backgroundColor: '#4C9A6A22' },
-  presetChipText: { color: '#8A96A3', fontSize: 12.5, fontWeight: '600' },
+  presetChipText: { color: '#8A96A3', fontSize: 11.5, fontWeight: '600' },
   presetChipTextActive: { color: '#4C9A6A' },
 
   // Hero
@@ -1079,33 +1102,33 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#D6454555',
     borderRadius: 14,
-    paddingVertical: 26,
-    paddingHorizontal: 20,
+    paddingVertical: 18,
+    paddingHorizontal: 14,
     alignItems: 'center',
   },
-  heroLabel: { color: '#8A96A3', fontSize: 11.5, fontWeight: '900', letterSpacing: 1.6 },
+  heroLabel: { color: '#8A96A3', fontSize: 10.5, fontWeight: '900', letterSpacing: 1.6 },
   heroValue: {
     color: '#D64545',
-    fontSize: 56,
+    fontSize: 40,
     fontWeight: '900',
     letterSpacing: -1.5,
-    marginTop: 6,
+    marginTop: 4,
     fontVariant: ['tabular-nums'],
   },
-  heroUnit: { color: '#8A96A3', fontSize: 13.5, marginTop: 2 },
-  heroFooter: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: 8, marginTop: 18 },
+  heroUnit: { color: '#8A96A3', fontSize: 12.5, marginTop: 2 },
+  heroFooter: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: 6, marginTop: 13 },
   heroChip: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 5,
+    gap: 4,
     backgroundColor: '#14181C',
     borderWidth: 1,
     borderColor: '#2C343C',
     borderRadius: 16,
-    paddingHorizontal: 10,
-    paddingVertical: 5,
+    paddingHorizontal: 7,
+    paddingVertical: 4,
   },
-  heroChipText: { color: '#8A96A3', fontSize: 11.5, fontWeight: '700' },
+  heroChipText: { color: '#8A96A3', fontSize: 10.5, fontWeight: '700' },
   heroChipScoped: { borderColor: '#4C9A6A', backgroundColor: '#4C9A6A18' },
 
   // KPI tiles
@@ -1114,16 +1137,16 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#2C343C',
     borderRadius: 12,
-    paddingVertical: 14,
-    paddingHorizontal: 14,
-    minHeight: 84,
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    minHeight: 63,
     justifyContent: 'space-between',
   },
-  kpiLabel: { color: '#8A96A3', fontSize: 11.5, fontWeight: '700' },
-  kpiValue: { color: '#ECEFF2', fontSize: 25, fontWeight: '900', fontVariant: ['tabular-nums'], marginTop: 8 },
+  kpiLabel: { color: '#8A96A3', fontSize: 10.5, fontWeight: '700' },
+  kpiValue: { color: '#ECEFF2', fontSize: 21, fontWeight: '900', fontVariant: ['tabular-nums'], marginTop: 6 },
 
   // Division ranking + donut
-  mainRow: { flexDirection: 'row', gap: 16, alignItems: 'flex-start' },
+  mainRow: { flexDirection: 'row', gap: 11, alignItems: 'flex-start' },
   mainRowStacked: { flexDirection: 'column', alignItems: 'stretch' },
   divCard: {
     backgroundColor: '#1D2329',
@@ -1136,44 +1159,44 @@ const styles = StyleSheet.create({
   divHeader: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 10,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
+    gap: 7,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
     borderWidth: 0,
   },
-  divName: { color: '#ECEFF2', fontSize: 15, fontWeight: '900' },
-  divMeta: { color: '#8A96A3', fontSize: 11.5, marginTop: 2 },
-  divQty: { color: '#D64545', fontSize: 20, fontWeight: '900', fontVariant: ['tabular-nums'] },
+  divName: { color: '#ECEFF2', fontSize: 14, fontWeight: '900' },
+  divMeta: { color: '#8A96A3', fontSize: 10.5, marginTop: 2 },
+  divQty: { color: '#D64545', fontSize: 17, fontWeight: '900', fontVariant: ['tabular-nums'] },
   divQtyUnit: { color: '#5C6670', fontSize: 10, fontWeight: '700' },
   shareTrack: { height: 3, backgroundColor: '#14181C' },
   shareFill: { height: 3, backgroundColor: '#D64545' },
-  lineList: { paddingHorizontal: 14, paddingLeft: 42, paddingBottom: 4, backgroundColor: '#191E23' },
-  lineRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 10 },
-  lineName: { color: '#ECEFF2', fontSize: 13.5, fontWeight: '700' },
-  lineSub: { color: '#8A96A3', fontSize: 11.5, marginTop: 1 },
-  lineQty: { color: '#ECEFF2', fontSize: 15, fontWeight: '900', fontVariant: ['tabular-nums'] },
+  lineList: { paddingHorizontal: 10, paddingLeft: 29, paddingBottom: 3, backgroundColor: '#191E23' },
+  lineRow: { flexDirection: 'row', alignItems: 'center', gap: 7, paddingVertical: 7 },
+  lineName: { color: '#ECEFF2', fontSize: 12.5, fontWeight: '700' },
+  lineSub: { color: '#8A96A3', fontSize: 10.5, marginTop: 1 },
+  lineQty: { color: '#ECEFF2', fontSize: 14, fontWeight: '900', fontVariant: ['tabular-nums'] },
 
   card: {
     backgroundColor: '#1D2329',
     borderWidth: 1,
     borderColor: '#2C343C',
     borderRadius: 12,
-    padding: 14,
+    padding: 10,
   },
-  cardHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 },
-  cardLabel: { color: '#8A96A3', fontSize: 11, fontWeight: '900', letterSpacing: 1.2 },
-  cardMeta: { color: '#5C6670', fontSize: 11, fontWeight: '700' },
+  cardHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 },
+  cardLabel: { color: '#8A96A3', fontSize: 10, fontWeight: '900', letterSpacing: 1.2 },
+  cardMeta: { color: '#5C6670', fontSize: 10, fontWeight: '700' },
 
-  donutCenterValue: { color: '#ECEFF2', fontSize: 26, fontWeight: '900', fontVariant: ['tabular-nums'] },
-  donutCenterLabel: { color: '#8A96A3', fontSize: 10.5, fontWeight: '800', letterSpacing: 1.2 },
-  legend: { alignSelf: 'stretch', marginTop: 16, gap: 8 },
-  legendRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  donutCenterValue: { color: '#ECEFF2', fontSize: 22, fontWeight: '900', fontVariant: ['tabular-nums'] },
+  donutCenterLabel: { color: '#8A96A3', fontSize: 10, fontWeight: '800', letterSpacing: 1.2 },
+  legend: { alignSelf: 'stretch', marginTop: 11, gap: 6 },
+  legendRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   legendDot: { width: 10, height: 10, borderRadius: 5 },
-  legendText: { color: '#ECEFF2', fontSize: 13, flex: 1 },
-  legendShare: { color: '#5C6670', fontSize: 11.5, fontWeight: '700', fontVariant: ['tabular-nums'] },
+  legendText: { color: '#ECEFF2', fontSize: 12, flex: 1 },
+  legendShare: { color: '#5C6670', fontSize: 10.5, fontWeight: '700', fontVariant: ['tabular-nums'] },
   legendValue: {
     color: '#ECEFF2',
-    fontSize: 13.5,
+    fontSize: 12.5,
     fontWeight: '900',
     minWidth: 40,
     textAlign: 'right',
@@ -1181,12 +1204,12 @@ const styles = StyleSheet.create({
   },
 
   // Ranked cards
-  rankRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 8 },
-  rankLabel: { color: '#ECEFF2', fontSize: 13, fontWeight: '600', flex: 1 },
-  rankShare: { color: '#5C6670', fontSize: 11.5, fontWeight: '700', fontVariant: ['tabular-nums'] },
+  rankRow: { flexDirection: 'row', alignItems: 'center', gap: 7, paddingVertical: 6 },
+  rankLabel: { color: '#ECEFF2', fontSize: 12, fontWeight: '600', flex: 1 },
+  rankShare: { color: '#5C6670', fontSize: 10.5, fontWeight: '700', fontVariant: ['tabular-nums'] },
   rankQty: {
     color: '#ECEFF2',
-    fontSize: 14,
+    fontSize: 13,
     fontWeight: '900',
     minWidth: 40,
     textAlign: 'right',
@@ -1194,26 +1217,26 @@ const styles = StyleSheet.create({
   },
 
   // Latest entries
-  entryRow: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 10 },
-  entryTitle: { color: '#ECEFF2', fontSize: 13.5, fontWeight: '800' },
-  entryMeta: { color: '#8A96A3', fontSize: 11.5 },
-  entryRemarks: { color: '#8A96A3', fontSize: 11.5, fontStyle: 'italic' },
-  entryQty: { color: '#D64545', fontSize: 16, fontWeight: '900', fontVariant: ['tabular-nums'] },
+  entryRow: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 7 },
+  entryTitle: { color: '#ECEFF2', fontSize: 12.5, fontWeight: '800' },
+  entryMeta: { color: '#8A96A3', fontSize: 10.5 },
+  entryRemarks: { color: '#8A96A3', fontSize: 10.5, fontStyle: 'italic' },
+  entryQty: { color: '#D64545', fontSize: 14.5, fontWeight: '900', fontVariant: ['tabular-nums'] },
 
   // Loading / empty / error
-  stateBlock: { gap: 12, alignItems: 'center' },
+  stateBlock: { gap: 8, alignItems: 'center' },
   skeletonHero: {
     width: '100%',
-    height: 160,
+    height: 120,
     borderRadius: 14,
     backgroundColor: '#1D2329',
     borderWidth: 1,
     borderColor: '#2C343C',
   },
-  skeletonRow: { flexDirection: 'row', gap: 12, width: '100%' },
+  skeletonRow: { flexDirection: 'row', gap: 8, width: '100%' },
   skeletonHalf: {
     flex: 1,
-    height: 120,
+    height: 90,
     borderRadius: 14,
     backgroundColor: '#1D2329',
     borderWidth: 1,
@@ -1224,10 +1247,10 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#2C343C',
     borderRadius: 14,
-    paddingVertical: 36,
-    paddingHorizontal: 24,
+    paddingVertical: 25,
+    paddingHorizontal: 17,
     alignItems: 'center',
-    gap: 8,
+    gap: 6,
   },
   stateIcon: {
     width: 64,
@@ -1238,9 +1261,9 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     marginBottom: 4,
   },
-  stateTitle: { color: '#ECEFF2', fontSize: 16.5, fontWeight: '800', textAlign: 'center' },
-  stateText: { color: '#8A96A3', fontSize: 13, textAlign: 'center' },
-  stateDate: { color: '#ECEFF2', fontSize: 14, fontWeight: '800' },
+  stateTitle: { color: '#ECEFF2', fontSize: 15, fontWeight: '800', textAlign: 'center' },
+  stateText: { color: '#8A96A3', fontSize: 12, textAlign: 'center' },
+  stateDate: { color: '#ECEFF2', fontSize: 13, fontWeight: '800' },
   retryButton: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1253,7 +1276,7 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     marginTop: 8,
   },
-  retryText: { color: '#ECEFF2', fontSize: 13.5, fontWeight: '700' },
+  retryText: { color: '#ECEFF2', fontSize: 12.5, fontWeight: '700' },
 
   // Period modal
   modalScrim: {

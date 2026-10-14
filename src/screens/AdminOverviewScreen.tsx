@@ -26,8 +26,15 @@
 //   downtimeMinutes  = Σ stopEvents[].durationMinutes
 //   efficiency       = produced / expected * 100   (GenerateReportScreen summary)
 //   achievementPct   = actual / plan * 100         (KPIAnalysisScreen totals — same figure)
-//   rejectionPct     = rejections / (actual + rejections) * 100  (KPIAnalysisScreen totals)
-//   qualityPct       = 100 - rejectionPct
+//   goodParts        = Σ producedThisSlot  (KPIAnalysisScreen: produced is the GOOD output)
+//   qcRejected       = Σ rejectionRecords.rejectionQty, same day + filters
+//   inspected        = goodParts + qcRejected
+//   rejectionPct     = qcRejected / inspected * 100  (KPIAnalysisScreen formula)
+//   qualityPct       = 100 - rejectionPct            (see src/utils/qualityMetrics.ts)
+// QC-logged rejectionRecords are the authoritative rejection count. The
+// supervisor's per-slot `rejections` are shown for reference but never
+// added — nothing links them to QC records, so adding both could count the
+// same parts twice.
 //   operatorHours    = Σ operatorCount × productiveMinutes / 60  (KPIAnalysisScreen byLine)
 //   pcsPerManHour    = actual / operatorHours      (KPIAnalysisScreen totals)
 
@@ -38,6 +45,7 @@ import {
   Pressable,
   StyleSheet,
   ScrollView,
+  RefreshControl,
   TextInput,
   Modal,
   ActivityIndicator,
@@ -50,6 +58,12 @@ import { db } from '../services/firebase';
 import { PLANTS, WORKSHOPS, DIVISIONS } from '../constants/lineOptions';
 import AppDrawer from '../components/AppDrawer';
 import { ADMIN_MENU_ITEMS } from '../constants/adminMenu';
+import {
+  QcRejectionRecord,
+  computeQuality,
+  filterQcRecords,
+  sumRejectionQty,
+} from '../utils/qualityMetrics';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 // Same field set the other production screens map off each Firestore doc.
@@ -131,12 +145,6 @@ function prettyDate(s: string): string {
   if (!isValidDateStr(s)) return s;
   const [y, m, d] = s.split('-');
   return `${d} ${MONTHS[Number(m) - 1]} ${y}`;
-}
-
-function relativeDayLabel(s: string): string | null {
-  if (s === todayStr()) return 'Today';
-  if (s === dateStrDaysAgo(1)) return 'Yesterday';
-  return null;
 }
 
 function round1(n: number) {
@@ -416,18 +424,23 @@ export default function AdminOverviewScreen() {
   const [allLines, setAllLines] = useState<Line[]>([]);
   const [records, setRecords] = useState<ProductionRecord[]>([]);
   // QC-logged rejections for the same day (rejectionRecords, the collection
-  // QualityAnalysisScreen reads). Best-effort: null means "not available",
-  // which renders as "—" rather than a misleading 0.
-  const [qcRejections, setQcRejections] = useState<number | null>(null);
+  // QualityAnalysisScreen reads) — the authoritative rejection count. Kept
+  // as records, not a sum, so the Plant/Workshop/Division filters apply to
+  // them too. Best-effort: null means the read failed, which renders as "—"
+  // rather than a misleading 0 rejections / 100% quality.
+  const [qcRecords, setQcRecords] = useState<QcRejectionRecord[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [hasLoaded, setHasLoaded] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
 
   // One query per date change. Everything on this screen is derived from
   // its result set in the useMemo below.
-  const fetchDay = useCallback(async (dateStr: string) => {
+  // `silent` (pull-to-refresh) keeps the current figures on screen instead
+  // of swapping them for the loading state while the new ones arrive.
+  const fetchDay = useCallback(async (dateStr: string, silent = false) => {
     if (!isValidDateStr(dateStr)) return;
-    setLoading(true);
+    if (!silent) setLoading(true);
     setLoadError(null);
     try {
       // Local business day → the same Timestamp range GenerateReportScreen
@@ -480,17 +493,28 @@ export default function AdminOverviewScreen() {
         const qcSnap = await getDocs(
           query(collection(db, 'rejectionRecords'), where('date', '==', dateStr))
         );
-        setQcRejections(
-          qcSnap.docs.reduce((sum, d) => sum + ((d.data() as any).rejectionQty ?? 0), 0)
+        setQcRecords(
+          qcSnap.docs.map((d) => {
+            const data: any = d.data();
+            const qty = Number(data.rejectionQty);
+            return {
+              date: data.date ?? null,
+              lineId: data.lineId ?? null,
+              plant: data.plant ?? null,
+              workshop: data.workshop ?? null,
+              division: data.division ?? null,
+              rejectionQty: Number.isFinite(qty) ? qty : 0,
+            };
+          })
         );
       } catch (qcErr) {
         console.warn('[AdminOverview] rejectionRecords read failed', qcErr);
-        setQcRejections(null);
+        setQcRecords(null);
       }
     } catch (e) {
       console.error('[AdminOverview] productionRecords fetch failed', e);
       setRecords([]);
-      setQcRejections(null);
+      setQcRecords(null);
       setLoadError('Unable to load production data.');
     } finally {
       setLoading(false);
@@ -546,39 +570,46 @@ export default function AdminOverviewScreen() {
   // ── productionLines, fetched once. Not per date: the line roster doesn't
   // change between days, and it's what resolves each record's real
   // plant/workshop/division below.
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const snap = await getDocs(collection(db, 'productionLines'));
-        if (cancelled) return;
-        setAllLines(
-          snap.docs.map((d) => {
-            const data: any = d.data();
-            return {
-              id: d.id,
-              plant: data.plant ?? null,
-              workshop: data.workshop ?? null,
-              division: data.division ?? null,
-              lineName: data.lineName ?? null,
-            };
-          })
-        );
-      } catch (e) {
-        // Non-fatal: without the roster each record falls back to its own
-        // stamped plant/workshop/division (see resolvedRecords).
-        console.warn('[AdminOverview] productionLines fetch failed', e);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
+  const fetchLines = useCallback(async () => {
+    try {
+      const snap = await getDocs(collection(db, 'productionLines'));
+      setAllLines(
+        snap.docs.map((d) => {
+          const data: any = d.data();
+          return {
+            id: d.id,
+            plant: data.plant ?? null,
+            workshop: data.workshop ?? null,
+            division: data.division ?? null,
+            lineName: data.lineName ?? null,
+          };
+        })
+      );
+    } catch (e) {
+      // Non-fatal: without the roster each record falls back to its own
+      // stamped plant/workshop/division (see resolvedRecords).
+      console.warn('[AdminOverview] productionLines fetch failed', e);
+    }
   }, []);
+
+  useEffect(() => {
+    fetchLines();
+  }, [fetchLines]);
 
   useEffect(() => {
     if (!prefsLoaded) return;
     fetchDay(selectedDate);
   }, [prefsLoaded, selectedDate, fetchDay]);
+
+  // Pull-to-refresh: re-reads the line roster and the selected day.
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await Promise.all([fetchLines(), fetchDay(selectedDate, true)]);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [fetchLines, fetchDay, selectedDate]);
 
   // ── Same fix GenerateReportScreen applies: some already-saved records
   // carry a null or mismatched plant/workshop/division (a supervisor-side
@@ -639,22 +670,17 @@ export default function AdminOverviewScreen() {
     });
 
     const efficiency = plannedTotal > 0 ? round1((totalProduction / plannedTotal) * 100) : 0;
-    const rejectionPct =
-      totalProduction + rejections > 0
-        ? round1((rejections / (totalProduction + rejections)) * 100)
-        : 0;
 
     return {
       totalProduction,
       plannedTotal,
       lossParts: Math.round(lossParts),
-      rejections,
+      // Supervisor-reported per-slot rejections — reference only, NOT part
+      // of the quality figure (see `quality` below).
+      lineRejections: rejections,
       downtimeMinutes: Math.round(downtimeMinutes),
       operatorHours: round1(operatorHours),
       efficiency,
-      rejectionPct,
-      qualityPct: round1(100 - rejectionPct),
-      goodParts: Math.max(0, totalProduction - rejections),
       pcsPerManHour: operatorHours > 0 ? round1(totalProduction / operatorHours) : 0,
       linesRunning: lineIds.size,
       shifts: Array.from(shifts).sort(),
@@ -662,9 +688,23 @@ export default function AdminOverviewScreen() {
     };
   }, [filteredRecords]);
 
+  // ── Quality — QC-logged rejections for the same day, narrowed by the same
+  // Plant/Workshop/Division filters as production, against the filtered good
+  // output. Every quality/rejection figure on screen reads from this one
+  // object, so they always agree with each other.
+  const quality = useMemo(() => {
+    const qcFiltered = qcRecords ? filterQcRecords(qcRecords, allLines, { plant, workshop, division }) : null;
+    return computeQuality(metrics.totalProduction, qcFiltered ? sumRejectionQty(qcFiltered) : null);
+  }, [qcRecords, allLines, plant, workshop, division, metrics.totalProduction]);
+  const qcUnavailable = quality.rejectedParts === null;
+  const qualityColor = quality.rejectionPct === null ? '#8A96A3' : rejectionColor(quality.rejectionPct);
+  const pctText = (v: number | null) => (v === null ? '—' : `${v}%`);
+  const intText = (v: number | null) => (v === null ? '—' : formatInt(v));
+
   // ── Responsive tile sizing. Percentage widths inside a wrapping row, so
   // nothing can overflow horizontally at any breakpoint.
-  const kpiColumns = width >= 1100 ? 4 : width >= 760 ? 3 : 2;
+  // Compact layout: more tiles per row so more of the day fits on screen.
+  const kpiColumns = width >= 1100 ? 6 : width >= 760 ? 4 : width >= 440 ? 3 : 2;
   const kpiWidth = `${100 / kpiColumns - (kpiColumns === 2 ? 1.6 : 1.2)}%`;
   const isWide = width >= 760;
 
@@ -677,7 +717,6 @@ export default function AdminOverviewScreen() {
   const isEmptyDay = ready && records.length === 0;
   const isEmptyFiltered = ready && records.length > 0 && filteredRecords.length === 0;
   const activeFilterCount = [plant, workshop, division].filter(Boolean).length;
-  const relLabel = relativeDayLabel(selectedDate);
 
   return (
     <View style={styles.root}>
@@ -705,6 +744,7 @@ export default function AdminOverviewScreen() {
         style={{ flex: 1 }}
         contentContainerStyle={styles.scroll}
         showsVerticalScrollIndicator={false}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#3E7CB1" colors={['#3E7CB1']} />}
       >
         {/* ── Date selector ──────────────────────────────────────────── */}
         <View style={styles.dateBlock}>
@@ -720,9 +760,11 @@ export default function AdminOverviewScreen() {
               <Text style={styles.dateButtonText}>{prettyDate(selectedDate)}</Text>
               <Ionicons name="chevron-down" size={16} color="#8A96A3" />
             </Pressable>
-            {relLabel ? (
+            {/* Same as Quality Overview: "Today" pill on today, otherwise a
+                "Jump to today" link (including on Yesterday). */}
+            {selectedDate === todayStr() ? (
               <View style={styles.relPill}>
-                <Text style={styles.relPillText}>{relLabel}</Text>
+                <Text style={styles.relPillText}>Today</Text>
               </View>
             ) : (
               <Pressable onPress={() => setSelectedDate(todayStr())} style={styles.todayLink} hitSlop={8}>
@@ -874,48 +916,54 @@ export default function AdminOverviewScreen() {
 
             {/* ── Quality + Rejection ──────────────────────────────── */}
             <View style={[styles.duoRow, !isWide && styles.duoRowStacked]}>
-              <View style={[styles.duoCard, { borderColor: rejectionColor(metrics.rejectionPct) + '55' }]}>
+              <View style={[styles.duoCard, { borderColor: qualityColor + '55' }]}>
                 <Text style={styles.duoLabel}>QUALITY</Text>
                 <Text
-                  style={[styles.duoValue, { color: rejectionColor(metrics.rejectionPct) }]}
+                  style={[styles.duoValue, { color: qualityColor }]}
                   numberOfLines={1}
                   adjustsFontSizeToFit
                 >
-                  {metrics.qualityPct}%
+                  {pctText(quality.qualityPct)}
                 </Text>
-                <Text style={styles.duoUnit}>First Pass Quality</Text>
+                <Text style={styles.duoUnit}>
+                  {qcUnavailable ? 'QC rejections unavailable — pull to retry' : 'First Pass Quality'}
+                </Text>
                 <View style={styles.duoBreakdown}>
                   <View style={styles.duoLine}>
-                    <Text style={styles.duoLineLabel}>Total Produced</Text>
-                    <Text style={styles.duoLineValue}>{formatInt(metrics.totalProduction)}</Text>
-                  </View>
-                  <View style={styles.duoLine}>
-                    <Text style={styles.duoLineLabel}>Good Parts</Text>
+                    <Text style={styles.duoLineLabel}>Good Parts (produced)</Text>
                     <Text style={[styles.duoLineValue, { color: '#4C9A6A' }]}>
-                      {formatInt(metrics.goodParts)}
+                      {formatInt(quality.goodParts)}
                     </Text>
                   </View>
                   <View style={styles.duoLine}>
                     <Text style={styles.duoLineLabel}>QC Logged Rejections</Text>
-                    <Text style={styles.duoLineValue}>
-                      {qcRejections === null ? '—' : formatInt(qcRejections)}
-                    </Text>
+                    <Text style={styles.duoLineValue}>{intText(quality.rejectedParts)}</Text>
+                  </View>
+                  <View style={styles.duoLine}>
+                    <Text style={styles.duoLineLabel}>Total Inspected</Text>
+                    <Text style={styles.duoLineValue}>{intText(quality.inspectedParts)}</Text>
                   </View>
                 </View>
               </View>
 
               <View style={[styles.duoCard, { borderColor: '#D6454555' }]}>
                 <Text style={styles.duoLabel}>REJECTION</Text>
-                <Text style={[styles.duoValue, { color: '#D64545' }]} numberOfLines={1} adjustsFontSizeToFit>
-                  {formatInt(metrics.rejections)}
+                <Text style={[styles.duoValue, { color: qcUnavailable ? '#8A96A3' : '#D64545' }]} numberOfLines={1} adjustsFontSizeToFit>
+                  {intText(quality.rejectedParts)}
                 </Text>
-                <Text style={styles.duoUnit}>Parts Rejected</Text>
+                <Text style={styles.duoUnit}>Parts Rejected (QC logged)</Text>
                 <View style={styles.duoBreakdown}>
                   <View style={styles.duoLine}>
                     <Text style={styles.duoLineLabel}>Rejection %</Text>
-                    <Text style={[styles.duoLineValue, { color: rejectionColor(metrics.rejectionPct) }]}>
-                      {metrics.rejectionPct}%
+                    <Text style={[styles.duoLineValue, { color: qualityColor }]}>
+                      {pctText(quality.rejectionPct)}
                     </Text>
+                  </View>
+                  {/* Reference only — not added to the QC count (could be
+                      the same parts). */}
+                  <View style={styles.duoLine}>
+                    <Text style={styles.duoLineLabel}>Line-reported (not added)</Text>
+                    <Text style={styles.duoLineValue}>{formatInt(metrics.lineRejections)}</Text>
                   </View>
                   <View style={styles.duoLine}>
                     <Text style={styles.duoLineLabel}>Loss Parts</Text>
@@ -953,14 +1001,14 @@ export default function AdminOverviewScreen() {
                 />
                 <KpiTile
                   label="Quality"
-                  value={`${metrics.qualityPct}%`}
-                  color={rejectionColor(metrics.rejectionPct)}
+                  value={pctText(quality.qualityPct)}
+                  color={quality.qualityPct === null ? undefined : qualityColor}
                   width={kpiWidth}
                 />
                 <KpiTile
-                  label="Rejection"
-                  value={formatInt(metrics.rejections)}
-                  color={metrics.rejections > 0 ? '#D64545' : undefined}
+                  label="Rejection (QC)"
+                  value={intText(quality.rejectedParts)}
+                  color={(quality.rejectedParts ?? 0) > 0 ? '#D64545' : undefined}
                   width={kpiWidth}
                 />
                 <KpiTile
@@ -998,11 +1046,15 @@ export default function AdminOverviewScreen() {
                 </Text>
               </View>
               <View style={styles.statusItem}>
-                <View style={[styles.statusDot, { backgroundColor: rejectionColor(metrics.rejectionPct) }]} />
+                <View style={[styles.statusDot, { backgroundColor: qualityColor }]} />
                 <Text style={styles.statusText}>
-                  {metrics.rejectionPct <= 2
+                  {quality.rejectionPct === null
+                    ? qcUnavailable
+                      ? 'QC data unavailable'
+                      : 'No parts inspected'
+                    : quality.rejectionPct <= 2
                     ? 'Quality stable'
-                    : metrics.rejectionPct <= 5
+                    : quality.rejectionPct <= 5
                     ? 'Quality watch'
                     : 'Quality alert'}
                 </Text>
@@ -1072,10 +1124,10 @@ const styles = StyleSheet.create({
   header: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 12,
-    paddingHorizontal: 16,
-    paddingTop: 14,
-    paddingBottom: 14,
+    gap: 8,
+    paddingHorizontal: 12,
+    paddingTop: 10,
+    paddingBottom: 10,
     borderBottomWidth: 1,
     borderBottomColor: '#2C343C',
   },
@@ -1090,49 +1142,50 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   hamburgerPressed: { backgroundColor: '#242B32', borderColor: '#3A434C' },
-  brand: { color: '#ECEFF2', fontSize: 19, fontWeight: '900', letterSpacing: 0.3 },
-  brandSub: { color: '#8A96A3', fontSize: 12.5, marginTop: 1 },
+  brand: { color: '#ECEFF2', fontSize: 16, fontWeight: '900', letterSpacing: 0.3 },
+  brandSub: { color: '#8A96A3', fontSize: 11.5, marginTop: 1 },
   rolePill: {
     borderWidth: 1,
     borderColor: '#3E7CB1',
     backgroundColor: '#3E7CB122',
     borderRadius: 20,
-    paddingHorizontal: 11,
-    paddingVertical: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
   },
-  rolePillText: { color: '#3E7CB1', fontSize: 10.5, fontWeight: '900', letterSpacing: 1 },
+  rolePillText: { color: '#3E7CB1', fontSize: 10, fontWeight: '900', letterSpacing: 1 },
 
-  scroll: { paddingHorizontal: 16, paddingTop: 16, paddingBottom: 40, gap: 16 },
+  // Bottom padding clears the dashboard pager's floating page tabs.
+  scroll: { paddingHorizontal: 12, paddingTop: 12, paddingBottom: 72, gap: 11 },
 
-  sectionLabel: { color: '#5C6670', fontSize: 10.5, fontWeight: '800', letterSpacing: 1.2 },
+  sectionLabel: { color: '#5C6670', fontSize: 10, fontWeight: '800', letterSpacing: 1.2 },
 
   // Date selector
-  dateBlock: { gap: 8 },
-  dateRow: { flexDirection: 'row', alignItems: 'center', gap: 10, flexWrap: 'wrap' },
+  dateBlock: { gap: 6 },
+  dateRow: { flexDirection: 'row', alignItems: 'center', gap: 7, flexWrap: 'wrap' },
   dateButton: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 9,
+    gap: 6,
     backgroundColor: '#1D2329',
     borderWidth: 1,
     borderColor: '#2C343C',
     borderRadius: 10,
-    paddingHorizontal: 14,
-    paddingVertical: 11,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
   },
   dateButtonPressed: { backgroundColor: '#242B32', borderColor: '#3A434C' },
-  dateButtonText: { color: '#ECEFF2', fontSize: 15, fontWeight: '700' },
+  dateButtonText: { color: '#ECEFF2', fontSize: 14, fontWeight: '700' },
   relPill: {
     borderWidth: 1,
     borderColor: '#4C9A6A',
     backgroundColor: '#4C9A6A22',
     borderRadius: 16,
-    paddingHorizontal: 10,
-    paddingVertical: 4,
+    paddingHorizontal: 7,
+    paddingVertical: 3,
   },
-  relPillText: { color: '#4C9A6A', fontSize: 11, fontWeight: '800' },
-  todayLink: { paddingVertical: 4 },
-  todayLinkText: { color: '#3E7CB1', fontSize: 12.5, fontWeight: '700' },
+  relPillText: { color: '#4C9A6A', fontSize: 10, fontWeight: '800' },
+  todayLink: { paddingVertical: 3 },
+  todayLinkText: { color: '#3E7CB1', fontSize: 11.5, fontWeight: '700' },
 
   // Hero
   heroCard: {
@@ -1140,61 +1193,61 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#2C343C',
     borderRadius: 14,
-    paddingVertical: 26,
-    paddingHorizontal: 20,
+    paddingVertical: 18,
+    paddingHorizontal: 14,
     alignItems: 'center',
   },
-  heroLabel: { color: '#8A96A3', fontSize: 11.5, fontWeight: '900', letterSpacing: 1.6 },
+  heroLabel: { color: '#8A96A3', fontSize: 10.5, fontWeight: '900', letterSpacing: 1.6 },
   heroValue: {
     color: '#ECEFF2',
-    fontSize: 56,
+    fontSize: 40,
     fontWeight: '900',
     letterSpacing: -1.5,
-    marginTop: 6,
+    marginTop: 4,
     fontVariant: ['tabular-nums'],
   },
-  heroUnit: { color: '#8A96A3', fontSize: 13.5, marginTop: 2 },
+  heroUnit: { color: '#8A96A3', fontSize: 12.5, marginTop: 2 },
   heroFooter: {
     flexDirection: 'row',
     flexWrap: 'wrap',
     justifyContent: 'center',
-    gap: 8,
-    marginTop: 18,
+    gap: 6,
+    marginTop: 13,
   },
   heroChip: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 5,
+    gap: 4,
     backgroundColor: '#14181C',
     borderWidth: 1,
     borderColor: '#2C343C',
     borderRadius: 16,
-    paddingHorizontal: 10,
-    paddingVertical: 5,
+    paddingHorizontal: 7,
+    paddingVertical: 4,
   },
-  heroChipText: { color: '#8A96A3', fontSize: 11.5, fontWeight: '700' },
+  heroChipText: { color: '#8A96A3', fontSize: 10.5, fontWeight: '700' },
   heroChipScoped: { borderColor: '#3E7CB1', backgroundColor: '#3E7CB118' },
 
   // Plant / Workshop / Division filter chips
-  filterRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  filterRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
   filterChip: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 7,
+    gap: 5,
     backgroundColor: '#1D2329',
     borderWidth: 1,
     borderColor: '#2C343C',
     borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 9,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
     flexGrow: 1,
     flexShrink: 1,
     minWidth: 150,
     maxWidth: 260,
   },
   filterChipActive: { borderColor: '#3E7CB155', backgroundColor: '#3E7CB112' },
-  filterChipLabel: { color: '#5C6670', fontSize: 11, fontWeight: '800', letterSpacing: 0.6 },
-  filterChipValue: { color: '#8A96A3', fontSize: 13, fontWeight: '700', flex: 1, textAlign: 'right' },
+  filterChipLabel: { color: '#5C6670', fontSize: 10, fontWeight: '800', letterSpacing: 0.6 },
+  filterChipValue: { color: '#8A96A3', fontSize: 12, fontWeight: '700', flex: 1, textAlign: 'right' },
   filterChipValueActive: { color: '#ECEFF2' },
 
   // Option list inside the filter modal
@@ -1203,102 +1256,102 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    gap: 10,
+    gap: 7,
     borderRadius: 9,
-    paddingHorizontal: 12,
-    paddingVertical: 12,
+    paddingHorizontal: 8,
+    paddingVertical: 8,
     borderWidth: 1,
     borderColor: 'transparent',
   },
   optionRowActive: { borderColor: '#3E7CB155', backgroundColor: '#3E7CB118' },
-  optionText: { color: '#8A96A3', fontSize: 14, fontWeight: '600' },
+  optionText: { color: '#8A96A3', fontSize: 13, fontWeight: '600' },
   optionTextActive: { color: '#ECEFF2', fontWeight: '800' },
 
   // Quality / Rejection pair
-  duoRow: { flexDirection: 'row', gap: 12 },
+  duoRow: { flexDirection: 'row', gap: 8 },
   duoRowStacked: { flexDirection: 'column' },
   duoCard: {
     flex: 1,
     backgroundColor: '#1D2329',
     borderWidth: 1,
     borderRadius: 14,
-    padding: 18,
+    padding: 13,
   },
-  duoLabel: { color: '#8A96A3', fontSize: 11, fontWeight: '900', letterSpacing: 1.4 },
+  duoLabel: { color: '#8A96A3', fontSize: 10, fontWeight: '900', letterSpacing: 1.4 },
   duoValue: {
-    fontSize: 38,
+    fontSize: 27,
     fontWeight: '900',
-    marginTop: 6,
+    marginTop: 4,
     letterSpacing: -0.8,
     fontVariant: ['tabular-nums'],
   },
-  duoUnit: { color: '#8A96A3', fontSize: 12.5, marginTop: 1 },
+  duoUnit: { color: '#8A96A3', fontSize: 11.5, marginTop: 1 },
   duoBreakdown: {
-    marginTop: 14,
-    paddingTop: 12,
+    marginTop: 10,
+    paddingTop: 8,
     borderTopWidth: 1,
     borderTopColor: '#2C343C',
-    gap: 7,
+    gap: 5,
   },
-  duoLine: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10 },
-  duoLineLabel: { color: '#8A96A3', fontSize: 12.5, flexShrink: 1 },
-  duoLineValue: { color: '#ECEFF2', fontSize: 13.5, fontWeight: '800', fontVariant: ['tabular-nums'] },
+  duoLine: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 7 },
+  duoLineLabel: { color: '#8A96A3', fontSize: 11.5, flexShrink: 1 },
+  duoLineValue: { color: '#ECEFF2', fontSize: 12.5, fontWeight: '800', fontVariant: ['tabular-nums'] },
 
   // KPI grid
-  kpiBlock: { gap: 10 },
+  kpiBlock: { gap: 7 },
   kpiHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  kpiHeaderDate: { color: '#5C6670', fontSize: 11.5, fontWeight: '700' },
-  kpiGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
+  kpiHeaderDate: { color: '#5C6670', fontSize: 10.5, fontWeight: '700' },
+  kpiGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 7 },
   kpiTile: {
     backgroundColor: '#1D2329',
     borderWidth: 1,
     borderColor: '#2C343C',
     borderRadius: 12,
-    paddingVertical: 14,
-    paddingHorizontal: 14,
-    minHeight: 84,
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    minHeight: 63,
     justifyContent: 'space-between',
   },
-  kpiLabel: { color: '#8A96A3', fontSize: 11.5, fontWeight: '700' },
+  kpiLabel: { color: '#8A96A3', fontSize: 10.5, fontWeight: '700' },
   kpiValue: {
     color: '#ECEFF2',
-    fontSize: 25,
+    fontSize: 21,
     fontWeight: '900',
     fontVariant: ['tabular-nums'],
-    marginTop: 8,
+    marginTop: 6,
   },
-  kpiFootnote: { color: '#5C6670', fontSize: 11, marginTop: 2 },
+  kpiFootnote: { color: '#5C6670', fontSize: 10, marginTop: 2 },
 
   // Status strip
   statusRow: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    gap: 14,
+    gap: 10,
     backgroundColor: '#1D2329',
     borderWidth: 1,
     borderColor: '#2C343C',
     borderRadius: 12,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
   },
-  statusItem: { flexDirection: 'row', alignItems: 'center', gap: 7 },
+  statusItem: { flexDirection: 'row', alignItems: 'center', gap: 5 },
   statusDot: { width: 8, height: 8, borderRadius: 4 },
-  statusText: { color: '#8A96A3', fontSize: 12.5, fontWeight: '700' },
+  statusText: { color: '#8A96A3', fontSize: 11.5, fontWeight: '700' },
 
   // Loading / empty / error
-  stateBlock: { gap: 12, alignItems: 'center' },
+  stateBlock: { gap: 8, alignItems: 'center' },
   skeletonHero: {
     width: '100%',
-    height: 160,
+    height: 120,
     borderRadius: 14,
     backgroundColor: '#1D2329',
     borderWidth: 1,
     borderColor: '#2C343C',
   },
-  skeletonRow: { flexDirection: 'row', gap: 12, width: '100%' },
+  skeletonRow: { flexDirection: 'row', gap: 8, width: '100%' },
   skeletonHalf: {
     flex: 1,
-    height: 120,
+    height: 90,
     borderRadius: 14,
     backgroundColor: '#1D2329',
     borderWidth: 1,
@@ -1309,10 +1362,10 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#2C343C',
     borderRadius: 14,
-    paddingVertical: 36,
-    paddingHorizontal: 24,
+    paddingVertical: 25,
+    paddingHorizontal: 17,
     alignItems: 'center',
-    gap: 8,
+    gap: 6,
   },
   stateIcon: {
     width: 64,
@@ -1323,8 +1376,8 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     marginBottom: 4,
   },
-  stateTitle: { color: '#ECEFF2', fontSize: 16.5, fontWeight: '800', textAlign: 'center' },
-  stateText: { color: '#8A96A3', fontSize: 13, textAlign: 'center' },
+  stateTitle: { color: '#ECEFF2', fontSize: 15, fontWeight: '800', textAlign: 'center' },
+  stateText: { color: '#8A96A3', fontSize: 12, textAlign: 'center' },
   retryButton: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1337,7 +1390,7 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     marginTop: 8,
   },
-  retryText: { color: '#ECEFF2', fontSize: 13.5, fontWeight: '700' },
+  retryText: { color: '#ECEFF2', fontSize: 12.5, fontWeight: '700' },
 
   // Date picker modal
   modalScrim: {
