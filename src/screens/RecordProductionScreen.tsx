@@ -54,6 +54,7 @@ import {
 } from 'firebase/firestore';
 import { db } from '../services/firebase';
 import { useAuthStore } from '../stores/authStore';
+import { productionDayKeyFor, resolveSessionProductionDate, timestampToMillis } from '../utils/productionDay';
 import { PLANTS, WORKSHOPS, DIVISIONS } from '../constants/lineOptions';
 import {
   SHIFT_A_START,
@@ -603,28 +604,8 @@ function CalculatorButton() {
   );
 }
 
-// ─── Production day ──────────────────────────────────────────────────────────
-// A "production day" runs from 6:30 AM to the next day's 6:30 AM - chosen
-// because it's 30 min before Shift A starts (7:00 AM) and ~3 hours after
-// Shift B ends (3:30 AM), so no shift is ever active across that boundary.
-// This is what lets Shift B (7:00 PM - 3:30 AM) keep the SAME production
-// date all night, even though the real calendar date changes at midnight:
-// a session started at 7:00 PM on the 22nd is still "22nd" at 2:00 AM,
-// because 2:00 AM is before the 6:30 AM cutover into the 23rd.
-const PRODUCTION_DAY_CUTOVER_MINUTES = 6 * 60 + 30; // 6:30 AM
-
-function productionDayKeyFor(epochMs: number): string {
-  const d = new Date(epochMs);
-  const minutesOfDay = d.getHours() * 60 + d.getMinutes();
-  const effective = new Date(d);
-  if (minutesOfDay < PRODUCTION_DAY_CUTOVER_MINUTES) {
-    effective.setDate(effective.getDate() - 1);
-  }
-  const y = effective.getFullYear();
-  const m = String(effective.getMonth() + 1).padStart(2, '0');
-  const day = String(effective.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}
+// Production day (6:30 AM cutover) and session date pinning live in
+// src/utils/productionDay.ts.
 
 function formatProductionDayDisplay(key: string | null): string {
   if (!key) return '—';
@@ -804,6 +785,9 @@ export default function RecordProductionScreen() {
   // Slot identity → productionRecords doc ID it resolved to (see
   // upsertProductionRecord).
   const resolvedRecordIdsRef = useRef<Map<string, string>>(new Map());
+  // Original start time of the current session (epoch ms) — last-resort
+  // source for its production date (see resolveActiveSessionProductionDate).
+  const sessionStartedAtMsRef = useRef<number | null>(null);
   const [startingProduction, setStartingProduction] = useState(false);
   const [persistingSession, setPersistingSession] = useState(false);
 
@@ -1206,12 +1190,25 @@ export default function RecordProductionScreen() {
     setProducedSegment(sd.producedSegment ?? {});
     setDeletedSlotIndices(new Set(sd.deletedSlotIndices ?? []));
 
-    // Sessions started before this feature existed won't have a
-    // productionDate field - fall back to computing it from startedAt (or
-    // now, as a last resort) so old in-flight sessions don't immediately
-    // look "rolled over" the moment this update ships.
-    const startedAtMs = (sd as any).startedAt?.toMillis ? (sd as any).startedAt.toMillis() : Date.now();
-    setProductionDate((sd as any).productionDate ?? productionDayKeyFor(startedAtMs));
+    // Keep the session's ORIGINAL production date — reopening the app or
+    // resuming the session on a later day must never move its records to
+    // today. Sessions started before the productionDate field existed derive
+    // it from their original startedAt, and get it written back so it's
+    // pinned from now on. Only when neither exists (shouldn't happen —
+    // startedAt is written on create) is the current day used, and that is
+    // pinned too, so Finalize can't pick a different date later.
+    const storedDate = (sd as any).productionDate;
+    let pd = resolveSessionProductionDate({ storedDate, startedAt: sd.startedAt });
+    if (!pd) {
+      console.warn('[restoreSession] session has no productionDate or startedAt — pinning the current production day', { docId });
+      pd = productionDayKeyFor(Date.now());
+    }
+    sessionStartedAtMsRef.current = timestampToMillis(sd.startedAt);
+    setProductionDate(pd);
+    if (storedDate !== pd) {
+      updateDoc(doc(db, 'activeSessions', docId), { productionDate: pd })
+        .catch((e) => console.error('[restoreSession] failed to pin productionDate', e));
+    }
 
     setSessionLineId(docId);
     setPhase('active');
@@ -1262,13 +1259,7 @@ export default function RecordProductionScreen() {
     // Total rejections across slots
     const totalRejections = Object.values(rejectionsBySlot).reduce((s, v) => s + (v ?? 0), 0);
 
-    // Production-day key (YYYY-MM-DD), pinned at session start via the
-    // 6:30 AM cutover - this is what stays stable across midnight during
-    // Shift B, unlike a raw new Date() calendar date would.
-    const pd = productionDate ?? productionDayKeyFor(Date.now());
-
     const sessionData: Omit<ActiveSessionDoc, 'startedAt'> & { startedAt?: any; updatedAt: any } & {
-      productionDate: string;
       totalDowntimeMinutes: number;
       totalRejections: number;
       stopsSummaryBySlot: Record<string, { totalDowntimeMinutes: number; stopCount: number }>;
@@ -1299,8 +1290,9 @@ export default function RecordProductionScreen() {
       lineStopped: stopped,
       updatedAt: serverTimestamp(),
 
-      // new structured summaries
-      productionDate: pd,
+      // new structured summaries. productionDate is deliberately NOT part
+      // of this payload — it's pinned when the session starts and an update
+      // must never overwrite it (see the create branch below).
       plannedProductionTotal: shiftPlannedTotal,
       totalDowntimeMinutes,
       totalRejections,
@@ -1310,9 +1302,14 @@ export default function RecordProductionScreen() {
     const docRef = doc(db, 'activeSessions', sessionLineId ?? selectedLineId);
     try {
       if (!sessionLineId) {
-        // create doc (set startedAt only first time)
-        await setDoc(docRef, { ...sessionData, startedAt: serverTimestamp() });
+        // create doc (set startedAt and productionDate only first time) —
+        // this is a genuinely new session, so its production day is pinned
+        // here, from now.
+        const pd = productionDate ?? productionDayKeyFor(Date.now());
+        await setDoc(docRef, { ...sessionData, productionDate: pd, startedAt: serverTimestamp() });
         setSessionLineId(selectedLineId);
+        setProductionDate(pd);
+        sessionStartedAtMsRef.current = Date.now();
       } else {
         // update existing
         await updateDoc(docRef, sessionData as any);
@@ -1334,7 +1331,11 @@ export default function RecordProductionScreen() {
     if (!hasOperator) { Alert.alert('Add operator', 'Enter at least one operator name.'); return; }
 
     setStartingProduction(true);
-    const pd = productionDayKeyFor(Date.now());
+    // The ONLY place a session's production date is calculated from the
+    // current time (persistSession's create branch aside) — see
+    // resolveActiveSessionProductionDate for every later read.
+    const startedMs = Date.now();
+    const pd = productionDayKeyFor(startedMs);
     try {
       const docRef = doc(db, 'activeSessions', selectedLineId);
       await setDoc(docRef, {
@@ -1363,7 +1364,10 @@ export default function RecordProductionScreen() {
         updatedAt: serverTimestamp(),
       });
       setSessionLineId(selectedLineId);
+      // Pinned for the lifetime of this session — every record it writes,
+      // including Finalize after midnight/the cutover, uses this date.
       setProductionDate(pd);
+      sessionStartedAtMsRef.current = startedMs;
       setSavedSlotIndices(new Set());
       setDeletedSlotIndices(new Set());
       setPhase('active');
@@ -1377,6 +1381,32 @@ export default function RecordProductionScreen() {
   // ─────────────────────────────────────────────────────────────────────────────
   // FINALIZE / END SESSION (new)
   // ─────────────────────────────────────────────────────────────────────────────
+
+  // The production date this session's records belong to: the one pinned
+  // in activeSessions/{lineId} when the session started, falling back to
+  // the date pinned in state, then to the session's original startedAt.
+  // Never the current time — a session finalized (or a slot saved) after
+  // midnight / the 6:30 AM cutover keeps its original date. Throws if no
+  // date can be resolved rather than guessing one.
+  async function resolveActiveSessionProductionDate(lineId: string): Promise<string> {
+    let storedDate: unknown;
+    let startedAt: unknown;
+    try {
+      const snap = await getDoc(doc(db, 'activeSessions', lineId));
+      if (snap.exists()) {
+        const data = snap.data() as any;
+        storedDate = data.productionDate;
+        startedAt = data.startedAt;
+      }
+    } catch (e) {
+      console.warn('[productionDate] could not read the active session — using the pinned date', e);
+    }
+    const pd =
+      resolveSessionProductionDate({ storedDate, pinnedDate: productionDate, startedAt }) ??
+      resolveSessionProductionDate({ startedAt: sessionStartedAtMsRef.current });
+    if (!pd) throw new Error('Could not determine the production date of this session. Check your connection and try again.');
+    return pd;
+  }
 
   // Sums planned production (cycle time × FULL slot duration, ignoring
   // downtime — same figure as plannedProduction on each slot doc) and actual
@@ -1408,10 +1438,12 @@ export default function RecordProductionScreen() {
   // supervisor presses "Finalize & End Session" — the "total expected parts
   // of that shift" figure, saved once rather than re-derived from
   // productionRecords every time it's needed.
-  async function saveShiftSummary(lineId: string) {
+  // prodDate is the session's original production date, resolved once by
+  // Finalize (see resolveActiveSessionProductionDate) so the summary always
+  // matches the productionRecords written alongside it.
+  async function saveShiftSummary(lineId: string, prodDate: string) {
     if (!selectedLine) return;
     const { planned, actual } = computeShiftTotals();
-    const prodDate = productionDate ?? productionDayKeyFor(Date.now());
     const summaryId = `${lineId}_${prodDate}_${selectedShift}`;
     // Part-level planned totals for this same production date + shift,
     // grouped by part name (see partTargetSummary above) — computed once
@@ -1456,7 +1488,10 @@ export default function RecordProductionScreen() {
   // session is closed.
   // ─────────────────────────────────────────────────────────────────────────────
 
-  async function submitUnsavedSlots(lineId: string) {
+  // prodDate: the session's original production date (see
+  // resolveActiveSessionProductionDate) — used for both the record IDs and
+  // the productionDate field, never the time Finalize happens to run.
+  async function submitUnsavedSlots(lineId: string, prodDate: string) {
     if (!selectedLine) return;
     const nowTs = Date.now();
 
@@ -1495,7 +1530,6 @@ export default function RecordProductionScreen() {
     function frozenExpected(partIdx: number, minutes: number): number {
       return expectedPartsFor(selectedLine?.parts?.[partIdx]?.cycleTimeSeconds ?? 0, minutes);
     }
-    const prodDate = productionDate ?? productionDayKeyFor(nowTs);
     const slotKey = (slotIndex: number) => ({ productionDate: prodDate, lineId, shift: selectedShift, slotIndex });
     const slotId = (slotIndex: number, segment: SlotSegment): ProductionSlotIdentity => ({ ...slotKey(slotIndex), segment });
     const base = {
@@ -1654,12 +1688,18 @@ export default function RecordProductionScreen() {
         const docId = sessionLineId ?? selectedLineId;
         console.log('[handleFinalizeSession] resolved docId', { docId, sessionLineId, selectedLineId });
         if (docId) {
+          // Resolved ONCE from the session itself and passed to every
+          // write below, so a session finalized after midnight / the 6:30 AM
+          // cutover still files everything under the day it started.
+          const prodDate = await resolveActiveSessionProductionDate(docId);
+          console.log('[handleFinalizeSession] resolved session productionDate', prodDate);
+
           console.log('[handleFinalizeSession] calling submitUnsavedSlots(docId)…');
-          await submitUnsavedSlots(docId);
+          await submitUnsavedSlots(docId, prodDate);
           console.log('[handleFinalizeSession] submitUnsavedSlots resolved');
 
           console.log('[handleFinalizeSession] calling saveShiftSummary(docId)…');
-          await saveShiftSummary(docId);
+          await saveShiftSummary(docId, prodDate);
           console.log('[handleFinalizeSession] saveShiftSummary resolved');
 
           console.log('[handleFinalizeSession] calling deleteDoc(activeSessions/', docId, ')…');
@@ -2068,12 +2108,12 @@ export default function RecordProductionScreen() {
   // find the line. A supervisor who selects a line without first narrowing by
   // Plant/Workshop/Division was getting null location fields on every slot,
   // which then silently failed to match Generate Report's filters.
-  const buildBaseDoc = () => ({
+  const buildBaseDoc = (prodDate: string) => ({
     shift: selectedShift, plant: selectedLine?.plant ?? plant ?? null, workshop: selectedLine?.workshop ?? workshop ?? null,
     division: selectedLine?.division ?? division ?? null, lineId: selectedLineId, lineName: selectedLine?.lineName ?? null,
     operators: operators.map((o) => ({ name: o.name, code: o.code })),
     supervisor: { name: supervisorName, code: supervisorCode, uid: user?.uid ?? null },
-    productionDate: productionDate ?? productionDayKeyFor(Date.now()),
+    productionDate: prodDate,
     createdAt: serverTimestamp(),
   });
 
@@ -2289,12 +2329,16 @@ export default function RecordProductionScreen() {
       const error = changeoverError(co);
       if (error) { Alert.alert('Invalid changeover time', `${error}\n\nRemove this changeover and add it again with valid times.`); return; }
     }
-    const baseDoc = buildBaseDoc();
-    const slotKey = { productionDate: baseDoc.productionDate, lineId: selectedLineId, shift: selectedShift, slotIndex: slot.index };
-    const slotId = (segment: SlotSegment): ProductionSlotIdentity => ({ ...slotKey, segment });
     savingSlotsRef.current.add(slot.index);
     setSaving(true);
     try {
+      // The session's original production date (not today's) — the same
+      // date Finalize uses, so a slot saved now and the remaining slots
+      // finalized after the cutover share one date and one set of IDs.
+      const prodDate = await resolveActiveSessionProductionDate(sessionLineId ?? selectedLineId);
+      const baseDoc = buildBaseDoc(prodDate);
+      const slotKey = { productionDate: prodDate, lineId: selectedLineId, shift: selectedShift, slotIndex: slot.index };
+      const slotId = (segment: SlotSegment): ProductionSlotIdentity => ({ ...slotKey, segment });
       if (!co) {
         // Independent record: the operator enters exactly what was produced
         // in this slot — no counter, no baseline, no subtraction.

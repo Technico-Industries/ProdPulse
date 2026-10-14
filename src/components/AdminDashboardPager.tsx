@@ -1,7 +1,7 @@
 // src/components/AdminDashboardPager.tsx
 //
 // Admin's main dashboard: the production overview, with the quality overview
-// one swipe to the left. A horizontal paging ScrollView, so it follows the
+// one swipe to the left and the live line efficiency overview after it. A horizontal paging ScrollView, so it follows the
 // finger on Android/iOS and on mobile web (react-native-web maps
 // pagingEnabled to CSS scroll-snap). Desktop browsers can't drag a scroll
 // area with the mouse, so the page tabs at the bottom are also tappable.
@@ -14,10 +14,12 @@ import React, { useRef, useState } from 'react';
 import { View, Text, Pressable, ScrollView, StyleSheet, LayoutChangeEvent, NativeScrollEvent, NativeSyntheticEvent } from 'react-native';
 import AdminOverviewScreen from '../screens/AdminOverviewScreen';
 import QualityOverviewScreen from '../screens/QualityOverviewScreen';
+import LineEfficiencyOverviewScreen from '../screens/LineEfficiencyOverviewScreen';
 
 const PAGES = [
   { key: 'production', label: 'Production', color: '#3E7CB1', Component: AdminOverviewScreen },
   { key: 'quality', label: 'Quality', color: '#4C9A6A', Component: QualityOverviewScreen },
+  { key: 'lines', label: 'Lines', color: '#8B5CF6', Component: LineEfficiencyOverviewScreen },
 ];
 
 export default function AdminDashboardPager() {

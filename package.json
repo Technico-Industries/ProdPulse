@@ -43,6 +43,9 @@
     "seed:hh": "tsx scripts/seedHHProduction.ts",
     "clear:hh": "tsx scripts/seedHHProduction.ts --clear",
     "test:schedule": "tsx scripts/testProductionSchedule.ts",
+    "test:production-day": "tsx scripts/testProductionDay.ts",
+    "test:line-efficiency": "tsx scripts/testLineEfficiency.ts",
+    "test:quality": "tsx scripts/testQualityMetrics.ts",
     "build": "expo export --platform web"
   },
   "private": true
