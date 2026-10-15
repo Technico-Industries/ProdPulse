@@ -12,17 +12,20 @@
 //                     (lineStopped + the running stop event in stopsBySlot),
 //                     resuming or being finalized (doc deleted) updates the
 //                     page by itself. Unsubscribed on unmount.
-//   productionRecords ONE query per change of the live sessions:
+//   productionRecords ONE onSnapshot listener (not one per line):
 //                     productionDate `in` the active sessions' dates, then
 //                     matched to each session locally by line + production
-//                     date + shift. Re-run when a session doc is written
-//                     (persistSession bumps updatedAt after every slot save).
+//                     date + shift, one record per slot/segment (see
+//                     recordsForSession). Saving, re-saving or splitting a
+//                     slot updates the page by itself. Re-subscribed only
+//                     when the set of session dates changes; unsubscribed on
+//                     unmount.
 //
 // Efficiency and the colour bands are in src/utils/lineEfficiency.ts.
 // This page is deliberately date-free: it shows what is running NOW. The
 // Production page keeps its own selected-date metrics and filters.
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   View,
   Text,
@@ -53,6 +56,7 @@ import {
   RegisteredLine,
   buildLineCards,
   filterLineCards,
+  productionFigures,
   summarize,
 } from '../utils/lineEfficiency';
 
@@ -65,10 +69,6 @@ function formatClock(ms: number): string {
   const h = d.getHours();
   const m = String(d.getMinutes()).padStart(2, '0');
   return `${h % 12 === 0 ? 12 : h % 12}:${m} ${h < 12 ? 'AM' : 'PM'}`;
-}
-
-function formatInt(n: number) {
-  return Math.round(n).toLocaleString();
 }
 
 // ─── Circular progress ring ──────────────────────────────────────────────────
@@ -150,17 +150,15 @@ function LineTile({ card, width }: { card: LineCard; width: string }) {
     detail = card.efficiency == null ? 'No slots saved yet' : null;
   }
 
-  const meta =
-    card.status !== 'not_running' && card.session
-      ? `Shift ${card.session.shift ?? '—'}${card.planned > 0 ? ` · ${formatInt(card.actual)}/${formatInt(card.planned)}` : ''}`
-      : null;
+  const meta = card.status !== 'not_running' && card.session ? `Shift ${card.session.shift ?? '—'}` : null;
+  const figures = productionFigures(card);
 
   return (
     <View style={[styles.cell, { width: width as any }]}>
       <View
         style={styles.tile}
         accessible
-        accessibilityLabel={`${card.lineName}: ${card.badge}${
+        accessibilityLabel={`${card.lineName}: ${figures === '— / —' ? '' : `${figures.replace(' / ', ' of ')} parts, `}${card.badge}${
           card.status !== 'not_running' && card.efficiency != null ? `, efficiency ${card.efficiency.toFixed(1)} percent` : ''
         }${detail ? `, ${detail}` : ''}`}
       >
@@ -168,6 +166,14 @@ function LineTile({ card, width }: { card: LineCard; width: string }) {
         <Text style={styles.tileName} numberOfLines={2}>
           {card.lineName}
         </Text>
+        <View style={styles.figures}>
+          <Text style={styles.figuresValue} numberOfLines={1} adjustsFontSizeToFit>
+            {figures}
+          </Text>
+          <Text style={styles.figuresLabel} numberOfLines={1}>
+            Actual / Target
+          </Text>
+        </View>
         <View style={[styles.badge, { borderColor: `${badgeColor}88`, backgroundColor: `${badgeColor}22` }]}>
           <Ionicons name={icon as any} size={9} color={badgeColor} />
           <Text style={[styles.badgeText, { color: badgeColor }]} numberOfLines={1}>
@@ -385,77 +391,74 @@ export default function LineEfficiencyOverviewScreen() {
     () => Array.from(new Set(sessions.map((s) => s.productionDate).filter(Boolean) as string[])).sort(),
     [sessions]
   );
-  // Changes when a session starts/ends or any session doc is written.
-  const fetchSignature = useMemo(
-    () =>
-      sessions
-        .map((s) => `${s.lineId}:${s.productionDate}:${s.shift}:${s.updatedAtMs ?? 0}`)
-        .sort()
-        .join('|'),
-    [sessions]
-  );
+  const datesKey = sessionDates.join('|');
+  // Bumped by Retry to re-open the listener after an error.
+  const [recordsEpoch, setRecordsEpoch] = useState(0);
 
-  const fetchRecords = useCallback(async (dates: string[], silent = false) => {
+  useEffect(() => {
+    if (!sessionsLoaded) return;
+    const dates = datesKey ? datesKey.split('|') : [];
     if (dates.length === 0) {
       setRecords([]);
       setRecordsError(null);
+      setRecordsLoading(false);
       return;
     }
-    if (!silent) setRecordsLoading(true);
+    setRecordsLoading(true);
     setRecordsError(null);
-    try {
-      // `in` takes at most 10 values — chunk rather than let Firestore throw.
-      const chunks: string[][] = [];
-      for (let i = 0; i < dates.length; i += 10) chunks.push(dates.slice(i, i + 10));
-      const snaps = await Promise.all(
-        chunks.map((c) => getDocs(query(collection(db, 'productionRecords'), where('productionDate', 'in', c))))
-      );
-      setRecords(
-        snaps.flatMap((snap) =>
-          snap.docs.map((d) => {
+    // `in` takes at most 10 values — one listener per chunk (normally one).
+    const chunks: string[][] = [];
+    for (let i = 0; i < dates.length; i += 10) chunks.push(dates.slice(i, i + 10));
+    const byChunk: EfficiencyRecord[][] = chunks.map(() => []);
+    const ready = chunks.map(() => false);
+    const unsubs = chunks.map((c, i) =>
+      onSnapshot(
+        query(collection(db, 'productionRecords'), where('productionDate', 'in', c)),
+        (snap) => {
+          byChunk[i] = snap.docs.map((d) => {
             const data: any = d.data();
             return {
+              id: d.id,
               lineId: data.lineId ?? null,
               shift: data.shift ?? null,
               productionDate: data.productionDate ?? null,
               expectedParts: data.expectedParts ?? null,
               producedThisSlot: data.producedThisSlot ?? null,
+              slotIndex: typeof data.slotIndex === 'number' ? data.slotIndex : null,
+              partSegment: data.partSegment ?? null,
+              createdAtMs: toMillis(data.createdAt),
+              updatedAtMs: toMillis(data.updatedAt),
             };
-          })
-        )
-      );
-    } catch (e) {
-      console.error('[LineEfficiency] productionRecords fetch failed', e);
-      setRecordsError('Unable to load production data for the running lines.');
-    } finally {
-      setRecordsLoading(false);
-    }
-  }, []);
+          });
+          ready[i] = true;
+          setRecords(byChunk.flat());
+          setRecordsError(null);
+          if (ready.every(Boolean)) setRecordsLoading(false);
+        },
+        (err) => {
+          console.error('[LineEfficiency] productionRecords listener error', err);
+          setRecordsError('Unable to load production data for the running lines.');
+          setRecordsLoading(false);
+        }
+      )
+    );
+    return () => unsubs.forEach((u) => u());
+  }, [sessionsLoaded, datesKey, recordsEpoch]);
 
-  const lastSignature = useRef<string | null>(null);
-  useEffect(() => {
-    if (!sessionsLoaded) return;
-    if (fetchSignature === lastSignature.current) return;
-    // First load shows the spinner; later live updates refresh in place.
-    const silent = lastSignature.current !== null;
-    lastSignature.current = fetchSignature;
-    fetchRecords(sessionDates, silent);
-  }, [sessionsLoaded, fetchSignature, sessionDates, fetchRecords]);
-
-  // Pull-to-refresh: the roster and the records. Sessions are already live.
+  // Pull-to-refresh: the roster. Sessions and records are already live.
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      await Promise.all([fetchLines(), fetchRecords(sessionDates, true)]);
+      await fetchLines();
     } finally {
       setRefreshing(false);
     }
-  }, [fetchLines, fetchRecords, sessionDates]);
+  }, [fetchLines]);
 
   const retry = useCallback(() => {
     fetchLines();
-    fetchRecords(sessionDates);
-  }, [fetchLines, fetchRecords, sessionDates]);
+    setRecordsEpoch((n) => n + 1);
+  }, [fetchLines]);
 
   const allCards = useMemo(() => buildLineCards(lines, sessions, records), [lines, sessions, records]);
   // Client-side over the same data — changing a filter never re-queries.
@@ -788,6 +791,10 @@ const styles = StyleSheet.create({
     maxWidth: '100%',
   },
   badgeText: { fontSize: 9.5, fontWeight: '800', flexShrink: 1 },
+  // Actual / Target: readable, but quieter than the ring's percentage.
+  figures: { alignItems: 'center', width: '100%', marginTop: -3 },
+  figuresValue: { color: '#C3CBD3', fontSize: 11.5, fontWeight: '700', fontVariant: ['tabular-nums'] },
+  figuresLabel: { color: '#5C6670', fontSize: 8.5, fontWeight: '700', letterSpacing: 0.4, marginTop: 1 },
   tileDetail: { color: '#8A96A3', fontSize: 10, fontWeight: '600', textAlign: 'center', width: '100%' },
   tileMeta: { color: '#8A96A3', fontSize: 9.5, fontWeight: '600', textAlign: 'center', width: '100%' },
 

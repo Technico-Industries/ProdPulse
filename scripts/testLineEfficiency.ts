@@ -17,6 +17,7 @@ import {
   efficiencyOf,
   filterLineCards,
   formatStopReason,
+  productionFigures,
   summarize,
 } from '../src/utils/lineEfficiency';
 
@@ -232,6 +233,105 @@ test('plant / workshop filter', () => {
   assert.deepEqual(summarize(filterLineCards(cards, { plant: 'Plant 1', workshop: null })), {
     total: 2, running: 1, stopped: 0, notRunning: 1,
   });
+});
+
+// ─── Actual / Target under the line name ────────────────────────────────────
+
+// A saved slot as RecordProductionScreen stores it: deterministic ID,
+// slotIndex, partSegment (null for a normal slot).
+const slotRec = (
+  slotIndex: number,
+  produced: number,
+  expected: number,
+  over: Partial<EfficiencyRecord> = {}
+): EfficiencyRecord => {
+  const seg = over.partSegment ?? null;
+  return rec('L1', produced, expected, {
+    id: ['pr', DATE, 'L1', 'A', String(slotIndex), seg ?? 'full'].map(encodeURIComponent).join('|'),
+    slotIndex,
+    partSegment: seg,
+    createdAtMs: 10,
+    updatedAtMs: 10,
+    ...over,
+  });
+};
+const l1 = (records: EfficiencyRecord[], s: LiveSession = session('L1')) => cardFor([line('L1')], [s], records, 'L1');
+
+test('F1. 250 actual / 366 target → "250 / 366" and 68.3%', () => {
+  const c = l1([slotRec(0, 100, 122), slotRec(1, 80, 122), slotRec(2, 70, 122)]);
+  assert.equal(c.actual, 250);
+  assert.equal(c.planned, 366);
+  assert.equal(productionFigures(c), '250 / 366');
+  assert.equal(c.efficiency, 68.3);
+  // Efficiency is computed from exactly the figures shown.
+  assert.equal(c.efficiency, Math.round((c.actual / c.planned) * 1000) / 10);
+});
+
+test('F2. re-saving a slot (same doc, new values) does not duplicate', () => {
+  const before = l1([slotRec(0, 100, 122), slotRec(1, 80, 122)]);
+  assert.equal(productionFigures(before), '180 / 244');
+  // The listener delivers the updated doc in place of the old one.
+  const after = l1([slotRec(0, 110, 122, { updatedAtMs: 20 }), slotRec(1, 80, 122)]);
+  assert.equal(productionFigures(after), '190 / 244');
+});
+
+test('F2b. legacy addDoc duplicates of one slot count once (canonical/earliest wins)', () => {
+  const c = l1([
+    slotRec(0, 100, 122),
+    slotRec(0, 999, 999, { id: 'legacyA', createdAtMs: 1 }),
+    slotRec(1, 80, 122, { id: 'legacyB', createdAtMs: 5 }),
+    slotRec(1, 999, 999, { id: 'legacyC', createdAtMs: 9 }),
+  ]);
+  assert.equal(productionFigures(c), '180 / 244');
+});
+
+test('F3. changeover before + after segments each counted exactly once', () => {
+  const c = l1([
+    slotRec(0, 100, 122),
+    slotRec(1, 40, 50, { partSegment: 'before' }),
+    slotRec(1, 60, 72, { partSegment: 'after' }),
+    slotRec(1, 60, 72, { partSegment: 'after', id: 'legacyAfter', createdAtMs: 1 }),
+  ]);
+  assert.equal(productionFigures(c), '200 / 244');
+});
+
+test('F3b. stale full record next to a newer split (or vice versa) → latest shape only', () => {
+  const split = [
+    slotRec(1, 40, 50, { partSegment: 'before', updatedAtMs: 30 }),
+    slotRec(1, 60, 72, { partSegment: 'after', updatedAtMs: 30 }),
+  ];
+  assert.equal(productionFigures(l1([slotRec(1, 90, 122, { updatedAtMs: 20 }), ...split])), '100 / 122');
+  assert.equal(productionFigures(l1([slotRec(1, 90, 122, { updatedAtMs: 40 }), ...split])), '90 / 122');
+});
+
+test('F4. stopped line keeps its current session figures', () => {
+  const s = session('L1', { lineStopped: true, stopsBySlot: { '2': [{ reason: 'power cut', startAbs: 1, running: true }] } });
+  const c = l1([slotRec(0, 100, 122), slotRec(1, 80, 122), slotRec(2, 70, 122)], s);
+  assert.equal(c.status, 'stopped');
+  assert.equal(productionFigures(c), '250 / 366');
+  assert.equal(c.efficiency, 68.3);
+});
+
+test('F5. no active session → "— / —", not historical totals', () => {
+  const c = cardFor([line('L1')], [], [slotRec(0, 100, 122)], 'L1');
+  assert.equal(productionFigures(c), '— / —');
+  // Earlier shift / day records don't leak into the current session.
+  const cur = l1([
+    slotRec(0, 50, 100),
+    slotRec(0, 999, 999, { shift: 'B', id: 'x' }),
+    slotRec(0, 999, 999, { productionDate: '2026-10-13', id: 'y' }),
+  ]);
+  assert.equal(productionFigures(cur), '50 / 100');
+});
+
+test('F6. missing / zero target handled safely', () => {
+  assert.equal(productionFigures(l1([])), '— / —');
+  const zero = l1([slotRec(0, 10, 0)]);
+  assert.equal(productionFigures(zero), '10 / —');
+  assert.equal(zero.efficiency, null);
+  const missing = l1([rec('L1', 10, null)]);
+  assert.equal(productionFigures(missing), '10 / —');
+  assert.equal(missing.efficiency, null);
 });
 
 console.log(`\n${passed} passed`);

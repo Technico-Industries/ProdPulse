@@ -48,6 +48,13 @@ export interface EfficiencyRecord {
   productionDate: string | null;
   expectedParts: number | null;
   producedThisSlot: number | null;
+  // Slot identity, used to count every slot exactly once (see
+  // dedupeSlotRecords). Optional so callers without them still work.
+  id?: string | null;
+  slotIndex?: number | null;
+  partSegment?: string | null; // null = 'full', else 'before' / 'after'
+  createdAtMs?: number | null;
+  updatedAtMs?: number | null;
 }
 
 function num(v: unknown): number {
@@ -172,17 +179,84 @@ export interface LineCard {
   session: LiveSession | null;
 }
 
+// Same deterministic ID RecordProductionScreen's productionRecordId() writes.
+function canonicalRecordId(r: EfficiencyRecord, segment: string): string {
+  return ['pr', r.productionDate ?? '', r.lineId ?? '', r.shift ?? '', String(r.slotIndex), segment]
+    .map((v) => encodeURIComponent(v))
+    .join('|');
+}
+
+// One logical slot is stored as either ONE 'full' record or a 'before' +
+// 'after' pair (a changeover slot). Two things can still leave extra docs
+// for a slot, and neither may be counted twice:
+//   • legacy addDoc() duplicates of the same slot + segment — keep the doc
+//     RecordProductionScreen itself would update: the canonical-ID doc if
+//     present, else the earliest-created one;
+//   • both shapes at once (a changeover added/removed and the superseded
+//     record not yet deleted) — keep the shape written most recently.
+// Records without a slotIndex can't be matched to a slot and are kept as-is.
+// Expects records of ONE session (line + date + shift).
+export function dedupeSlotRecords<R extends EfficiencyRecord>(records: R[]): R[] {
+  const loose: R[] = [];
+  const bySlot = new Map<number, Map<string, R[]>>();
+  records.forEach((r) => {
+    if (typeof r.slotIndex !== 'number' || !Number.isFinite(r.slotIndex)) {
+      loose.push(r);
+      return;
+    }
+    const seg = r.partSegment ?? 'full';
+    const segs = bySlot.get(r.slotIndex) ?? new Map<string, R[]>();
+    segs.set(seg, [...(segs.get(seg) ?? []), r]);
+    bySlot.set(r.slotIndex, segs);
+  });
+
+  const out: R[] = [...loose];
+  bySlot.forEach((segs) => {
+    const kept = new Map<string, R>();
+    segs.forEach((docs, seg) => {
+      const canonical = docs.find((d) => d.id != null && d.id === canonicalRecordId(d, seg));
+      kept.set(
+        seg,
+        canonical ??
+          [...docs].sort(
+            (a, b) => num(a.createdAtMs) - num(b.createdAtMs) || String(a.id ?? '').localeCompare(String(b.id ?? ''))
+          )[0]
+      );
+    });
+    const full = kept.get('full');
+    const split = [...kept.entries()].filter(([seg]) => seg !== 'full').map(([, r]) => r);
+    if (full && split.length) {
+      const splitLatest = Math.max(...split.map((r) => num(r.updatedAtMs)));
+      out.push(...(num(full.updatedAtMs) > splitLatest ? [full] : split));
+    } else {
+      out.push(...kept.values());
+    }
+  });
+  return out;
+}
+
 // A record belongs to a session when it is for the same line, production
 // date and shift — the same identity RecordProductionScreen keys its
-// deterministic productionRecords IDs on.
+// deterministic productionRecords IDs on. Each slot is counted once.
 export function recordsForSession<R extends EfficiencyRecord>(session: LiveSession, records: R[]): R[] {
-  return records.filter(
-    (r) =>
-      r.lineId === session.lineId &&
-      r.productionDate != null &&
-      r.productionDate === session.productionDate &&
-      (session.shift == null || r.shift === session.shift)
+  return dedupeSlotRecords(
+    records.filter(
+      (r) =>
+        r.lineId === session.lineId &&
+        r.productionDate != null &&
+        r.productionDate === session.productionDate &&
+        (session.shift == null || r.shift === session.shift)
+    )
   );
+}
+
+// "Actual / Target" text under a line's name. Inactive lines and active ones
+// with nothing saved yet show "— / —" (never historical totals); a missing
+// target shows "—" rather than 0.
+export function productionFigures(card: Pick<LineCard, 'status' | 'actual' | 'planned'>): string {
+  if (card.status === 'not_running' || (card.actual === 0 && card.planned === 0)) return '— / —';
+  const fmt = (n: number) => Math.round(n).toLocaleString();
+  return `${fmt(card.actual)} / ${card.planned > 0 ? fmt(card.planned) : '—'}`;
 }
 
 const STATUS_ORDER: Record<LineStatus, number> = { stopped: 0, running: 1, not_running: 2 };
