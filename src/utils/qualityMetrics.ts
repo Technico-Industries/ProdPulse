@@ -1,45 +1,38 @@
 // src/utils/qualityMetrics.ts
 //
-// First-pass quality for the admin Production Overview
-// (AdminOverviewScreen), checked by scripts/testQualityMetrics.ts
+// Quality figures for the admin Production Overview (AdminOverviewScreen),
+// the Quality Overview (QualityOverviewScreen) and the live QC Lines page
+// (via src/utils/liveQuality.ts). Checked by scripts/testQualityMetrics.ts
 // (npm run test:quality).
 //
-// DATA MODEL — the one KPIAnalysisScreen and kpiExcelExport already use:
-// productionRecords.producedThisSlot is the GOOD output a line reports
-// (KPIAnalysis shows Σ producedThisSlot as "Good Parts" and computes
-// rejection % = rejected / (produced + rejected)). Rejected parts come on
-// top of it, so:
+// SOURCE OF REJECTIONS — the "Rejections" −/+ counter on each Record
+// Production slot card. RecordProductionScreen writes it to that slot's
+// productionRecords doc as `rejections` (one doc per slot, or per changeover
+// half). It is the ONLY rejection source for these figures.
+// rejectionRecords (the separate Record Rejection screen, browsed in Quality
+// Analysis) is never added — it may log the very same parts.
+//
+// DATA MODEL — the one KPIAnalysisScreen already uses: producedThisSlot is
+// the GOOD output a line reports (efficiency compares it with the target,
+// nothing subtracts rejections from it, and KPIAnalysis computes
+// rejection % = rejections / (produced + rejections)). So, summed over the
+// same records — quantities first, never an average of slot percentages:
 //   goodParts      = Σ producedThisSlot
-//   rejectedParts  = Σ rejectionRecords.rejectionQty  (QC-logged)
+//   rejectedParts  = Σ rejections
 //   inspectedParts = goodParts + rejectedParts
 //   qualityPct     = goodParts / inspectedParts × 100
 //   rejectionPct   = rejectedParts / inspectedParts × 100  (= 100 − quality)
 //
-// AUTHORITATIVE REJECTIONS — the QC-logged `rejectionRecords` (one record per
-// defect type, written by RecordRejectionScreen). The per-slot `rejections`
-// a supervisor can also tap in on RecordProductionScreen are a separate,
-// unlinked count of what may be the very same physical parts (nothing ties a
-// slot rejection to a QC record), so they are NOT added — that would
-// double-count. They're shown separately for reference only.
-//
-// QC data that failed to load is `null`, never 0: quality is then unknown
-// (null → "—"), not a misleading 100%.
-
-export interface QcRejectionRecord {
-  date: string | null;
-  lineId: string | null;
-  plant: string | null;
-  workshop: string | null;
-  division: string | null;
-  rejectionQty: number;
-}
+// LEGACY records without a numeric `rejections` field are left out of all
+// four quantities (counted in `legacyRecords`), so a missing counter is
+// never read as "0 rejected". expectedParts is never used here.
 
 export interface QualityMetrics {
   goodParts: number;
-  // null when the QC rejections couldn't be loaded.
+  // null when the rejections are unknown (not loaded / legacy records only).
   rejectedParts: number | null;
   inspectedParts: number | null;
-  // null when unknown (QC data unavailable) or when nothing was inspected.
+  // null when unknown (rejections unknown) or when nothing was inspected.
   qualityPct: number | null;
   rejectionPct: number | null;
 }
@@ -48,12 +41,12 @@ function round1(n: number) {
   return Math.round(n * 10) / 10;
 }
 
-export function computeQuality(goodParts: number, qcRejected: number | null): QualityMetrics {
+export function computeQuality(goodParts: number, rejectedParts: number | null): QualityMetrics {
   const good = Math.max(0, Number.isFinite(goodParts) ? goodParts : 0);
-  if (qcRejected == null || !Number.isFinite(qcRejected)) {
+  if (rejectedParts == null || !Number.isFinite(rejectedParts)) {
     return { goodParts: good, rejectedParts: null, inspectedParts: null, qualityPct: null, rejectionPct: null };
   }
-  const rejected = Math.max(0, qcRejected);
+  const rejected = Math.max(0, rejectedParts);
   const inspected = good + rejected;
   if (inspected <= 0) {
     return { goodParts: good, rejectedParts: rejected, inspectedParts: 0, qualityPct: null, rejectionPct: null };
@@ -69,42 +62,39 @@ export function computeQuality(goodParts: number, qcRejected: number | null): Qu
   };
 }
 
-// Case/whitespace-insensitive equality — the same matching the admin
-// screens use for their Plant/Workshop/Division filters.
-function sameValue(a: string | null | undefined, b: string | null | undefined) {
-  if (a == null || b == null) return false;
-  return String(a).trim().toLowerCase() === String(b).trim().toLowerCase();
+export interface CounterRecord {
+  producedThisSlot: number | null;
+  // Absent / null on legacy records written before the counter existed.
+  rejections?: number | null;
 }
 
-export interface LineLocation {
-  id: string;
-  plant: string | null;
-  workshop: string | null;
-  division: string | null;
+export interface CounterQuality extends QualityMetrics {
+  // Records left out because they carry no rejection counter.
+  legacyRecords: number;
 }
 
-// QC records narrowed to the dashboard's Plant/Workshop/Division filters.
-// Like the production records on the same screen, a record's location is
-// taken from its line's productionLines doc when that line still exists, and
-// from the record's own stamped fields otherwise.
-export function filterQcRecords<T extends QcRejectionRecord>(
-  records: T[],
-  lines: LineLocation[],
-  filters: { plant: string | null; workshop: string | null; division: string | null }
-): T[] {
-  const lineById = new Map(lines.map((l) => [l.id, l]));
-  return records.filter((r) => {
-    const line = r.lineId ? lineById.get(r.lineId) : undefined;
-    const plant = line?.plant ?? r.plant;
-    const workshop = line?.workshop ?? r.workshop;
-    const division = line?.division ?? r.division;
-    if (filters.plant && !sameValue(plant, filters.plant)) return false;
-    if (filters.workshop && !sameValue(workshop, filters.workshop)) return false;
-    if (filters.division && !sameValue(division, filters.division)) return false;
-    return true;
+function finiteOrNull(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
+// Quality of a set of productionRecords (already de-duplicated / filtered by
+// the caller). No records → unavailable; only legacy records → rejections
+// unknown, so quality is unavailable rather than a misleading 100%.
+export function counterQuality(records: CounterRecord[]): CounterQuality {
+  let good = 0;
+  let rejected = 0;
+  let counted = 0;
+  let legacyRecords = 0;
+  records.forEach((r) => {
+    const rej = finiteOrNull(r.rejections);
+    if (rej == null) {
+      legacyRecords++;
+      return;
+    }
+    counted++;
+    good += Math.max(0, finiteOrNull(r.producedThisSlot) ?? 0);
+    rejected += Math.max(0, rej);
   });
-}
-
-export function sumRejectionQty(records: QcRejectionRecord[]): number {
-  return records.reduce((s, r) => s + (Number.isFinite(r.rejectionQty) ? Math.max(0, r.rejectionQty) : 0), 0);
+  const q = computeQuality(good, counted === 0 && legacyRecords > 0 ? null : rejected);
+  return { ...q, legacyRecords };
 }

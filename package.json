@@ -46,6 +46,7 @@
     "test:production-day": "tsx scripts/testProductionDay.ts",
     "test:line-efficiency": "tsx scripts/testLineEfficiency.ts",
     "test:quality": "tsx scripts/testQualityMetrics.ts",
+    "test:live-quality": "tsx scripts/testLiveQuality.ts",
     "build": "expo export --platform web"
   },
   "private": true

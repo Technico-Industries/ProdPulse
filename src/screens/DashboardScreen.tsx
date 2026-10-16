@@ -17,11 +17,10 @@ import { collection, getDocs, onSnapshot, query, where, orderBy, Timestamp, doc,
 import { db } from '../services/firebase';
 import { useAuthStore } from '../stores/authStore';
 import { ADMIN_MENU_ITEMS } from '../constants/adminMenu';
-import AdminDashboardPager from '../components/AdminDashboardPager';
+import AdminDashboardPager, { QualityDashboardPager } from '../components/AdminDashboardPager';
 import { SUPERVISOR_MENU_ITEMS } from '../constants/supervisorMenu';
 import SupervisorOverviewScreen from './SupervisorOverviewScreen';
 import { QUALITY_MENU_ITEMS } from '../constants/qualityMenu';
-import QualityOverviewScreen from './QualityOverviewScreen';
 
 type IconName = keyof typeof Ionicons.glyphMap;
 
@@ -1070,9 +1069,10 @@ export default function DashboardScreen() {
   }
 
   // Quality Control gets the digital quality overview, with its own header
-  // + hamburger drawer (Record Rejection / Quality Analysis live there now).
+  // + hamburger drawer (Record Rejection / Quality Analysis live there now),
+  // and the live quality lines page one swipe to the left.
   if (isQualityControl) {
-    return <QualityOverviewScreen />;
+    return <QualityDashboardPager />;
   }
 
   // Plain Supervisor (assign 'Supervisor' or unset) gets the digital

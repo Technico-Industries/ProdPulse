@@ -686,6 +686,9 @@ export default function RecordProductionScreen() {
   // producedSegment and lossReasonBySlot, so each split part-section has its
   // own independent rejection count.
   const [rejectionsBySlot, setRejectionsBySlot] = useState<Record<string, number>>({});
+  // Latest counts for the deferred record sync below (syncSavedSlotRejections).
+  const rejectionsBySlotRef = useRef<Record<string, number>>({});
+  rejectionsBySlotRef.current = rejectionsBySlot;
   const [stopsBySlot, setStopsBySlot] = useState<Record<number, StopEvent[]>>({});
   // Mirrors stopsBySlot for reads inside setTimeout/async callbacks below,
   // where a closure over state captured at call time would otherwise be stale.
@@ -1406,6 +1409,68 @@ export default function RecordProductionScreen() {
       resolveSessionProductionDate({ startedAt: sessionStartedAtMsRef.current });
     if (!pd) throw new Error('Could not determine the production date of this session. Check your connection and try again.');
     return pd;
+  }
+
+  // ── Rejection counter on an already-saved slot ──────────────────────────
+  // The counter stays editable after a slot is saved, but persistSession only
+  // writes it to activeSessions, and Finalize skips saved slots — so a tap
+  // after saving would never reach that slot's productionRecords doc, which
+  // is what the QC dashboards read. Each tap marks its key; shortly after the
+  // last tap, the `rejections` field (and updatedAt) of the slot's EXISTING
+  // record is updated to the counter's value. Nothing else on the record is
+  // touched, and no record is ever created here — an unsaved slot gets its
+  // count when it's saved, exactly as before.
+  const dirtyRejectionKeysRef = useRef<Set<string>>(new Set());
+  const rejectionSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Line + shift the pending taps belong to, vs. the one on screen now. If
+  // the supervisor switches line/shift (or Finalize resets the session)
+  // before the sync runs, the pending taps are dropped rather than written
+  // with another session's — or a reset — counter value.
+  const rejectionSyncScopeRef = useRef<string | null>(null);
+  const currentSyncScopeRef = useRef<string>('');
+  currentSyncScopeRef.current = `${selectedLineId ?? ''}|${selectedShift}`;
+
+  function queueRejectionSync(rejectKey: string) {
+    const scope = `${selectedLineId ?? ''}|${selectedShift}`;
+    if (rejectionSyncScopeRef.current !== scope) dirtyRejectionKeysRef.current.clear();
+    rejectionSyncScopeRef.current = scope;
+    dirtyRejectionKeysRef.current.add(rejectKey);
+    if (rejectionSyncTimerRef.current) clearTimeout(rejectionSyncTimerRef.current);
+    rejectionSyncTimerRef.current = setTimeout(() => {
+      rejectionSyncTimerRef.current = null;
+      syncSavedSlotRejections().catch((e) => console.warn('[rejections] could not update the saved slot record', e));
+    }, 600);
+  }
+
+  async function syncSavedSlotRejections() {
+    const keys = Array.from(dirtyRejectionKeysRef.current);
+    dirtyRejectionKeysRef.current.clear();
+    if (rejectionSyncScopeRef.current !== currentSyncScopeRef.current) return;
+    // Same identity a slot Save writes (slotKey in the save handler).
+    const lineId = selectedLineId;
+    if (!keys.length || !lineId || !selectedShift) return;
+    const prodDate = await resolveActiveSessionProductionDate(sessionLineId ?? lineId);
+    for (const key of keys) {
+      // Same key scheme as the cards: '3' → slot 3, '3:before' / '3:after'
+      // → that half of a changeover slot.
+      const [idxStr, seg] = key.split(':');
+      const slotIndex = Number(idxStr);
+      if (!Number.isInteger(slotIndex)) continue;
+      // Counter cleared (session finalized / reset) — nothing to sync.
+      if (!(key in rejectionsBySlotRef.current)) continue;
+      const segment: SlotSegment = seg === 'before' || seg === 'after' ? seg : 'full';
+      const id: ProductionSlotIdentity = { productionDate: prodDate, lineId, shift: selectedShift, slotIndex, segment };
+      const recordKey = productionRecordId(id);
+      const cachedDocId = resolvedRecordIdsRef.current.get(recordKey);
+      let ref = cachedDocId ? doc(db, 'productionRecords', cachedDocId) : null;
+      if (!ref) {
+        const resolved = await resolveProductionRecordRef(id);
+        if (!resolved.exists) continue; // slot not saved yet
+        ref = resolved.ref;
+        resolvedRecordIdsRef.current.set(recordKey, ref.id);
+      }
+      await updateDoc(ref, { rejections: rejectionsBySlotRef.current[key] ?? 0, updatedAt: serverTimestamp() });
+    }
   }
 
   // Sums planned production (cycle time × FULL slot duration, ignoring
@@ -2842,9 +2907,9 @@ export default function RecordProductionScreen() {
                     <View style={{ marginTop: 8 }}>
                       <Text style={styles.labelSmall}>Rejections</Text>
                       <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 4 }}>
-                        <Pressable onPress={() => { setRejectionsBySlot((p) => ({ ...p, [rejectKey]: Math.max(0, (p[rejectKey] ?? 0) - 1) })); setTimeout(() => persistSession(), 100); }} style={[styles.smallBtn, disabled && styles.disabledBtn]} disabled={disabled}><Text style={styles.smallBtnText}>−</Text></Pressable>
+                        <Pressable onPress={() => { setRejectionsBySlot((p) => ({ ...p, [rejectKey]: Math.max(0, (p[rejectKey] ?? 0) - 1) })); setTimeout(() => persistSession(), 100); queueRejectionSync(rejectKey); }} style={[styles.smallBtn, disabled && styles.disabledBtn]} disabled={disabled}><Text style={styles.smallBtnText}>−</Text></Pressable>
                         <Text style={{ color: '#ECEFF2', fontWeight: '700', minWidth: 36, textAlign: 'center' }}>{rejectionsBySlot[rejectKey] ?? 0}</Text>
-                        <Pressable onPress={() => { setRejectionsBySlot((p) => ({ ...p, [rejectKey]: (p[rejectKey] ?? 0) + 1 })); setTimeout(() => persistSession(), 100); }} style={[styles.smallBtn, disabled && styles.disabledBtn]} disabled={disabled}><Text style={styles.smallBtnText}>+</Text></Pressable>
+                        <Pressable onPress={() => { setRejectionsBySlot((p) => ({ ...p, [rejectKey]: (p[rejectKey] ?? 0) + 1 })); setTimeout(() => persistSession(), 100); queueRejectionSync(rejectKey); }} style={[styles.smallBtn, disabled && styles.disabledBtn]} disabled={disabled}><Text style={styles.smallBtnText}>+</Text></Pressable>
                       </View>
                     </View>
                   </View>

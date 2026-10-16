@@ -1,7 +1,10 @@
 // src/components/AdminDashboardPager.tsx
 //
 // Admin's main dashboard: the production overview, with the quality overview
-// one swipe to the left and the live line efficiency overview after it. A horizontal paging ScrollView, so it follows the
+// one swipe to the left, the live line efficiency overview after it and the
+// live quality lines page last. The Quality In-charge dashboard uses the same
+// pager (QualityDashboardPager below): quality overview → live quality lines.
+// A horizontal paging ScrollView, so it follows the
 // finger on Android/iOS and on mobile web (react-native-web maps
 // pagingEnabled to CSS scroll-snap). Desktop browsers can't drag a scroll
 // area with the mouse, so the page tabs at the bottom are also tappable.
@@ -15,14 +18,39 @@ import { View, Text, Pressable, ScrollView, StyleSheet, LayoutChangeEvent, Nativ
 import AdminOverviewScreen from '../screens/AdminOverviewScreen';
 import QualityOverviewScreen from '../screens/QualityOverviewScreen';
 import LineEfficiencyOverviewScreen from '../screens/LineEfficiencyOverviewScreen';
+import LiveQualityLinesScreen from '../screens/LiveQualityLinesScreen';
 
-const PAGES = [
+interface Page {
+  key: string;
+  label: string;
+  color: string;
+  Component: React.ComponentType;
+}
+
+const AdminLiveQualityLines = () => <LiveQualityLinesScreen role="admin" />;
+const QualityLiveQualityLines = () => <LiveQualityLinesScreen role="quality" />;
+
+const ADMIN_PAGES: Page[] = [
   { key: 'production', label: 'Production', color: '#3E7CB1', Component: AdminOverviewScreen },
   { key: 'quality', label: 'Quality', color: '#4C9A6A', Component: QualityOverviewScreen },
   { key: 'lines', label: 'Lines', color: '#8B5CF6', Component: LineEfficiencyOverviewScreen },
+  { key: 'quality-lines', label: 'QC Lines', color: '#E0793C', Component: AdminLiveQualityLines },
+];
+
+const QUALITY_PAGES: Page[] = [
+  { key: 'quality', label: 'Quality', color: '#4C9A6A', Component: QualityOverviewScreen },
+  { key: 'quality-lines', label: 'QC Lines', color: '#E0793C', Component: QualityLiveQualityLines },
 ];
 
 export default function AdminDashboardPager() {
+  return <DashboardPager pages={ADMIN_PAGES} />;
+}
+
+export function QualityDashboardPager() {
+  return <DashboardPager pages={QUALITY_PAGES} />;
+}
+
+function DashboardPager({ pages: PAGES }: { pages: Page[] }) {
   const scrollRef = useRef<ScrollView>(null);
   const [size, setSize] = useState<{ width: number; height: number } | null>(null);
   const [page, setPage] = useState(0);
@@ -108,7 +136,8 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#2C343C',
   },
-  tab: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 6, paddingHorizontal: 12, borderRadius: 999 },
+  // 10px sides so four tabs still fit a 360px-wide phone.
+  tab: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 6, paddingHorizontal: 10, borderRadius: 999 },
   dot: { width: 6, height: 6, borderRadius: 3 },
   tabText: { color: '#8A96A3', fontSize: 12, fontWeight: '800' },
 });

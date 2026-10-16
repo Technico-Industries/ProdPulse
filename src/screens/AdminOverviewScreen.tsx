@@ -13,11 +13,8 @@
 // KPIAnalysisScreen already use. Nothing here reads
 // sampleProductionRecords (the seed script's collection) or any mock data.
 //
-// ONE Firestore read per date change for the production side, plus one
-// best-effort read of `rejectionRecords` (the QC-logged rejections
-// QualityAnalysisScreen reads) for the same day. Every KPI below is then
-// computed locally from those two result sets — no per-KPI and no per-line
-// queries.
+// ONE Firestore read per date change. Every KPI below is then computed
+// locally from that result set — no per-KPI and no per-line queries.
 //
 // FORMULAS are the project's existing ones, not new inventions:
 //   totalProduction  = Σ producedThisSlot          (GenerateReportScreen summary)
@@ -27,14 +24,13 @@
 //   efficiency       = produced / expected * 100   (GenerateReportScreen summary)
 //   achievementPct   = actual / plan * 100         (KPIAnalysisScreen totals — same figure)
 //   goodParts        = Σ producedThisSlot  (KPIAnalysisScreen: produced is the GOOD output)
-//   qcRejected       = Σ rejectionRecords.rejectionQty, same day + filters
-//   inspected        = goodParts + qcRejected
-//   rejectionPct     = qcRejected / inspected * 100  (KPIAnalysisScreen formula)
-//   qualityPct       = 100 - rejectionPct            (see src/utils/qualityMetrics.ts)
-// QC-logged rejectionRecords are the authoritative rejection count. The
-// supervisor's per-slot `rejections` are shown for reference but never
-// added — nothing links them to QC records, so adding both could count the
-// same parts twice.
+//   rejected         = Σ rejections        (Record Production's rejection counter)
+//   inspected        = goodParts + rejected
+//   rejectionPct     = rejected / inspected * 100  (KPIAnalysisScreen formula)
+//   qualityPct       = 100 - rejectionPct          (see src/utils/qualityMetrics.ts)
+// The quality figures use only records that carry the counter (legacy ones
+// without it are left out). rejectionRecords (Record Rejection screen) are
+// not added — they may log the same parts.
 //   operatorHours    = Σ operatorCount × productiveMinutes / 60  (KPIAnalysisScreen byLine)
 //   pcsPerManHour    = actual / operatorHours      (KPIAnalysisScreen totals)
 
@@ -58,12 +54,7 @@ import { db } from '../services/firebase';
 import { PLANTS, WORKSHOPS, DIVISIONS } from '../constants/lineOptions';
 import AppDrawer from '../components/AppDrawer';
 import { ADMIN_MENU_ITEMS } from '../constants/adminMenu';
-import {
-  QcRejectionRecord,
-  computeQuality,
-  filterQcRecords,
-  sumRejectionQty,
-} from '../utils/qualityMetrics';
+import { counterQuality } from '../utils/qualityMetrics';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 // Same field set the other production screens map off each Firestore doc.
@@ -423,12 +414,6 @@ export default function AdminOverviewScreen() {
 
   const [allLines, setAllLines] = useState<Line[]>([]);
   const [records, setRecords] = useState<ProductionRecord[]>([]);
-  // QC-logged rejections for the same day (rejectionRecords, the collection
-  // QualityAnalysisScreen reads) — the authoritative rejection count. Kept
-  // as records, not a sum, so the Plant/Workshop/Division filters apply to
-  // them too. Best-effort: null means the read failed, which renders as "—"
-  // rather than a misleading 0 rejections / 100% quality.
-  const [qcRecords, setQcRecords] = useState<QcRejectionRecord[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [hasLoaded, setHasLoaded] = useState(false);
@@ -486,35 +471,9 @@ export default function AdminOverviewScreen() {
         };
       });
       setRecords(mapped);
-
-      // Secondary, non-blocking read — a failure here (rules, offline) must
-      // not take the whole dashboard down with it.
-      try {
-        const qcSnap = await getDocs(
-          query(collection(db, 'rejectionRecords'), where('date', '==', dateStr))
-        );
-        setQcRecords(
-          qcSnap.docs.map((d) => {
-            const data: any = d.data();
-            const qty = Number(data.rejectionQty);
-            return {
-              date: data.date ?? null,
-              lineId: data.lineId ?? null,
-              plant: data.plant ?? null,
-              workshop: data.workshop ?? null,
-              division: data.division ?? null,
-              rejectionQty: Number.isFinite(qty) ? qty : 0,
-            };
-          })
-        );
-      } catch (qcErr) {
-        console.warn('[AdminOverview] rejectionRecords read failed', qcErr);
-        setQcRecords(null);
-      }
     } catch (e) {
       console.error('[AdminOverview] productionRecords fetch failed', e);
       setRecords([]);
-      setQcRecords(null);
       setLoadError('Unable to load production data.');
     } finally {
       setLoading(false);
@@ -648,7 +607,6 @@ export default function AdminOverviewScreen() {
     let totalProduction = 0;
     let plannedTotal = 0;
     let lossParts = 0;
-    let rejections = 0;
     let downtimeMinutes = 0;
     let operatorHours = 0;
     const lineIds = new Set<string>();
@@ -660,7 +618,6 @@ export default function AdminOverviewScreen() {
       totalProduction += produced;
       plannedTotal += expected;
       lossParts += r.lossParts ?? Math.max(0, expected - produced);
-      rejections += r.rejections ?? 0;
       (r.stopEvents ?? []).forEach((se) => {
         downtimeMinutes += se.durationMinutes ?? 0;
       });
@@ -675,9 +632,6 @@ export default function AdminOverviewScreen() {
       totalProduction,
       plannedTotal,
       lossParts: Math.round(lossParts),
-      // Supervisor-reported per-slot rejections — reference only, NOT part
-      // of the quality figure (see `quality` below).
-      lineRejections: rejections,
       downtimeMinutes: Math.round(downtimeMinutes),
       operatorHours: round1(operatorHours),
       efficiency,
@@ -688,14 +642,11 @@ export default function AdminOverviewScreen() {
     };
   }, [filteredRecords]);
 
-  // ── Quality — QC-logged rejections for the same day, narrowed by the same
-  // Plant/Workshop/Division filters as production, against the filtered good
-  // output. Every quality/rejection figure on screen reads from this one
+  // ── Quality — the rejection counter on the same filtered records as
+  // production. Every quality/rejection figure on screen reads from this one
   // object, so they always agree with each other.
-  const quality = useMemo(() => {
-    const qcFiltered = qcRecords ? filterQcRecords(qcRecords, allLines, { plant, workshop, division }) : null;
-    return computeQuality(metrics.totalProduction, qcFiltered ? sumRejectionQty(qcFiltered) : null);
-  }, [qcRecords, allLines, plant, workshop, division, metrics.totalProduction]);
+  const quality = useMemo(() => counterQuality(filteredRecords), [filteredRecords]);
+  // Only legacy records (no rejection counter) for this day / filter.
   const qcUnavailable = quality.rejectedParts === null;
   const qualityColor = quality.rejectionPct === null ? '#8A96A3' : rejectionColor(quality.rejectionPct);
   const pctText = (v: number | null) => (v === null ? '—' : `${v}%`);
@@ -926,7 +877,11 @@ export default function AdminOverviewScreen() {
                   {pctText(quality.qualityPct)}
                 </Text>
                 <Text style={styles.duoUnit}>
-                  {qcUnavailable ? 'QC rejections unavailable — pull to retry' : 'First Pass Quality'}
+                  {qcUnavailable
+                    ? 'No rejection counter on these records'
+                    : quality.legacyRecords > 0
+                    ? `First Pass Quality · ${quality.legacyRecords} legacy ${quality.legacyRecords === 1 ? 'slot' : 'slots'} excluded`
+                    : 'First Pass Quality'}
                 </Text>
                 <View style={styles.duoBreakdown}>
                   <View style={styles.duoLine}>
@@ -936,7 +891,7 @@ export default function AdminOverviewScreen() {
                     </Text>
                   </View>
                   <View style={styles.duoLine}>
-                    <Text style={styles.duoLineLabel}>QC Logged Rejections</Text>
+                    <Text style={styles.duoLineLabel}>Rejected Parts</Text>
                     <Text style={styles.duoLineValue}>{intText(quality.rejectedParts)}</Text>
                   </View>
                   <View style={styles.duoLine}>
@@ -951,19 +906,13 @@ export default function AdminOverviewScreen() {
                 <Text style={[styles.duoValue, { color: qcUnavailable ? '#8A96A3' : '#D64545' }]} numberOfLines={1} adjustsFontSizeToFit>
                   {intText(quality.rejectedParts)}
                 </Text>
-                <Text style={styles.duoUnit}>Parts Rejected (QC logged)</Text>
+                <Text style={styles.duoUnit}>Parts Rejected (Record Production)</Text>
                 <View style={styles.duoBreakdown}>
                   <View style={styles.duoLine}>
                     <Text style={styles.duoLineLabel}>Rejection %</Text>
                     <Text style={[styles.duoLineValue, { color: qualityColor }]}>
                       {pctText(quality.rejectionPct)}
                     </Text>
-                  </View>
-                  {/* Reference only — not added to the QC count (could be
-                      the same parts). */}
-                  <View style={styles.duoLine}>
-                    <Text style={styles.duoLineLabel}>Line-reported (not added)</Text>
-                    <Text style={styles.duoLineValue}>{formatInt(metrics.lineRejections)}</Text>
                   </View>
                   <View style={styles.duoLine}>
                     <Text style={styles.duoLineLabel}>Loss Parts</Text>
@@ -1006,7 +955,7 @@ export default function AdminOverviewScreen() {
                   width={kpiWidth}
                 />
                 <KpiTile
-                  label="Rejection (QC)"
+                  label="Rejection"
                   value={intText(quality.rejectedParts)}
                   color={(quality.rejectedParts ?? 0) > 0 ? '#D64545' : undefined}
                   width={kpiWidth}
@@ -1050,7 +999,7 @@ export default function AdminOverviewScreen() {
                 <Text style={styles.statusText}>
                   {quality.rejectionPct === null
                     ? qcUnavailable
-                      ? 'QC data unavailable'
+                      ? 'No rejection data'
                       : 'No parts inspected'
                     : quality.rejectionPct <= 2
                     ? 'Quality stable'
