@@ -12,6 +12,7 @@ import {
   Platform,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import WebRefreshButton from '../components/WebRefreshButton';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { collection, getDocs, orderBy, query, deleteDoc, doc } from 'firebase/firestore';
 import { db } from '../services/firebase';
@@ -152,9 +153,12 @@ export default function ManageLinesScreen() {
         <Text style={styles.backText}>Back</Text>
       </Pressable>
 
-      <View style={styles.header}>
-        <Text style={styles.title}>Manage Lines</Text>
-        <Text style={styles.subtitle}>Tap a line to edit its details or models</Text>
+      <View style={[styles.header, { flexDirection: 'row', alignItems: 'center', gap: 12 }]}>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.title}>Manage Lines</Text>
+          <Text style={styles.subtitle}>Tap a line to edit its details or models</Text>
+        </View>
+        <WebRefreshButton onRefresh={handleRefresh} refreshing={refreshing} />
       </View>
 
       <View style={styles.filters}>

@@ -116,27 +116,43 @@ export const useAuthStore = create<AuthState>((set) => ({
 }));
 
 // Keeps the store in sync on cold start if Firebase has a cached session.
-onAuthStateChanged(auth, async (fbUser: FirebaseUser | null) => {
-  if (!fbUser) {
-    useAuthStore.setState({ user: null, initializing: false });
-    return;
-  }
-  const profile = await resolveProfile(fbUser.uid);
+// `initializing` stays true (App.tsx shows the splash, never login) until
+// the FIRST result here is fully handled — including the profile read — and
+// is cleared on every path, errors included, so startup can't hang.
+onAuthStateChanged(
+  auth,
+  async (fbUser: FirebaseUser | null) => {
+    try {
+      if (!fbUser) {
+        useAuthStore.setState({ user: null, initializing: false });
+        return;
+      }
+      const profile = await resolveProfile(fbUser.uid);
 
-  if (profile && !profile.active) {
-    await signOut(auth);
-    useAuthStore.setState({ user: null, initializing: false, error: 'This account has been deactivated. Contact your admin.' });
-    return;
-  }
+      if (profile && !profile.active) {
+        await signOut(auth);
+        useAuthStore.setState({ user: null, initializing: false, error: 'This account has been deactivated. Contact your admin.' });
+        return;
+      }
 
-  useAuthStore.setState({
-    user: {
-      uid: fbUser.uid,
-      email: fbUser.email,
-      name: profile?.name ?? null,
-      role: profile?.role ?? 'supervisor',
-      assign: profile?.assign ?? null,
-    },
-    initializing: false,
-  });
-});
+      useAuthStore.setState({
+        user: {
+          uid: fbUser.uid,
+          email: fbUser.email,
+          name: profile?.name ?? null,
+          role: profile?.role ?? 'supervisor',
+          assign: profile?.assign ?? null,
+        },
+        initializing: false,
+      });
+    } catch (err) {
+      // Fall back to the login screen rather than a splash that never ends.
+      console.error('[auth] restoring the session failed', err);
+      useAuthStore.setState({ user: null, initializing: false, error: 'Could not restore your session. Please sign in again.' });
+    }
+  },
+  (err) => {
+    console.error('[auth] auth state listener error', err);
+    useAuthStore.setState({ user: null, initializing: false, error: 'Could not restore your session. Please sign in again.' });
+  }
+);

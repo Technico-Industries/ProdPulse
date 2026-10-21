@@ -41,7 +41,14 @@
 //   achievement   = actual / target * 100      (GenerateReport "efficiency")
 //   rejectionPct  = rejections / (actual + rejections) * 100
 //   qualityPct    = 100 - rejectionPct
-//   downtime      = Σ stopEvents[].durationMinutes
+//   downtime      = Σ every unique stop interval in the session doc's
+//                   stopsBySlot (live up to now while the line is stopped).
+//                   NOT from productionRecords: a stop is saved to the
+//                   session the moment the line resumes, but only reaches a
+//                   record when its slot is saved, so a records-only sum
+//                   showed 0 next to a slot reading "quality · 4.2 min".
+//                   The records hold per-slot shares of these same
+//                   intervals, so they are not added on top.
 //   lossParts     = Σ lossParts ?? max(0, target - actual)
 // Shift Plan is the session doc's own `plannedProductionTotal` field (what
 // RecordProductionScreen computed at session start) — read, not recomputed.
@@ -58,12 +65,14 @@ import {
   useWindowDimensions,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import WebRefreshButton from '../components/WebRefreshButton';
 import { useNavigation } from '@react-navigation/native';
 import { collection, getDocs, onSnapshot, query, where } from 'firebase/firestore';
 import { db } from '../services/firebase';
 import { useAuthStore } from '../stores/authStore';
 import { SUPERVISOR_MENU_ITEMS } from '../constants/supervisorMenu';
 import AppDrawer from '../components/AppDrawer';
+import { DowntimeStop, formatDowntimeMinutes, isAnyStopRunning, sessionDowntimeMinutes } from '../utils/downtime';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -86,6 +95,9 @@ interface ActiveSession {
   supervisorName: string | null;
   operatorCount: number;
   lineStopped: boolean;
+  // Every stop interval of the session (RecordProductionScreen's
+  // stopsBySlot, same field name) — the source of the Downtime KPI.
+  stopsBySlot: Record<string, DowntimeStop[]>;
   startedAtMs: number | null;
   updatedAtMs: number | null;
 }
@@ -146,13 +158,8 @@ function formatInt(n: number) {
   return Math.round(n).toLocaleString();
 }
 
-function formatMinutes(mins: number): string {
-  const total = Math.max(0, Math.round(mins));
-  if (total < 60) return `${total} min`;
-  const h = Math.floor(total / 60);
-  const m = total % 60;
-  return m === 0 ? `${h}h` : `${h}h ${m}m`;
-}
+// Downtime display — see formatDowntimeMinutes for the rounding policy.
+const formatMinutes = formatDowntimeMinutes;
 
 // Same colour bands the Admin overview and the report screens use.
 function efficiencyColor(pct: number) {
@@ -197,6 +204,8 @@ function aggregate(records: ProductionRecord[]): Totals {
       downtimeMinutes += se.durationMinutes ?? 0;
     });
   });
+  // Kept for completeness; the Downtime KPI tiles use session downtime
+  // (see sessionDowntimeMinutes) instead.
 
   const achievement = target > 0 ? round1((actual / target) * 100) : 0;
   const rejectionPct =
@@ -206,7 +215,7 @@ function aggregate(records: ProductionRecord[]): Totals {
     actual,
     target,
     rejections,
-    downtimeMinutes: Math.round(downtimeMinutes),
+    downtimeMinutes: Math.round(downtimeMinutes * 100) / 100,
     lossParts: Math.round(lossParts),
     achievement,
     rejectionPct,
@@ -303,6 +312,7 @@ export default function SupervisorOverviewScreen() {
               supervisorName: data.supervisorName ?? null,
               operatorCount: Array.isArray(data.operators) ? data.operators.length : 0,
               lineStopped: data.lineStopped === true,
+              stopsBySlot: data.stopsBySlot && typeof data.stopsBySlot === 'object' ? data.stopsBySlot : {},
               startedAtMs: data.startedAt?.toMillis ? data.startedAt.toMillis() : null,
               updatedAtMs: data.updatedAt?.toMillis ? data.updatedAt.toMillis() : null,
               _uid: data.supervisorUid ?? null,
@@ -359,6 +369,7 @@ export default function SupervisorOverviewScreen() {
       if (dates.length === 0 || lineIds.length === 0) {
         setRecords([]);
         setRecordsError(null);
+        setRefreshing(false); // returns before the finally below
         return;
       }
       if (!isRefresh) setRecordsLoading(true);
@@ -424,8 +435,31 @@ export default function SupervisorOverviewScreen() {
     fetchRecords(productionDates, activeLineIds);
   }, [fetchRecords, productionDates, activeLineIds]);
 
+  // ── Clock for a stopped line's live downtime. Ticks only while some
+  // line is stopped; stop/resume themselves arrive via the listener above.
+  const anyLineStopped = useMemo(() => sessions.some((s) => isAnyStopRunning(s.stopsBySlot)), [sessions]);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    setNowMs(Date.now());
+    if (!anyLineStopped) return;
+    const id = setInterval(() => setNowMs(Date.now()), 30000);
+    return () => clearInterval(id);
+  }, [anyLineStopped, sessions]);
+
+  // Per line: downtime of that line's session doc.
+  const downtimeByLine = useMemo(() => {
+    const map = new Map<string, number>();
+    sessions.forEach((s) => map.set(s.lineId, sessionDowntimeMinutes(s.stopsBySlot, nowMs)));
+    return map;
+  }, [sessions, nowMs]);
+
   // ── Session-wide totals, and one rollup per active line.
-  const totals = useMemo(() => aggregate(records), [records]);
+  const totals = useMemo(() => {
+    const t = aggregate(records);
+    let downtime = 0;
+    downtimeByLine.forEach((m) => { downtime += m; });
+    return { ...t, downtimeMinutes: Math.round(downtime * 100) / 100 };
+  }, [records, downtimeByLine]);
 
   const byLine = useMemo(() => {
     const recordsByLine = new Map<string, ProductionRecord[]>();
@@ -440,9 +474,9 @@ export default function SupervisorOverviewScreen() {
     // against its plan rather than vanishing.
     return sessions.map((s) => ({
       session: s,
-      totals: aggregate(recordsByLine.get(s.lineId) ?? []),
+      totals: { ...aggregate(recordsByLine.get(s.lineId) ?? []), downtimeMinutes: downtimeByLine.get(s.lineId) ?? 0 },
     }));
-  }, [sessions, records]);
+  }, [sessions, records, downtimeByLine]);
 
   // Shift plan across the active lines — read straight off each session doc's
   // plannedProductionTotal, which RecordProductionScreen already computed.
@@ -488,6 +522,7 @@ export default function SupervisorOverviewScreen() {
           <Text style={styles.brand}>ProdPulse</Text>
           <Text style={styles.brandSub}>Production Overview</Text>
         </View>
+        <WebRefreshButton onRefresh={onRefresh} refreshing={refreshing} />
         <View style={styles.rolePill}>
           <Text style={styles.rolePillText}>SUPERVISOR</Text>
         </View>

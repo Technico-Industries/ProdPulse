@@ -12,6 +12,7 @@ import {
   Alert,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import WebRefreshButton from '../components/WebRefreshButton';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { collection, getDocs, onSnapshot, query, where, orderBy, Timestamp, doc, updateDoc, serverTimestamp } from 'firebase/firestore';
 import { db } from '../services/firebase';
@@ -385,6 +386,12 @@ function TechnicianBreakdownList() {
         {tab === 'active' && (
           <Text style={styles.liveStatusText}>{liveConnected ? 'Live' : 'Connecting…'}</Text>
         )}
+        <WebRefreshButton
+          onRefresh={tab === 'active' ? handleRefresh : handleFixedRefresh}
+          refreshing={tab === 'active' ? refreshing : fixedRefreshing}
+          size={36}
+          style={{ alignSelf: 'center', marginLeft: tab === 'active' ? 0 : 'auto' }}
+        />
       </View>
 
       {tab === 'active' ? (
@@ -775,6 +782,12 @@ function RestockerMaterialDemandList() {
         {tab === 'pending' && (
           <Text style={styles.liveStatusText}>{liveConnected ? 'Live' : 'Connecting…'}</Text>
         )}
+        <WebRefreshButton
+          onRefresh={tab === 'pending' ? handleRefresh : handleRespondedRefresh}
+          refreshing={tab === 'pending' ? refreshing : respondedRefreshing}
+          size={36}
+          style={{ alignSelf: 'center', marginLeft: tab === 'pending' ? 0 : 'auto' }}
+        />
       </View>
 
       {tab === 'pending' ? (

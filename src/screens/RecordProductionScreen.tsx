@@ -36,13 +36,13 @@ import {
   PanResponder,
   Dimensions,
   Platform,
+  AppState,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import {
   collection,
   getDocs,
-  addDoc,
   serverTimestamp,
   doc,
   getDoc,
@@ -86,6 +86,16 @@ import {
   validateProductionStartTime,
   formatAbsMinutes24,
 } from '../utils/productionSchedule';
+import {
+  RecordStopEvent,
+  completeRunningStops,
+  formatElapsedSince,
+  freezeRunningStops,
+  isAnyStopRunning,
+  stopDurationMinutes,
+  stopEventsForWindow,
+  stopIdOf,
+} from '../utils/downtime';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -119,14 +129,20 @@ type ChangeoverInfo = {
   expectedAfter: number;
 };
 
+// startAbs/endAbs are epoch ms (not schedule minutes, despite the name) —
+// startAbs is persisted the moment the line is stopped and is the source of
+// truth for the running timer and the final duration (see utils/downtime).
 type StopEvent = {
+  // Stable interval id, `stop-<startAbs>`. Missing on older stops — use
+  // stopIdOf(), which derives the same value.
+  id?: string;
   reason: string;
   startAbs: number;
   endAbs?: number;
   durationMinutes?: number;
   running?: boolean;
   // Firestore doc id of the lineBreakdowns record this stop created (maintenance
-  // stops only). Each stop gets its OWN document (via addDoc) instead of a
+  // stops only). Each stop gets its OWN auto-id document instead of a
   // single doc keyed by lineId, so a line breaking down more than once keeps
   // every occurrence instead of the newest overwriting the previous one.
   breakdownDocId?: string;
@@ -762,6 +778,9 @@ export default function RecordProductionScreen() {
       setProducedBySlot({});
       setRejectionsBySlot({});
       setStopsBySlot({});
+      stopsBySlotRef.current = {};
+      setStopSync('idle');
+      pendingResumeRef.current = null;
       setChangeovers({});
       setProducedSegment({});
       setSavedSlotIndices(new Set());
@@ -817,9 +836,23 @@ export default function RecordProductionScreen() {
   // it can actually save).
   const pendingAfterLossRef = useRef<(() => void) | null>(null);
 
-  // ── Live timer
+  // ── Live timer — display refresh only. Elapsed downtime is always
+  // nowMs - the stop's persisted startAbs, never a count of ticks.
   const [nowMs, setNowMs] = useState(Date.now());
   const intervalRef = useRef<number | null>(null);
+
+  // ── Stop / Resume persistence. A stop or resume is only confirmed once
+  // its activeSessions write resolves: 'saving' while in flight, 'error' if
+  // it failed (the local stop is kept so no downtime is lost, and the card
+  // offers a retry).
+  const [stopSync, setStopSync] = useState<'idle' | 'saving' | 'error'>('idle');
+  // Synchronous guard against a second Stop/Resume tap before the first
+  // write settles — state only updates after the next render.
+  const stopActionBusyRef = useRef(false);
+  // A Resume that hasn't been saved yet: which stop it closes and when it
+  // was first tapped. A retry reuses that time, so the saved duration is the
+  // real one no matter how long the retry takes.
+  const pendingResumeRef = useRef<{ slotIndex: number; stopId: string; endMs: number } | null>(null);
 
   // ── Saving
   const [saving, setSaving] = useState(false);
@@ -1095,16 +1128,26 @@ export default function RecordProductionScreen() {
     setActiveDropdown(null);
   }
 
-  // ── Live timer management
+  // ── Live timer management. The interval only re-renders the display; on
+  // start (incl. a restored stopped session) and whenever the app returns to
+  // the foreground the clock is re-read at once, so the timer shows the full
+  // time since the persisted stop, including time the app was closed.
   useEffect(() => {
     if (anyStopRunning) {
+      setNowMs(Date.now());
       if (!intervalRef.current) {
         intervalRef.current = setInterval(() => setNowMs(Date.now()), 1000) as unknown as number;
       }
     } else {
       if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
     }
-    return () => { if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; } };
+    const appStateSub = anyStopRunning
+      ? AppState.addEventListener('change', (st) => { if (st === 'active') setNowMs(Date.now()); })
+      : null;
+    return () => {
+      appStateSub?.remove();
+      if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
+    };
   }, [anyStopRunning]);
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -1210,6 +1253,25 @@ export default function RecordProductionScreen() {
     return () => { mounted = false; };
   }, [selectedLineId, allLines]);
 
+  // "Continue active session" card. Always restores from the CURRENT
+  // activeSessions doc — the list is loaded once when the screen opens, so
+  // its copy can be missing a stop/resume (or anything else) saved since,
+  // and restoring it would overwrite that on the next save.
+  const continueSession = async (docId: string) => {
+    try {
+      const snap = await getDoc(doc(db, 'activeSessions', docId));
+      if (!snap.exists()) {
+        Alert.alert('Session ended', 'This session has already been finalized.');
+        loadActiveSessions();
+        return;
+      }
+      restoreSession(snap.data() as ActiveSessionDoc, allLines, snap.id);
+    } catch (e) {
+      console.error('[continueSession]', e);
+      Alert.alert('Could not open session', 'The latest session data could not be loaded. Check your connection and try again.');
+    }
+  };
+
   function restoreSession(sd: ActiveSessionDoc, lineList: Line[], docId: string) {
     setPlant(sd.plant);
     setWorkshop(sd.workshop);
@@ -1233,8 +1295,13 @@ export default function RecordProductionScreen() {
     setRejectionsBySlot({ ...(sd.rejectionsBySlot ?? {}) });
 
     const stopsNum: Record<number, StopEvent[]> = {};
-    Object.entries(sd.stopsBySlot ?? {}).forEach(([k, v]) => { stopsNum[Number(k)] = v; });
+    Object.entries(sd.stopsBySlot ?? {}).forEach(([k, v]) => { stopsNum[Number(k)] = Array.isArray(v) ? v : []; });
+    // A running stop comes back with its original persisted startAbs, so
+    // the timer continues from the real stop time, not from app launch.
+    stopsBySlotRef.current = stopsNum;
     setStopsBySlot(stopsNum);
+    setStopSync('idle');
+    pendingResumeRef.current = null;
 
     const coNum: Record<number, ChangeoverInfo | null> = {};
     Object.entries(sd.changeovers ?? {}).forEach(([k, v]) => { coNum[Number(k)] = v; });
@@ -1275,17 +1342,21 @@ export default function RecordProductionScreen() {
   // ─────────────────────────────────────────────────────────────────────────────
   // PERSIST SESSION to Firestore whenever production data changes
   // (unchanged except it will now be used to "save session" without deleting)
+  // Resolves true once Firestore has accepted the write, false if it failed.
   // ─────────────────────────────────────────────────────────────────────────────
 
     const persistSession = async (
     overrideStops?: Record<number, StopEvent[]>,
     lineStopped?: boolean
-  ) => {
+  ): Promise<boolean> => {
     // require a selected line id
-    if (!selectedLineId) return;
+    if (!selectedLineId) return false;
 
-    const stopped = lineStopped ?? anyStopRunning;
-    const stopsToSave = overrideStops ?? stopsBySlot;
+    // Stops come from the ref, not this render's state: many callers run
+    // persistSession from a setTimeout closure, and an older render's
+    // stopsBySlot would otherwise overwrite a stop/resume saved since.
+    const stopsToSave = overrideStops ?? stopsBySlotRef.current;
+    const stopped = lineStopped ?? isAnyStopRunning(stopsToSave);
 
     setPersistingSession(true);
 
@@ -1372,8 +1443,10 @@ export default function RecordProductionScreen() {
         // update existing
         await updateDoc(docRef, sessionData as any);
       }
+      return true;
     } catch (e) {
       console.error('[persistSession] error', e);
+      return false;
     } finally {
       setPersistingSession(false);
     }
@@ -1601,9 +1674,24 @@ export default function RecordProductionScreen() {
   // prodDate is the session's original production date, resolved once by
   // Finalize (see resolveActiveSessionProductionDate) so the summary always
   // matches the productionRecords written alongside it.
-  async function saveShiftSummary(lineId: string, prodDate: string) {
+  async function saveShiftSummary(lineId: string, prodDate: string, frozenStops: Record<number, StopEvent[]>) {
     if (!selectedLine) return;
     const { planned, actual } = computeShiftTotals();
+    // Every stop interval of the session, whole and unsplit (the
+    // activeSessions doc holding them is deleted at Finalize). Audit /
+    // summary only — reports total downtime from productionRecords'
+    // stopEvents, so nothing here is added to those figures.
+    const downtimeIntervals = Object.entries(frozenStops)
+      .flatMap(([k, arr]) => (arr ?? []).map((se) => ({
+        stopId: stopIdOf(se),
+        slotIndex: Number(k),
+        reason: se.reason,
+        startAbs: se.startAbs,
+        endAbs: se.endAbs ?? null,
+        durationMinutes: se.durationMinutes ?? (se.endAbs != null ? stopDurationMinutes(se.startAbs, se.endAbs) : null),
+      })))
+      .sort((a, b) => a.startAbs - b.startAbs);
+    const totalDowntimeMinutes = Math.round(downtimeIntervals.reduce((sum, d) => sum + (d.durationMinutes ?? 0), 0) * 100) / 100;
     const summaryId = `${lineId}_${prodDate}_${selectedShift}`;
     // Part-level planned totals for this same production date + shift,
     // grouped by part name (see partTargetSummary above) — computed once
@@ -1628,6 +1716,8 @@ export default function RecordProductionScreen() {
           plannedProductionTotal: planned,
           actualProductionTotal: actual,
           partPlannedTotals,
+          downtimeIntervals,
+          totalDowntimeMinutes,
           supervisor: { name: supervisorName, code: supervisorCode, uid: user?.uid ?? null },
           finalizedAt: serverTimestamp(),
         },
@@ -1651,37 +1741,9 @@ export default function RecordProductionScreen() {
   // prodDate: the session's original production date (see
   // resolveActiveSessionProductionDate) — used for both the record IDs and
   // the productionDate field, never the time Finalize happens to run.
-  async function submitUnsavedSlots(lineId: string, prodDate: string) {
+  async function submitUnsavedSlots(lineId: string, prodDate: string, frozenStops: Record<number, StopEvent[]>, nowTs: number) {
     if (!selectedLine) return;
-    const nowTs = Date.now();
 
-    // Freeze any running stops as ending right now, without touching React
-    // state - avoids a race with saveSlot's "is anything running" guard,
-    // which reads render-scope state that wouldn't have updated yet if we
-    // called setStopsBySlot and then immediately saved.
-    const frozenStops: Record<number, StopEvent[]> = {};
-    Object.entries(stopsBySlot).forEach(([k, arr]) => {
-      frozenStops[Number(k)] = arr.map((ev) =>
-        ev.running
-          ? { ...ev, endAbs: nowTs, running: false, durationMinutes: Math.max(0, Math.round(((nowTs - ev.startAbs) / 60000) * 100) / 100) }
-          : ev
-      );
-    });
-
-    function frozenStoppedMinutes(slotIndex: number): number {
-      const arr = frozenStops[slotIndex] ?? [];
-      let ms = 0;
-      arr.forEach((ev) => {
-        if (ev.endAbs !== undefined) ms += Math.max(0, ev.endAbs - ev.startAbs);
-      });
-      return Math.max(0, Math.round((ms / 60000) * 100) / 100);
-    }
-    function frozenSegmentMinutes(slotIndex: number, segMin: number, otherMin: number): number {
-      const total = frozenStoppedMinutes(slotIndex);
-      const totalSeg = segMin + otherMin;
-      if (totalSeg <= 0) return 0;
-      return Math.max(0, Math.round(total * (segMin / totalSeg) * 100) / 100);
-    }
     // Expected/planned parts = cycle time × the slot's FULL designed time
     // (including whatever OT is set right now), never the stop-reduced time.
     // Planned production is a target — it shouldn't shrink just because the
@@ -1721,16 +1783,12 @@ export default function RecordProductionScreen() {
       // The slot's real part (accounts for every changeover, including ones
       // in slots already saved and skipped above) — same map the cards use.
       const activePart = activePartIndexBySlot[s.index] ?? selectedPartIndex;
-      const stopEventsArr = (frozenStops[s.index] ?? []).map((se) => ({
-        reason: se.reason, startAbs: se.startAbs, endAbs: se.endAbs ?? null, durationMinutes: se.durationMinutes ?? null,
-      }));
-
       if (!co) {
         // Each card is independent — the operator enters exactly what was
         // produced in this slot, nothing more.
         const produced = producedBySlot[s.index];
         if (produced == null) continue; // nothing entered for this slot - skip
-        const stopped = frozenStoppedMinutes(s.index);
+        const { events: slotStopEvents, minutes: stopped } = segmentDowntime(frozenStops, prodDate, s, 'full', null, nowTs);
         const productive = Math.max(0, s.productiveMinutes - stopped);
         const expPartsAuto = frozenExpected(activePart, s.productiveMinutes);
         const lossPartsAuto = Math.max(0, expPartsAuto - produced);
@@ -1750,14 +1808,14 @@ export default function RecordProductionScreen() {
           lossReasonLabel: lossReasonAuto?.label ?? null,
           lossReasonNote: lossReasonAuto?.note ?? null,
           rejections: rejectionsBySlot[s.index] ?? 0,
-          stopEvents: stopEventsArr,
+          stopEvents: slotStopEvents,
         }, resolvedRecordIdsRef.current);
         await removeSupersededProductionRecords(slotKey(s.index), 'full', resolvedRecordIdsRef.current);
       } else {
         // Changeover — two fully independent records, each with its own
         // produced value as entered (no baseline, no subtraction).
-        const stopBefore = frozenSegmentMinutes(s.index, co.beforeMinutes, co.afterMinutes);
-        const stopAfter = frozenSegmentMinutes(s.index, co.afterMinutes, co.beforeMinutes);
+        const { events: stopEventsBefore, minutes: stopBefore } = segmentDowntime(frozenStops, prodDate, s, 'before', co, nowTs);
+        const { events: stopEventsAfter, minutes: stopAfter } = segmentDowntime(frozenStops, prodDate, s, 'after', co, nowTs);
         const prodBefore = Math.max(0, co.beforeMinutes - stopBefore);
         const prodAfter = Math.max(0, co.afterMinutes - stopAfter);
 
@@ -1781,7 +1839,7 @@ export default function RecordProductionScreen() {
             lossReasonCode: lossReasonBeforeAuto?.code ?? null,
             lossReasonLabel: lossReasonBeforeAuto?.label ?? null,
             lossReasonNote: lossReasonBeforeAuto?.note ?? null,
-            rejections: rejectionsBySlot[`${s.index}:before`] ?? 0, stopEvents: stopEventsArr,
+            rejections: rejectionsBySlot[`${s.index}:before`] ?? 0, stopEvents: stopEventsBefore,
             changeoverInfo: co, partSegment: 'before',
           }, resolvedRecordIdsRef.current);
         }
@@ -1805,7 +1863,7 @@ export default function RecordProductionScreen() {
             lossReasonCode: lossReasonAfterAuto?.code ?? null,
             lossReasonLabel: lossReasonAfterAuto?.label ?? null,
             lossReasonNote: lossReasonAfterAuto?.note ?? null,
-            rejections: rejectionsBySlot[`${s.index}:after`] ?? 0, stopEvents: stopEventsArr,
+            rejections: rejectionsBySlot[`${s.index}:after`] ?? 0, stopEvents: stopEventsAfter,
             changeoverInfo: co, partSegment: 'after',
           }, resolvedRecordIdsRef.current);
         }
@@ -1854,12 +1912,17 @@ export default function RecordProductionScreen() {
           const prodDate = await resolveActiveSessionProductionDate(docId);
           console.log('[handleFinalizeSession] resolved session productionDate', prodDate);
 
+          // Any stop still running ends now — one timestamp for both the
+          // slot records and the shift summary.
+          const finalizedAt = Date.now();
+          const frozenStops = freezeRunningStops(stopsBySlotRef.current, finalizedAt);
+
           console.log('[handleFinalizeSession] calling submitUnsavedSlots(docId)…');
-          await submitUnsavedSlots(docId, prodDate);
+          await submitUnsavedSlots(docId, prodDate, frozenStops, finalizedAt);
           console.log('[handleFinalizeSession] submitUnsavedSlots resolved');
 
           console.log('[handleFinalizeSession] calling saveShiftSummary(docId)…');
-          await saveShiftSummary(docId, prodDate);
+          await saveShiftSummary(docId, prodDate, frozenStops);
           console.log('[handleFinalizeSession] saveShiftSummary resolved');
 
           console.log('[handleFinalizeSession] calling deleteDoc(activeSessions/', docId, ')…');
@@ -2073,81 +2136,153 @@ export default function RecordProductionScreen() {
     setStopModalVisible(true);
   };
 
-  const startStopForSlot = (slotIndex: number, reason: string) => {
+  // Shows a blocking message on both native and web (Alert.alert has no
+  // real modal behind it on react-native-web — see handleFinalizeSession).
+  const notify = (title: string, message: string) => {
+    if (Platform.OS === 'web') window.alert(`${title}\n\n${message}`);
+    else Alert.alert(title, message);
+  };
+
+  // Stop Line. The stop's start time is captured at the tap and written to
+  // activeSessions/{lineId} straight away (awaited) — that persisted
+  // startAbs is what the timer and the final duration are computed from, so
+  // the line stays stopped, with the timer running from the real stop time,
+  // across app close, restart and logout.
+  const startStopForSlot = async (slotIndex: number, reason: string) => {
+    // One active stop interval at a time: ignore a double tap on "Start
+    // Stop", or a stop while another is still running or saving.
+    if (stopActionBusyRef.current || isAnyStopRunning(stopsBySlotRef.current)) {
+      setStopModalVisible(false);
+      return;
+    }
+    stopActionBusyRef.current = true;
     const ts = Date.now();
-    const newStop: StopEvent = { reason, startAbs: ts, running: true };
-    const nextStops = { ...stopsBySlot, [slotIndex]: [...(stopsBySlot[slotIndex] ?? []), newStop] };
+    const breakdownLineId = selectedLine?.id ?? sessionLineId ?? selectedLineId;
+    // Maintenance stops get their own lineBreakdowns doc. Its id is
+    // generated up front (the same auto-id addDoc would use) so it is saved
+    // on the stop event together with the stop itself, and Resume can close
+    // it even after an app restart.
+    const breakdownRef = reason === 'maintenance' && breakdownLineId ? doc(collection(db, 'lineBreakdowns')) : null;
+    const newStop: StopEvent = {
+      id: stopIdOf({ startAbs: ts }),
+      reason,
+      startAbs: ts,
+      running: true,
+      ...(breakdownRef ? { breakdownDocId: breakdownRef.id } : {}),
+    };
+    const current = stopsBySlotRef.current;
+    const nextStops = { ...current, [slotIndex]: [...(current[slotIndex] ?? []), newStop] };
+    stopsBySlotRef.current = nextStops;
     setStopsBySlot(nextStops);
     setStopModalVisible(false);
+    setStopSync('saving');
 
-    // Persist stopped flag immediately (will include running stop)
-    setTimeout(() => persistSession(nextStops, true), 100);
-
-    if (reason === 'maintenance') {
-      const breakdownLineId = selectedLine?.id ?? sessionLineId ?? selectedLineId;
-      if (breakdownLineId) {
-        const slot = slots.find((s) => s.index === slotIndex);
-        // addDoc (not setDoc keyed by lineId) — every breakdown gets its own
-        // document, so if this line breaks down again later the earlier
-        // occurrence stays in Firestore instead of being overwritten. The
-        // Technician dashboard's Active tab then shows every currently-open
-        // breakdown, and the Fixed tab keeps the full history for the line.
-        addDoc(collection(db, 'lineBreakdowns'), {
-          lineId: breakdownLineId,
-          lineName: selectedLine?.lineName ?? null,
-          plant: selectedLine?.plant ?? plant ?? null,
-          workshop: selectedLine?.workshop ?? workshop ?? null,
-          division: selectedLine?.division ?? division ?? null,
-          slotLabel: slot?.label ?? null,
-          active: true,
-          reportedBy: { uid: user?.uid ?? null, name: supervisorName || user?.name || null },
-          startedAt: serverTimestamp(),
-          resolvedAt: null,
-          fixedBy: null,
-        }).then((docRef) => {
-          // Patch the new doc's id onto the matching stop event (matched by
-          // startAbs, since a slot could in principle log more than one stop
-          // over time) so endStopForSlot later closes exactly this record.
-          setStopsBySlot((prev) => {
-            const arr = prev[slotIndex] ?? [];
-            const patched = arr.map((e) => (e.startAbs === ts && e.running ? { ...e, breakdownDocId: docRef.id } : e));
-            return { ...prev, [slotIndex]: patched };
-          });
-        }).catch((e) => {
-          console.error('[breakdown] failed to mark line as broken down:', e.code, e.message);
-          Alert.alert(
-            'Warning',
-            'The stop was recorded, but the Technician dashboard could not be notified (breakdown flag failed to save). Check your connection.'
-          );
-        });
+    try {
+      const ok = await persistSession(nextStops, true);
+      if (ok) {
+        setStopSync('idle');
+      } else {
+        // Keep the stop on screen (it really happened, and its start time
+        // must not be lost) but flag it as NOT saved; the card offers Retry,
+        // and any later successful save of the session — including Resume —
+        // writes it.
+        setStopSync('error');
+        notify(
+          'Line stop not saved',
+          'The stop is shown on this device but was NOT saved to the server, so it will be lost if the app is closed. Check your connection and tap "Retry save".'
+        );
       }
+    } finally {
+      stopActionBusyRef.current = false;
+    }
+
+    if (breakdownRef && breakdownLineId) {
+      const slot = slots.find((s) => s.index === slotIndex);
+      // A doc per breakdown (not one keyed by lineId), so if this line breaks
+      // down again later the earlier occurrence stays in Firestore instead of
+      // being overwritten. The Technician dashboard's Active tab then shows
+      // every currently-open breakdown, and the Fixed tab keeps the full
+      // history for the line.
+      setDoc(breakdownRef, {
+        lineId: breakdownLineId,
+        lineName: selectedLine?.lineName ?? null,
+        plant: selectedLine?.plant ?? plant ?? null,
+        workshop: selectedLine?.workshop ?? workshop ?? null,
+        division: selectedLine?.division ?? division ?? null,
+        slotLabel: slot?.label ?? null,
+        active: true,
+        reportedBy: { uid: user?.uid ?? null, name: supervisorName || user?.name || null },
+        startedAt: serverTimestamp(),
+        resolvedAt: null,
+        fixedBy: null,
+      }).catch((e) => {
+        console.error('[breakdown] failed to mark line as broken down:', e.code, e.message);
+        Alert.alert(
+          'Warning',
+          'The stop was recorded, but the Technician dashboard could not be notified (breakdown flag failed to save). Check your connection.'
+        );
+      });
     }
   };
 
-    const endStopForSlot = (slotIndex: number) => {
-    const ts = Date.now();
+  // Re-sends the current stops after a failed Stop save.
+  const retryStopSync = async () => {
+    if (stopActionBusyRef.current) return;
+    stopActionBusyRef.current = true;
+    setStopSync('saving');
+    try {
+      const ok = await persistSession(stopsBySlotRef.current, isAnyStopRunning(stopsBySlotRef.current));
+      setStopSync(ok ? 'idle' : 'error');
+      if (!ok) notify('Still not saved', 'The line stop could not be saved. Check your connection and try again.');
+    } finally {
+      stopActionBusyRef.current = false;
+    }
+  };
 
-    // Read the running stop's reason NOW from current state — synchronously,
-    // before any setState call. setState callbacks run asynchronously so any
-    // variable mutated inside them is still the old value when code below runs.
-    const currentSlotStops = stopsBySlot[slotIndex] ?? [];
+  // Resume Line. Duration = resume time − the persisted stop time, so time
+  // the app was closed counts in full. The completed interval is written
+  // first and the stop is only cleared on screen once that write succeeds;
+  // if it fails the line stays STOPPED here and in Firestore (nothing is
+  // lost) and the next Resume tap retries with the ORIGINAL resume time.
+  // Closing an already-closed stop is a no-op (completeRunningStops), so
+  // repeated taps or retries can never save the interval twice.
+  const endStopForSlot = async (slotIndex: number) => {
+    if (stopActionBusyRef.current) return;
+
+    const current = stopsBySlotRef.current;
+    const currentSlotStops = current[slotIndex] ?? [];
     const runningStop = currentSlotStops.find((e) => e.running) ?? null;
     if (!runningStop) return; // nothing running, bail early
+    stopActionBusyRef.current = true;
+
+    const stopId = stopIdOf(runningStop);
+    const pending = pendingResumeRef.current;
+    const ts = pending && pending.slotIndex === slotIndex && pending.stopId === stopId ? pending.endMs : Date.now();
+    pendingResumeRef.current = { slotIndex, stopId, endMs: ts };
 
     const endedReason = runningStop.reason;
+    const nextStops: Record<number, StopEvent[]> = { ...current, [slotIndex]: completeRunningStops(currentSlotStops, ts) };
+    const remaining = isAnyStopRunning(nextStops);
 
-    // Build the updated stops map synchronously from current state.
-    const updatedArr = currentSlotStops.map((e) =>
-      e.running
-        ? { ...e, endAbs: ts, durationMinutes: Math.max(0, Math.round(((ts - e.startAbs) / 60000) * 100) / 100), running: false }
-        : e
-    );
-    const nextStops: Record<number, StopEvent[]> = { ...stopsBySlot, [slotIndex]: updatedArr };
-
-    // Apply to state and persist.
+    setStopSync('saving');
+    let ok = false;
+    try {
+      ok = await persistSession(nextStops, remaining);
+    } finally {
+      stopActionBusyRef.current = false;
+    }
+    if (!ok) {
+      setStopSync('error');
+      notify(
+        'Resume not saved',
+        `The line is still recorded as stopped. Check your connection and tap Resume again — the resume time ${new Date(ts).toLocaleTimeString()} will be kept (${stopDurationMinutes(runningStop.startAbs, ts).toFixed(1)} min of downtime).`
+      );
+      return;
+    }
+    pendingResumeRef.current = null;
+    stopsBySlotRef.current = nextStops;
     setStopsBySlot(nextStops);
-    const remaining = Object.values(nextStops).some((arr) => arr.some((s) => s.running));
-    setTimeout(() => persistSession(nextStops, remaining), 150);
+    setStopSync('idle');
 
     // Clear the breakdown doc so both dashboards update in real time.
     // Each stop closes its OWN lineBreakdowns doc (via the id stashed on the
@@ -2163,7 +2298,7 @@ export default function RecordProductionScreen() {
           console.error('[breakdown] failed to clear breakdown flag:', e.code, e.message);
           Alert.alert(
             'Warning',
-            'Line resumed locally, but the Technician dashboard could not be updated. Check your connection and tap Resume again if the breakdown still shows as active.'
+            'Line resumed, but the Technician dashboard could not be updated. Check your connection — the breakdown may still show as active there.'
           );
         });
       };
@@ -2171,22 +2306,13 @@ export default function RecordProductionScreen() {
       if (runningStop.breakdownDocId) {
         closeBreakdownDoc(runningStop.breakdownDocId);
       } else {
-        // The addDoc that creates the breakdown record (in startStopForSlot)
-        // may still be in flight on a slow connection. Give it a moment to
-        // land in state and retry once before warning the technician side
-        // might not have been notified.
-        setTimeout(() => {
-          const latest = (stopsBySlotRef.current[slotIndex] ?? []).find((e) => e.startAbs === runningStop.startAbs);
-          if (latest?.breakdownDocId) {
-            closeBreakdownDoc(latest.breakdownDocId);
-          } else {
-            console.error('[breakdown] no breakdownDocId available to close for slot', slotIndex);
-            Alert.alert(
-              'Warning',
-              'Line resumed locally, but the Technician dashboard could not be updated. Check your connection — the breakdown may still show as active there.'
-            );
-          }
-        }, 1500);
+        // Only stops recorded before the breakdown id was generated up front
+        // can be missing it (their addDoc result was never persisted).
+        console.error('[breakdown] no breakdownDocId available to close for slot', slotIndex);
+        Alert.alert(
+          'Warning',
+          'Line resumed, but the Technician dashboard could not be updated — the breakdown may still show as active there.'
+        );
       }
     }
   };
@@ -2197,21 +2323,40 @@ export default function RecordProductionScreen() {
   // CALCULATIONS
   // ─────────────────────────────────────────────────────────────────────────────
 
-  function totalStoppedMinutesForSlot(slotIndex: number) {
-    const arr = stopsBySlot[slotIndex] ?? [];
-    let ms = 0;
-    arr.forEach((ev) => {
-      const end = ev.endAbs ?? (ev.running ? nowMs : undefined);
-      if (end !== undefined) ms += Math.max(0, end - ev.startAbs);
-    });
-    return Math.max(0, Math.round((ms / 60000) * 100) / 100);
+  // Downtime of one record window — a whole slot ('full') or one side of a
+  // changeover ('before'/'after') — by time overlap with EVERY stop of the
+  // session, whichever card it was pressed on (see utils/downtime). A stop
+  // across an hour boundary is split between the slots it covers, and a
+  // changeover slot's BEFORE and AFTER records each get only their own
+  // part, so a stop is never counted on two records. `events` is what is
+  // stored as the record's stopEvents; `minutes` is their total.
+  function segmentWindowAbs(slot: Slot, segment: SlotSegment, co: ChangeoverInfo | null): TimeInterval {
+    if (segment === 'full' || !co) return { start: slot.startMinutesAbs, end: slot.endMinutesAbs };
+    const w = changeoverSegmentWindows(
+      { start: slot.startMinutesAbs, end: slot.endMinutesAbs },
+      { start: co.startAbs ?? co.atAbs, end: co.endAbs ?? co.atAbs }
+    );
+    return segment === 'before' ? w.before : w.after;
   }
 
-  function stoppedMinutesForSegment(slotIndex: number, segMin: number, otherMin: number) {
-    const total = totalStoppedMinutesForSlot(slotIndex);
-    const totalSeg = segMin + otherMin;
-    if (totalSeg <= 0) return 0;
-    return Math.max(0, Math.round(total * (segMin / totalSeg) * 100) / 100);
+  function segmentDowntime(
+    stops: Record<number, StopEvent[]>,
+    pd: string,
+    slot: Slot,
+    segment: SlotSegment,
+    co: ChangeoverInfo | null,
+    atMs: number
+  ): { events: RecordStopEvent[]; minutes: number } {
+    const w = segmentWindowAbs(slot, segment, co);
+    const events = stopEventsForWindow(stops, productionDayMinuteToMillis(pd, w.start), productionDayMinuteToMillis(pd, w.end), atMs);
+    const minutes = Math.round(events.reduce((sum, e) => sum + e.durationMinutes, 0) * 100) / 100;
+    return { events, minutes };
+  }
+
+  // Live per-card downtime for display (running stops count up to now).
+  function displayedStoppedMinutes(slot: Slot, segment: SlotSegment, co: ChangeoverInfo | null) {
+    const pd = productionDate ?? productionDayKeyFor(sessionStartedAtMsRef.current ?? nowMs);
+    return segmentDowntime(stopsBySlot, pd, slot, segment, co, nowMs).minutes;
   }
 
   // Expected/planned parts = cycle time × the slot's FULL designed time
@@ -2244,8 +2389,7 @@ export default function RecordProductionScreen() {
   }
 
   function formatElapsed(startMs: number) {
-    const s = Math.max(0, Math.floor((nowMs - startMs) / 1000));
-    return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+    return formatElapsedSince(startMs, nowMs);
   }
 
   // The part actually in effect right now — the active part carries forward
@@ -2509,7 +2653,7 @@ export default function RecordProductionScreen() {
         // recorded under the wrong part. Use the slot's real active part,
         // which already accounts for every earlier changeover.
         const activePart = activePartIndexBySlot[slot.index] ?? selectedPartIndex;
-        const stopped = totalStoppedMinutesForSlot(slot.index);
+        const { events: slotStopEvents, minutes: stopped } = segmentDowntime(stopsBySlot, prodDate, slot, 'full', null, Date.now());
         const productive = Math.max(0, slot.productiveMinutes - stopped);
         const expParts = expectedParts(activePart, slot.productiveMinutes);
         const slotLossParts = Math.max(0, expParts - produced);
@@ -2532,7 +2676,7 @@ export default function RecordProductionScreen() {
           lossReasonLabel: lossReason?.label ?? null,
           lossReasonNote: lossReason?.note ?? null,
           rejections: rejectionsBySlot[slot.index] ?? 0,
-          stopEvents: (stopsBySlot[slot.index] ?? []).map((se) => ({ reason: se.reason, startAbs: se.startAbs, endAbs: se.endAbs ?? null, durationMinutes: se.durationMinutes ?? null })),
+          stopEvents: slotStopEvents,
         }, resolvedRecordIdsRef.current);
         await removeSupersededProductionRecords(slotKey, 'full', resolvedRecordIdsRef.current);
         Alert.alert('Saved', `Slot ${slot.label} saved.`);
@@ -2544,11 +2688,11 @@ export default function RecordProductionScreen() {
         const pa = producedSegment[`${slot.index}:after`];
         if (pb == null) { Alert.alert('Missing', 'Enter BEFORE segment produced.'); return; }
         if (pa == null) { Alert.alert('Missing', 'Enter AFTER segment produced.'); return; }
-        const stopBefore = stoppedMinutesForSegment(slot.index, co.beforeMinutes, co.afterMinutes);
-        const stopAfter = stoppedMinutesForSegment(slot.index, co.afterMinutes, co.beforeMinutes);
+        const savedAt = Date.now();
+        const { events: stopEventsBefore, minutes: stopBefore } = segmentDowntime(stopsBySlot, prodDate, slot, 'before', co, savedAt);
+        const { events: stopEventsAfter, minutes: stopAfter } = segmentDowntime(stopsBySlot, prodDate, slot, 'after', co, savedAt);
         const prodBefore = Math.max(0, co.beforeMinutes - stopBefore);
         const prodAfter = Math.max(0, co.afterMinutes - stopAfter);
-        const stopEventsArr = (stopsBySlot[slot.index] ?? []).map((se) => ({ reason: se.reason, startAbs: se.startAbs, endAbs: se.endAbs ?? null, durationMinutes: se.durationMinutes ?? null }));
         const expBefore = expectedParts(co.oldPartIndex, co.beforeMinutes);
         const expAfter = expectedParts(co.newPartIndex, co.afterMinutes);
         const lossReasonBefore = lossReasonBySlot[`${slot.index}:before`] ?? null;
@@ -2570,7 +2714,7 @@ export default function RecordProductionScreen() {
           lossReasonCode: lossReasonBefore?.code ?? null,
           lossReasonLabel: lossReasonBefore?.label ?? null,
           lossReasonNote: lossReasonBefore?.note ?? null,
-          rejections: rejectionsBySlot[`${slot.index}:before`] ?? 0, stopEvents: stopEventsArr,
+          rejections: rejectionsBySlot[`${slot.index}:before`] ?? 0, stopEvents: stopEventsBefore,
           changeoverInfo: co, partSegment: 'before',
         }, resolvedRecordIdsRef.current);
         await upsertProductionRecord(slotId('after'), {
@@ -2588,7 +2732,7 @@ export default function RecordProductionScreen() {
           lossReasonCode: lossReasonAfter?.code ?? null,
           lossReasonLabel: lossReasonAfter?.label ?? null,
           lossReasonNote: lossReasonAfter?.note ?? null,
-          rejections: rejectionsBySlot[`${slot.index}:after`] ?? 0, stopEvents: stopEventsArr,
+          rejections: rejectionsBySlot[`${slot.index}:after`] ?? 0, stopEvents: stopEventsAfter,
           changeoverInfo: co, partSegment: 'after',
         }, resolvedRecordIdsRef.current);
         await removeSupersededProductionRecords(slotKey, 'split', resolvedRecordIdsRef.current);
@@ -2793,7 +2937,7 @@ export default function RecordProductionScreen() {
                 return (
                   <Pressable
                     key={docId}
-                    onPress={() => restoreSession(sd, allLines, docId)}
+                    onPress={() => continueSession(docId)}
                     style={styles.continueCard}
                   >
                     <View style={{ flex: 1 }}>
@@ -3078,15 +3222,31 @@ export default function RecordProductionScreen() {
                           <Text style={{ color: '#D64545', fontSize: 12, fontWeight: '700' }}>
                             {(() => { const arr = stopsBySlot[stopSlotIndex] ?? []; const r = arr.find((x) => x.running); return r ? formatElapsed(r.startAbs) : '00:00'; })()}
                           </Text>
-                          <Pressable onPress={() => endStopForSlot(stopSlotIndex)} style={styles.resumeBtn}>
-                            <Text style={{ color: '#14181C', fontWeight: '800', fontSize: 12 }}>Resume</Text>
+                          {stopSync !== 'idle' && (
+                            <Text style={{ color: stopSync === 'error' ? '#D64545' : '#8A96A3', fontSize: 10, fontWeight: '700', textAlign: 'center' }}>
+                              {stopSync === 'saving' ? 'Saving…' : 'NOT SAVED'}
+                            </Text>
+                          )}
+                          {stopSync === 'error' && !pendingResumeRef.current && (
+                            <Pressable onPress={retryStopSync} style={[styles.stopBtn, { paddingVertical: 4 }]}>
+                              <Text style={{ color: '#F2A93B', fontWeight: '700', fontSize: 11 }}>Retry save</Text>
+                            </Pressable>
+                          )}
+                          <Pressable
+                            onPress={() => endStopForSlot(stopSlotIndex)}
+                            disabled={stopSync === 'saving'}
+                            style={[styles.resumeBtn, stopSync === 'saving' && styles.disabledBtn]}
+                          >
+                            {stopSync === 'saving'
+                              ? <ActivityIndicator size="small" color="#14181C" />
+                              : <Text style={{ color: '#14181C', fontWeight: '800', fontSize: 12 }}>Resume</Text>}
                           </Pressable>
                         </View>
                       ) : (
                         <Pressable
                           onPress={() => openStopModalForSlot(stopSlotIndex)}
-                          disabled={disabled}
-                          style={[styles.stopBtn, disabled && styles.disabledBtn]}
+                          disabled={disabled || stopSync === 'saving'}
+                          style={[styles.stopBtn, (disabled || stopSync === 'saving') && styles.disabledBtn]}
                         >
                           <Text style={{ color: '#F2A93B', fontWeight: '700', fontSize: 12 }}>Stop</Text>
                         </Pressable>
@@ -3159,7 +3319,7 @@ export default function RecordProductionScreen() {
 
             if (!co) {
               const activePart = activePartIndexBySlot[s.index] ?? selectedPartIndex;
-              const stopped = totalStoppedMinutesForSlot(s.index);
+              const stopped = displayedStoppedMinutes(s, 'full', null);
               const productive = Math.max(0, s.productiveMinutes - stopped);
               // Each card is independent — the operator enters exactly what
               // was produced in this slot, so the display value IS the
@@ -3195,10 +3355,10 @@ export default function RecordProductionScreen() {
               // segment, no counter, no baseline. Deleting either half
               // deletes the whole underlying hourly slot (both segments and
               // its changeover), since they're one hourly card split in two.
-              const stopBefore = stoppedMinutesForSegment(s.index, co.beforeMinutes, co.afterMinutes);
+              const stopBefore = displayedStoppedMinutes(s, 'before', co);
               const prodBefore = Math.max(0, co.beforeMinutes - stopBefore);
               const expBefore = expectedParts(co.oldPartIndex, co.beforeMinutes);
-              const stopAfter = stoppedMinutesForSegment(s.index, co.afterMinutes, co.beforeMinutes);
+              const stopAfter = displayedStoppedMinutes(s, 'after', co);
               const prodAfter = Math.max(0, co.afterMinutes - stopAfter);
               const expAfter = expectedParts(co.newPartIndex, co.afterMinutes);
 

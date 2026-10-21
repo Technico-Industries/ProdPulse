@@ -5,6 +5,7 @@ import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import ScreenContainer from './src/components/ScreenContainer';
+import AuthSplash from './src/components/AuthSplash';
 import { useAuthStore } from './src/stores/authStore';
 
 import LoginScreen from './src/screens/LoginScreen';
@@ -185,13 +186,25 @@ const linking: LinkingOptions<RootStackParamList> = {
   },
 };
 
+// While Firebase is still restoring the session (`initializing`), `user` is
+// null for a returning user too — rendering RootNavigator then mounted the
+// login screen until the session came back, which is the login flash. So
+// nothing navigational mounts until the first auth result is in: the
+// splash shows instead, then RootNavigator picks App or Auth exactly once.
+// NavigationContainer is held back as well, so on web it reads the URL
+// (e.g. a reload on /record-production) only once it knows who is signed in.
 export default function App() {
+  const initializing = useAuthStore((s) => s.initializing);
   return (
     <SafeAreaProvider>
-      <NavigationContainer linking={linking}>
-        <StatusBar style="light" backgroundColor="#14181C" />
-        <RootNavigator />
-      </NavigationContainer>
+      <StatusBar style="light" backgroundColor="#14181C" />
+      {initializing ? (
+        <AuthSplash />
+      ) : (
+        <NavigationContainer linking={linking}>
+          <RootNavigator />
+        </NavigationContainer>
+      )}
     </SafeAreaProvider>
   );
 }

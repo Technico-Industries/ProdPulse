@@ -20,7 +20,14 @@
 //   totalProduction  = Σ producedThisSlot          (GenerateReportScreen summary)
 //   plannedTotal     = Σ expectedParts             (GenerateReportScreen summary)
 //   lossParts        = Σ lossParts ?? max(0, expected - produced)
-//   downtimeMinutes  = Σ stopEvents[].durationMinutes
+//   downtimeMinutes  = Σ stopEvents[].durationMinutes of saved records, plus
+//                      for every session still running on this production
+//                      day, Σ its stopsBySlot intervals (live while stopped)
+//                      in place of that session's records — a stop reaches
+//                      a record only when its slot is saved, so records
+//                      alone showed 0 for an active line (utils/downtime
+//                      combinedDowntimeMinutes, same as the Supervisor
+//                      overview).
 //   efficiency       = produced / expected * 100   (GenerateReportScreen summary)
 //   achievementPct   = actual / plan * 100         (KPIAnalysisScreen totals — same figure)
 //   goodParts        = Σ producedThisSlot  (KPIAnalysisScreen: produced is the GOOD output)
@@ -48,13 +55,20 @@ import {
   useWindowDimensions,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import WebRefreshButton from '../components/WebRefreshButton';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { collection, getDocs, query, where, orderBy, Timestamp } from 'firebase/firestore';
+import { collection, getDocs, onSnapshot, query, where, orderBy, Timestamp } from 'firebase/firestore';
 import { db } from '../services/firebase';
 import { PLANTS, WORKSHOPS, DIVISIONS } from '../constants/lineOptions';
 import AppDrawer from '../components/AppDrawer';
 import { ADMIN_MENU_ITEMS } from '../constants/adminMenu';
 import { counterQuality } from '../utils/qualityMetrics';
+import {
+  DowntimeSessionLike,
+  combinedDowntimeMinutes,
+  formatDowntimeMinutes,
+  isAnyStopRunning,
+} from '../utils/downtime';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 // Same field set the other production screens map off each Firestore doc.
@@ -146,13 +160,9 @@ function formatInt(n: number) {
   return Math.round(n).toLocaleString();
 }
 
-function formatMinutes(mins: number): string {
-  const total = Math.max(0, Math.round(mins));
-  if (total < 60) return `${total} min`;
-  const h = Math.floor(total / 60);
-  const m = total % 60;
-  return m === 0 ? `${h}h` : `${h}h ${m}m`;
-}
+// Downtime display — see formatDowntimeMinutes for the rounding policy
+// ("4.2 min" under an hour, "1h 5m" after).
+const formatMinutes = formatDowntimeMinutes;
 
 // Case/whitespace-insensitive equality — same helper GenerateReportScreen
 // and KPIAnalysisScreen compare filter values with, so "matches" means the
@@ -602,12 +612,68 @@ export default function AdminOverviewScreen() {
     [resolvedRecords, plant, workshop, division]
   );
 
+  // ── Active sessions, live — only for downtime: their stopsBySlot holds
+  // stops on slots that haven't been saved to productionRecords yet.
+  const [activeSessions, setActiveSessions] = useState<(DowntimeSessionLike & {
+    plant: string | null; workshop: string | null; division: string | null;
+  })[]>([]);
+  useEffect(() => {
+    return onSnapshot(
+      collection(db, 'activeSessions'),
+      (snap) => {
+        setActiveSessions(
+          snap.docs.map((d) => {
+            const data: any = d.data();
+            return {
+              lineId: data.lineId ?? d.id,
+              productionDate: data.productionDate ?? null,
+              shift: data.shift === 'B' ? 'B' : 'A',
+              stopsBySlot: data.stopsBySlot && typeof data.stopsBySlot === 'object' ? data.stopsBySlot : {},
+              plant: data.plant ?? null,
+              workshop: data.workshop ?? null,
+              division: data.division ?? null,
+            };
+          })
+        );
+      },
+      (err) => console.warn('[AdminOverview] activeSessions listener error', err)
+    );
+  }, []);
+
+  // The selected day's running sessions, through the same plant/workshop/
+  // division filters as the records (resolved from productionLines first).
+  const filteredSessions = useMemo(() => {
+    const lineById = new Map(allLines.map((l) => [l.id, l]));
+    return activeSessions.filter((s) => {
+      if (s.productionDate !== selectedDate) return false;
+      const line = lineById.get(s.lineId);
+      if (plant && !sameValue(line?.plant ?? s.plant, plant)) return false;
+      if (workshop && !sameValue(line?.workshop ?? s.workshop, workshop)) return false;
+      if (division && !sameValue(line?.division ?? s.division, division)) return false;
+      return true;
+    });
+  }, [activeSessions, allLines, selectedDate, plant, workshop, division]);
+
+  // Clock for a stopped line's live downtime; ticks only while one is stopped.
+  const anyLineStopped = useMemo(() => filteredSessions.some((s) => isAnyStopRunning(s.stopsBySlot ?? {})), [filteredSessions]);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    setNowMs(Date.now());
+    if (!anyLineStopped) return;
+    const id = setInterval(() => setNowMs(Date.now()), 30000);
+    return () => clearInterval(id);
+  }, [anyLineStopped, filteredSessions]);
+
+  const downtimeMinutes = useMemo(
+    () => combinedDowntimeMinutes(filteredRecords, filteredSessions, nowMs),
+    [filteredRecords, filteredSessions, nowMs]
+  );
+
   // ── Aggregates — all computed locally from the single fetch above.
   const metrics = useMemo(() => {
     let totalProduction = 0;
     let plannedTotal = 0;
     let lossParts = 0;
-    let downtimeMinutes = 0;
     let operatorHours = 0;
     const lineIds = new Set<string>();
     const shifts = new Set<string>();
@@ -618,9 +684,6 @@ export default function AdminOverviewScreen() {
       totalProduction += produced;
       plannedTotal += expected;
       lossParts += r.lossParts ?? Math.max(0, expected - produced);
-      (r.stopEvents ?? []).forEach((se) => {
-        downtimeMinutes += se.durationMinutes ?? 0;
-      });
       operatorHours += (r.operatorCount || 0) * ((r.productiveMinutes ?? 0) / 60);
       if (r.lineId) lineIds.add(r.lineId);
       if (r.shift) shifts.add(r.shift);
@@ -632,7 +695,7 @@ export default function AdminOverviewScreen() {
       totalProduction,
       plannedTotal,
       lossParts: Math.round(lossParts),
-      downtimeMinutes: Math.round(downtimeMinutes),
+      downtimeMinutes,
       operatorHours: round1(operatorHours),
       efficiency,
       pcsPerManHour: operatorHours > 0 ? round1(totalProduction / operatorHours) : 0,
@@ -640,7 +703,7 @@ export default function AdminOverviewScreen() {
       shifts: Array.from(shifts).sort(),
       recordCount: filteredRecords.length,
     };
-  }, [filteredRecords]);
+  }, [filteredRecords, downtimeMinutes]);
 
   // ── Quality — the rejection counter on the same filtered records as
   // production. Every quality/rejection figure on screen reads from this one
@@ -686,6 +749,7 @@ export default function AdminOverviewScreen() {
           <Text style={styles.brand}>ProdPulse</Text>
           <Text style={styles.brandSub}>Production Overview</Text>
         </View>
+        <WebRefreshButton onRefresh={onRefresh} refreshing={refreshing} />
         <View style={styles.rolePill}>
           <Text style={styles.rolePillText}>ADMIN</Text>
         </View>

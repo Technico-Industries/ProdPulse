@@ -38,6 +38,7 @@ import {
   useWindowDimensions,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import WebRefreshButton from '../components/WebRefreshButton';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Svg, { Circle } from 'react-native-svg';
 import { collection, getDocs, onSnapshot, query, where } from 'firebase/firestore';
@@ -494,6 +495,7 @@ export default function LineEfficiencyOverviewScreen() {
           <Text style={styles.brand}>ProdPulse</Text>
           <Text style={styles.brandSub}>Line Efficiency Overview</Text>
         </View>
+        <WebRefreshButton onRefresh={onRefresh} refreshing={refreshing} />
         <View style={styles.rolePill}>
           <Text style={styles.rolePillText}>ADMIN</Text>
         </View>

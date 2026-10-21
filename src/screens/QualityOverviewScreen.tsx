@@ -48,6 +48,7 @@ import {
   useWindowDimensions,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import WebRefreshButton from '../components/WebRefreshButton';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useNavigation } from '@react-navigation/native';
 import { collection, getDocs, query, where } from 'firebase/firestore';
@@ -669,6 +670,7 @@ export default function QualityOverviewScreen() {
           <Text style={styles.brand}>ProdPulse</Text>
           <Text style={styles.brandSub}>Quality Report</Text>
         </View>
+        <WebRefreshButton onRefresh={onRefresh} refreshing={refreshing} />
         <View style={styles.rolePill}>
           <Text style={styles.rolePillText}>QUALITY</Text>
         </View>
