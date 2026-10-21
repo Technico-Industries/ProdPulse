@@ -20,6 +20,7 @@ import {
   productiveMinutesIn,
   scheduledNonProductive,
   validateChangeoverInterval,
+  validateProductionStartTime,
   LUNCH_CHANGEOVER_MESSAGE,
   TimeInterval,
 } from '../src/utils/productionSchedule';
@@ -398,6 +399,138 @@ test('Shift B: 02:15 lands in the after-midnight slot', () => {
   const slotsB = buildSlots('B', 0);
   const p = placeChangeoverTime(timeOfDayToShiftAbs(parseTimeInput('02:15')!, 'B'), slotsB, []);
   assert.ok(p.ok && p.slot.hourStartAbs === t(26));
+});
+
+console.log('Production start time');
+const startAt = (shift: 'A' | 'B', start: number, ot = 0) => buildSlots(shift, ot, [], start);
+const indexOfHour = (h: number) => byHour(h).index;
+test('start at 14:00: first slot stays 2–3 PM, nothing clipped', () => {
+  const s = startAt('A', t(14));
+  assert.equal(s[0].hourStartAbs, t(14));
+  assert.equal(s[0].startMinutesAbs, t(14));
+  assert.equal(s[0].startAdjusted, false);
+  assert.equal(s[0].label, byHour(14).label);
+  assert.equal(s[0].productiveMinutes, byHour(14).productiveMinutes);
+});
+test('start at 14:15: first slot 14:15–15:00, 45 minutes, target 135 at 20 s', () => {
+  const s = startAt('A', t(14, 15));
+  assert.equal(s[0].startMinutesAbs, t(14, 15));
+  assert.equal(s[0].endMinutesAbs, t(15));
+  assert.equal(s[0].durationMinutes, 45);
+  assert.equal(s[0].productiveMinutes, 45);
+  assert.equal(s[0].label, '02:15 PM - 03:00 PM');
+  assert.equal(s[0].startAdjusted, true);
+  assert.equal(expectedPartsFor(20, s[0].productiveMinutes), 135);
+});
+test('later slots keep their boundaries, minutes and indices', () => {
+  const s = startAt('A', t(14, 15), 2);
+  const full = buildSlots('A', 2);
+  for (const slot of s.slice(1)) assert.deepEqual(slot, full.find((f) => f.index === slot.index));
+  assert.equal(s[0].index, full.find((f) => f.hourStartAbs === t(14))!.index);
+  assert.deepEqual(s.map((x) => x.startMinutesAbs), [t(14, 15), t(15), t(16), t(17)]);
+});
+test('start at 14:59: one minute left in the slot', () => {
+  const s = startAt('A', t(14, 59));
+  assert.equal(s[0].durationMinutes, 1);
+  assert.equal(s[0].productiveMinutes, 1);
+});
+test('hourly boundary start: no zero-length or duplicate slot', () => {
+  for (const h of [8, 10, 11, 15]) {
+    const s = startAt('A', t(h));
+    assert.ok(s.every((x) => x.durationMinutes > 0));
+    assert.equal(new Set(s.map((x) => x.index)).size, s.length);
+    assert.equal(s.filter((x) => x.startAdjusted).length, 0);
+  }
+});
+test('13:00 start: the 12:45–2:00 slot (after lunch) is clipped to 13:00–14:00', () => {
+  const s = startAt('A', t(13));
+  assert.equal(s[0].index, indexOfHour(13));
+  assert.equal(s[0].startMinutesAbs, t(13));
+  assert.equal(s[0].productiveMinutes, 60);
+});
+test('no start / start at shift start = legacy schedule', () => {
+  assert.deepEqual(buildSlots('A', 0, [], null), slotsA);
+  assert.deepEqual(buildSlots('A', 0, [], t(7)), slotsA);
+  assert.deepEqual(buildSlots('B', 1, [], t(19)), buildSlots('B', 1));
+});
+test('start inside tea break 9:35: break still excluded from the clipped slot', () => {
+  const s = startAt('A', t(9, 35));
+  assert.equal(s[0].startMinutesAbs, t(9, 35));
+  assert.equal(s[0].productiveMinutes, 20); // 9:35–10:00 minus 9:35–9:40 break
+});
+test('start in the startup reserve 7:05 keeps the 7–8 rule (50 min)', () => {
+  assert.equal(startAt('A', t(7, 5))[0].productiveMinutes, 50);
+});
+test('start during lunch 12:20: lunch card clipped, 0 productive, 1–2 PM untouched', () => {
+  const s = startAt('A', t(12, 20));
+  assert.equal(s[0].isBreak, true);
+  assert.equal(s[0].startMinutesAbs, t(12, 20));
+  assert.equal(s[0].productiveMinutes, 0);
+  assert.deepEqual(s[1], byHour(13));
+});
+test('start at 12:05: 11–12 slot clipped to 12:05–12:15 (lunch excluded)', () => {
+  const s = startAt('A', t(12, 5));
+  assert.equal(s[0].index, indexOfHour(11));
+  assert.equal(s[0].productiveMinutes, 10);
+  assert.equal(s[0].label, '12:05 PM - 12:15 PM');
+});
+test('start at 13:15: 1–2 PM slot clipped to 13:15–14:00', () => {
+  const s = startAt('A', t(13, 15));
+  assert.equal(s[0].index, indexOfHour(13));
+  assert.equal(s[0].productiveMinutes, 45);
+});
+test('Shift B overnight start 01:20 → 25:20, 1–2 AM slot clipped, index unchanged', () => {
+  const abs = timeOfDayToShiftAbs(parseTimeInput('01:20')!, 'B');
+  assert.equal(abs, t(25, 20));
+  const s = startAt('B', abs);
+  assert.equal(s[0].index, buildSlots('B', 0).find((f) => f.hourStartAbs === t(25))!.index);
+  assert.equal(s[0].startMinutesAbs, t(25, 20));
+  assert.equal(s[0].endMinutesAbs, t(26));
+  assert.equal(s[0].label, '01:20 AM - 02:00 AM');
+  assert.equal(s[s.length - 1].endMinutesAbs, t(27, 30));
+});
+test('changeovers: before the start rejected, in the clipped slot split from the start', () => {
+  const s = startAt('A', t(14, 15));
+  assert.equal(placeChangeoverTime(t(14, 10), s, []).ok, false);
+  assert.equal(placeChangeoverTime(t(10), s, []).ok, false);
+  const atStart = placeChangeoverTime(t(14, 15), s, []);
+  assert.ok(atStart.ok && atStart.atSlotStart);
+  const mid = placeChangeoverTime(t(14, 40), s, []);
+  assert.ok(mid.ok && !mid.atSlotStart && mid.slot.index === s[0].index);
+  const seg = changeoverSegmentMinutes(s[0], { start: t(14, 40), end: t(14, 40) }, scheduledNonProductive('A', 0));
+  assert.equal(seg.beforeMinutes, 25);
+  assert.equal(seg.afterMinutes, 20);
+  assert.equal(seg.beforeMinutes + seg.afterMinutes, s[0].productiveMinutes);
+});
+test('validation: malformed and incomplete input rejected', () => {
+  for (const txt of ['', '1', '14:', '14:1', '24:00', '14:60', 'ab:cd']) {
+    assert.equal(validateProductionStartTime(txt, 'A', 0).ok, false, txt);
+  }
+});
+test('validation: accepts times inside the shift (incl. boundaries)', () => {
+  const cases: [string, number][] = [['07:00', t(7)], ['07:05', t(7, 5)], ['09:30', t(9, 30)], ['14:15', t(14, 15)], ['15:29', t(15, 29)]];
+  for (const [txt, abs] of cases) {
+    const r = validateProductionStartTime(txt, 'A', 0);
+    assert.ok(r.ok && r.startAbs === abs, txt);
+  }
+  const b = validateProductionStartTime('23:45', 'B', 0);
+  assert.ok(b.ok && b.startAbs === t(23, 45));
+});
+test('validation: before shift, at/after shift end and other shift rejected', () => {
+  assert.equal(validateProductionStartTime('06:59', 'A', 0).ok, false);
+  assert.equal(validateProductionStartTime('15:30', 'A', 0).ok, false);
+  assert.ok(validateProductionStartTime('15:30', 'A', 1).ok); // inside OT
+  assert.equal(validateProductionStartTime('16:30', 'A', 1).ok, false);
+  assert.equal(validateProductionStartTime('14:15', 'B', 0).ok, false);
+  assert.equal(validateProductionStartTime('03:30', 'B', 0).ok, false);
+  assert.ok(validateProductionStartTime('03:29', 'B', 0).ok);
+});
+test('validation: future rejected, earlier time (late entry) accepted', () => {
+  assert.equal(validateProductionStartTime('14:15', 'A', 0, t(14, 10)).ok, false);
+  assert.ok(validateProductionStartTime('14:15', 'A', 0, t(14, 15)).ok);
+  assert.ok(validateProductionStartTime('14:15', 'A', 0, t(14, 30)).ok);
+  assert.ok(validateProductionStartTime('01:20', 'B', 0, t(25, 30)).ok);
+  assert.equal(validateProductionStartTime('02:00', 'B', 0, t(25, 30)).ok, false);
 });
 
 console.log(`\n${passed} checks passed`);

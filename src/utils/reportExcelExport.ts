@@ -171,9 +171,15 @@ function hourBucketStart(slotStartMinutesAbs: number | null): number | null {
   return Math.floor(slotStartMinutesAbs / 60) * 60;
 }
 
-function hourRangeLabel(hourStartAbs: number | null): string {
+// `firstStartAbs` is the earliest slot start recorded in the hour: when it
+// falls inside the hour (a session whose production started mid-hour, e.g.
+// 14:15), the label starts there instead of on the hour.
+function hourRangeLabel(hourStartAbs: number | null, firstStartAbs: number | null = null): string {
   if (hourStartAbs == null) return '—';
-  return `${formatAbsMinutesToAmPm(hourStartAbs)} - ${formatAbsMinutesToAmPm(hourStartAbs + 60)}`;
+  const from = firstStartAbs != null && firstStartAbs > hourStartAbs && firstStartAbs < hourStartAbs + 60
+    ? firstStartAbs
+    : hourStartAbs;
+  return `${formatAbsMinutesToAmPm(from)} - ${formatAbsMinutesToAmPm(hourStartAbs + 60)}`;
 }
 
 // ── Professional report styling ──────────────────────────────────────────
@@ -477,6 +483,8 @@ type HourlyGroup = {
   shift: string | null;
   lineName: string | null;
   hourStartAbs: number | null;
+  // Earliest slotStartMinutesAbs among the group's records (see hourRangeLabel).
+  firstStartAbs: number | null;
   partNames: Set<string>;
   planned: number;
   produced: number;
@@ -503,6 +511,7 @@ function aggregateHourly(rows: ExcelHourlySourceRow[]): HourlyGroup[] {
         shift: row.shift,
         lineName: row.lineName,
         hourStartAbs,
+        firstStartAbs: null,
         partNames: new Set(),
         planned: 0,
         produced: 0,
@@ -515,6 +524,9 @@ function aggregateHourly(rows: ExcelHourlySourceRow[]): HourlyGroup[] {
         reasons: new Set(),
       };
       map.set(key, g);
+    }
+    if (typeof row.slotStartMinutesAbs === 'number' && !isNaN(row.slotStartMinutesAbs)) {
+      g.firstStartAbs = g.firstStartAbs == null ? row.slotStartMinutesAbs : Math.min(g.firstStartAbs, row.slotStartMinutesAbs);
     }
     if (row.partName) g.partNames.add(row.partName);
     g.planned += row.planned;
@@ -763,7 +775,7 @@ function buildHourlyReportSheet(filters: ExcelFilters, hourlyRows: ExcelHourlySo
     setCell(ws, r, 1, safe(g.shift));
     setCell(ws, r, 2, safe(g.lineName));
     setCell(ws, r, 3, hourlyPartText(g));
-    setCell(ws, r, 4, hourRangeLabel(g.hourStartAbs));
+    setCell(ws, r, 4, hourRangeLabel(g.hourStartAbs, g.firstStartAbs));
     setCell(ws, r, 5, hourlySupervisorText(g));
     setCell(ws, r, 6, hourlyOperatorsText(g));
     setCell(ws, r, 7, num(g.planned));
@@ -836,7 +848,7 @@ function buildHourlyLineSheet(filters: ExcelFilters, lineName: string, lineHourl
   groups.forEach((g) => {
     setCell(ws, r, 0, formatDateLabel(g.productionDate));
     setCell(ws, r, 1, safe(g.shift));
-    setCell(ws, r, 2, hourRangeLabel(g.hourStartAbs));
+    setCell(ws, r, 2, hourRangeLabel(g.hourStartAbs, g.firstStartAbs));
     setCell(ws, r, 3, hourlySupervisorText(g));
     setCell(ws, r, 4, hourlyOperatorsText(g));
     setCell(ws, r, 5, num(g.planned));

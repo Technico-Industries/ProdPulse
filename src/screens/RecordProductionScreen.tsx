@@ -51,10 +51,17 @@ import {
   deleteDoc,
   query,
   where,
+  Timestamp,
 } from 'firebase/firestore';
 import { db } from '../services/firebase';
 import { useAuthStore } from '../stores/authStore';
-import { productionDayKeyFor, resolveSessionProductionDate, timestampToMillis } from '../utils/productionDay';
+import {
+  millisToProductionDayMinute,
+  productionDayKeyFor,
+  productionDayMinuteToMillis,
+  resolveSessionProductionDate,
+  timestampToMillis,
+} from '../utils/productionDay';
 import { PLANTS, WORKSHOPS, DIVISIONS } from '../constants/lineOptions';
 import {
   SHIFT_A_START,
@@ -76,6 +83,8 @@ import {
   placeChangeoverTime,
   timeOfDayToShiftAbs,
   validateChangeoverInterval,
+  validateProductionStartTime,
+  formatAbsMinutes24,
 } from '../utils/productionSchedule';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -146,7 +155,16 @@ interface ActiveSessionDoc {
   lineStopped: boolean;        // true if any stop is currently running
   startedAt: any;              // serverTimestamp
   updatedAt: any;              // serverTimestamp
+  // Actual production start entered by the supervisor, written once by
+  // handleStartProduction and never by persistSession. Missing on sessions
+  // started before it existed — those keep the full-shift schedule.
+  productionStartMinutesAbs?: number | null; // same absolute-minute frame as the schedule
+  productionStartedAt?: any;                 // Timestamp of that instant on the production day
 }
+
+// A start time entered more than this many minutes before "now" asks the
+// supervisor to confirm it (late data entry is allowed, but should be deliberate).
+const LATE_START_CONFIRM_MINUTES = 10;
 
 // ─── Production record upsert ─────────────────────────────────────────────────
 // One productionRecords doc per logical slot: re-saving a slot (or Finalize
@@ -621,6 +639,21 @@ function formatSessionStartedAt(ms: number | null): string {
   return `${day}/${mon} · ${formatAbsMinutesToAmPm(d.getHours() * 60 + d.getMinutes())}`;
 }
 
+// Default Production Start Time for a shift: its scheduled start (Shift A
+// 07:00, Shift B 19:00). The supervisor overwrites it when production
+// actually started later.
+function defaultStartTimeText(shift: 'A' | 'B'): string {
+  return formatAbsMinutes24(shift === 'A' ? SHIFT_A_START : SHIFT_B_START);
+}
+
+// Planned parts for a list of slots on one part (the shift's planned total
+// before any changeover exists).
+function plannedTotalFor(slotList: Slot[], line: Line | null, partIndex: number): number {
+  const cycle = line?.parts?.[partIndex]?.cycleTimeSeconds ?? 0;
+  if (!cycle) return 0;
+  return slotList.reduce((sum, s) => sum + expectedPartsFor(cycle, s.productiveMinutes), 0);
+}
+
 // Division only applies under the Assembly workshop. Matched by substring
 // rather than an exact hardcoded string so this keeps working even if the
 // exact label in lineOptions.ts changes (e.g. "Assembly" vs "Assembly Shop").
@@ -666,6 +699,12 @@ export default function RecordProductionScreen() {
   const [division, setDivision] = useState<string | null>(null);
   const [selectedShift, setSelectedShift] = useState<'A' | 'B'>('A');
   const [otHours, setOtHours] = useState(0);
+  // Production Start Time as typed on the setup screen (24-hour "HH:MM").
+  // Defaults to the selected shift's start (see defaultStartTimeText).
+  const [startTimeText, setStartTimeText] = useState(() => defaultStartTimeText('A'));
+  // The active session's stored production start (absolute minutes), or
+  // null for a legacy session that has none.
+  const [sessionStartAbs, setSessionStartAbs] = useState<number | null>(null);
   const [operators, setOperators] = useState<Operator[]>([{ id: `op-${Date.now()}`, name: '', code: '' }]);
 
   // ── Which picker box is currently open (null = none)
@@ -728,6 +767,8 @@ export default function RecordProductionScreen() {
       setSavedSlotIndices(new Set());
       setDeletedSlotIndices(new Set());
       setProductionDate(null);
+      setSessionStartAbs(null);
+      setStartTimeText(defaultStartTimeText(selectedShift));
       return;
     }
     if (navigation.canGoBack()) {
@@ -805,13 +846,23 @@ export default function RecordProductionScreen() {
     [storedChangeovers]
   );
 
+  // Production start the schedule is built from: the active session's
+  // stored start, or — on the setup screen — the typed time once it is a
+  // valid time inside the shift (the "not in the future" rule is checked
+  // against the clock when Start Production is pressed).
+  const setupStartCheck = validateProductionStartTime(startTimeText, selectedShift, otHours);
+  const effectiveStartAbs = phase === 'active'
+    ? sessionStartAbs
+    : setupStartCheck.ok ? setupStartCheck.startAbs : null;
+
   // Hourly slots from the shared schedule (src/utils/productionSchedule.ts):
   // lunch-adjusted windows, with breaks, startup reserve and changeover time
   // already taken out of productiveMinutes — so a changeover that runs past
-  // its own slot's end reduces the following slot too.
+  // its own slot's end reduces the following slot too. Slots before the
+  // production start are left out and the slot it falls in is clipped to it.
   const slots = useMemo(
-    () => buildSlots(selectedShift, otHours, changeoverIntervals),
-    [selectedShift, otHours, changeoverIntervals]
+    () => buildSlots(selectedShift, otHours, changeoverIntervals, effectiveStartAbs),
+    [selectedShift, otHours, changeoverIntervals, effectiveStartAbs]
   );
 
   // Every changeover with its BEFORE/AFTER productive minutes recomputed
@@ -896,12 +947,10 @@ export default function RecordProductionScreen() {
   // afterward. Uses the currently selected part for every slot since no
   // changeover exists yet at the moment production starts. Deleted slots
   // (see visibleSlots) don't contribute to this total.
-  const shiftPlannedTotal = useMemo(() => {
-    if (!selectedLine) return 0;
-    const cycle = selectedLine.parts?.[selectedPartIndex]?.cycleTimeSeconds ?? 0;
-    if (!cycle) return 0;
-    return visibleSlots.reduce((sum, s) => sum + expectedPartsFor(cycle, s.productiveMinutes), 0);
-  }, [visibleSlots, selectedLine, selectedPartIndex]);
+  const shiftPlannedTotal = useMemo(
+    () => plannedTotalFor(visibleSlots, selectedLine, selectedPartIndex),
+    [visibleSlots, selectedLine, selectedPartIndex]
+  );
 
   // Part Target Summary — redistributes the FIXED shiftPlannedTotal across
   // whichever parts actually run during the shift (accounting for mid-shift
@@ -1040,6 +1089,7 @@ export default function RecordProductionScreen() {
         break;
       case 'shift':
         setSelectedShift(key as 'A' | 'B');
+        setStartTimeText(defaultStartTimeText(key as 'A' | 'B'));
         break;
     }
     setActiveDropdown(null);
@@ -1193,6 +1243,11 @@ export default function RecordProductionScreen() {
     setProducedSegment(sd.producedSegment ?? {});
     setDeletedSlotIndices(new Set(sd.deletedSlotIndices ?? []));
 
+    // The start time stored when the session began — never re-derived from
+    // the clock. Legacy sessions without it keep the full-shift schedule.
+    const storedStart = sd.productionStartMinutesAbs;
+    setSessionStartAbs(typeof storedStart === 'number' && Number.isFinite(storedStart) ? storedStart : null);
+
     // Keep the session's ORIGINAL production date — reopening the app or
     // resuming the session on a later day must never move its records to
     // today. Sessions started before the productionDate field existed derive
@@ -1333,16 +1388,53 @@ export default function RecordProductionScreen() {
     const hasOperator = operators.some((o) => o.name.trim());
     if (!hasOperator) { Alert.alert('Add operator', 'Enter at least one operator name.'); return; }
 
-    setStartingProduction(true);
     // The ONLY place a session's production date is calculated from the
     // current time (persistSession's create branch aside) — see
     // resolveActiveSessionProductionDate for every later read.
     const startedMs = Date.now();
     const pd = productionDayKeyFor(startedMs);
+
+    // Production Start Time: a valid time inside the shift, not in the
+    // future, measured on the same production day the session is pinned to.
+    const nowAbs = millisToProductionDayMinute(pd, startedMs);
+    const startCheck = validateProductionStartTime(startTimeText, selectedShift, otHours, nowAbs);
+    if (!startCheck.ok) {
+      if (Platform.OS === 'web') window.alert(startCheck.error);
+      else Alert.alert('Invalid production start time', startCheck.error);
+      return;
+    }
+    const startAbs = startCheck.startAbs;
+    const begin = () => beginSession(selectedLineId, startAbs, startedMs, pd);
+
+    // An earlier time is allowed (data entered after production began), but
+    // confirmed so it isn't a typo. Same web/native confirm split as
+    // handleFinalizeSession — Alert buttons don't fire on react-native-web.
+    if (nowAbs - startAbs > LATE_START_CONFIRM_MINUTES) {
+      const message =
+        `Production started at ${formatAbsMinutes24(startAbs)}, ${nowAbs - startAbs} minutes before the current time (${formatAbsMinutes24(nowAbs)}). ` +
+        `Slots and targets will be counted from ${formatAbsMinutes24(startAbs)}.`;
+      if (Platform.OS === 'web') {
+        if (window.confirm(`Confirm production start time\n\n${message}`)) begin();
+      } else {
+        Alert.alert('Confirm production start time', message, [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Start Production', onPress: begin },
+        ]);
+      }
+      return;
+    }
+    begin();
+  };
+
+  const beginSession = async (lineId: string, startAbs: number, startedMs: number, pd: string) => {
+    setStartingProduction(true);
+    // Planned total from the schedule for THIS start time (no changeovers or
+    // deleted slots exist yet), rather than the last render's value.
+    const plannedTotal = plannedTotalFor(buildSlots(selectedShift, otHours, [], startAbs), selectedLine, selectedPartIndex);
     try {
-      const docRef = doc(db, 'activeSessions', selectedLineId);
+      const docRef = doc(db, 'activeSessions', lineId);
       await setDoc(docRef, {
-        lineId: selectedLineId,
+        lineId,
         lineName: selectedLine?.lineName ?? null,
         plant: selectedLine?.plant ?? plant ?? null,
         workshop: selectedLine?.workshop ?? workshop ?? null,
@@ -1362,14 +1454,17 @@ export default function RecordProductionScreen() {
         deletedSlotIndices: [],
         lineStopped: false,
         productionDate: pd,
-        plannedProductionTotal: shiftPlannedTotal,
+        plannedProductionTotal: plannedTotal,
+        productionStartMinutesAbs: startAbs,
+        productionStartedAt: Timestamp.fromMillis(productionDayMinuteToMillis(pd, startAbs)),
         startedAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
-      setSessionLineId(selectedLineId);
+      setSessionLineId(lineId);
       // Pinned for the lifetime of this session — every record it writes,
       // including Finalize after midnight/the cutover, uses this date.
       setProductionDate(pd);
+      setSessionStartAbs(startAbs);
       sessionStartedAtMsRef.current = startedMs;
       setSavedSlotIndices(new Set());
       setDeletedSlotIndices(new Set());
@@ -2626,11 +2721,52 @@ export default function RecordProductionScreen() {
             <TextInput style={styles.input} value={String(otHours)} onChangeText={(t) => setOtHours(Math.max(0, Math.min(4, Math.floor(Number(t) || 0))))} keyboardType="number-pad" placeholder="0" placeholderTextColor="#5C6670" />
           </View>
 
+          {/* PRODUCTION START TIME — the actual start, typed by the supervisor (24-hour) */}
+          <View style={{ width: 180 }}>
+            <Text style={styles.label}>Production Start Time</Text>
+            <TextInput
+              style={styles.input}
+              value={startTimeText}
+              onChangeText={(t) => setStartTimeText(formatTimeInput(t))}
+              placeholder="HH:MM"
+              placeholderTextColor="#5C6670"
+              keyboardType="number-pad"
+              maxLength={5}
+            />
+          </View>
+          {(() => {
+            // Live preview: the first slot this start produces, or why the
+            // time can't be used. The future-time check runs against the
+            // clock here and again when Start Production is pressed.
+            if (startTimeText.replace(/\D/g, '').length < 4) {
+              return (
+                <Text style={[styles.muted, { marginTop: 8 }]}>
+                  24-hour time production actually started, e.g. 1415 → 14:15.
+                </Text>
+              );
+            }
+            const nowMsSetup = Date.now();
+            const pdSetup = productionDayKeyFor(nowMsSetup);
+            const check = validateProductionStartTime(startTimeText, selectedShift, otHours, millisToProductionDayMinute(pdSetup, nowMsSetup));
+            if (!check.ok) return <Text style={[styles.muted, { marginTop: 8, color: '#F0A8A8' }]}>{check.error}</Text>;
+            const first = slots[0];
+            return first ? (
+              <Text style={[styles.muted, { marginTop: 8 }]}>
+                First slot: {formatAbsMinutesToAmPm(first.startMinutesAbs)} – {formatAbsMinutesToAmPm(first.endMinutesAbs)}
+                {first.isBreak ? ' (lunch break)' : ` · ${first.productiveMinutes} productive min`}
+              </Text>
+            ) : null;
+          })()}
+
           {/* START BUTTON */}
           <Pressable
-            style={({ pressed }) => [styles.startButton, (startingProduction || pressed) && styles.startButtonPressed]}
+            style={({ pressed }) => [
+              styles.startButton,
+              (startingProduction || pressed) && styles.startButtonPressed,
+              !setupStartCheck.ok && { opacity: 0.45 },
+            ]}
             onPress={handleStartProduction}
-            disabled={startingProduction}
+            disabled={startingProduction || !setupStartCheck.ok}
           >
             {startingProduction ? (
               <ActivityIndicator color="#14181C" />
@@ -2651,7 +2787,9 @@ export default function RecordProductionScreen() {
             <View style={{ marginTop: 22 }}>
               <Text style={styles.sectionLabel}>CONTINUE ACTIVE SESSION</Text>
               {activeSessionsList.map(({ docId, data: sd }) => {
-                const startedMs = (sd as any).startedAt?.toMillis ? (sd as any).startedAt.toMillis() : null;
+                // The entered production start when the session has one,
+                // otherwise when the session document was created.
+                const startedMs = timestampToMillis(sd.productionStartedAt) ?? timestampToMillis(sd.startedAt);
                 return (
                   <Pressable
                     key={docId}
@@ -2733,6 +2871,7 @@ export default function RecordProductionScreen() {
             </Text>
             <Text style={[styles.subtitle, { marginTop: 2, color: '#F2A93B', fontWeight: '700' }]}>
               Date: {formatProductionDayDisplay(productionDate)}
+              {sessionStartAbs != null ? ` · Production start: ${formatAbsMinutes24(sessionStartAbs)}` : ''}
             </Text>
             <Text style={[styles.subtitle, { marginTop: 2, color: '#4C9A6A', fontWeight: '700' }]}>
               Shift Planned Total: {shiftPlannedTotal} parts{otHours > 0 ? ` (incl. ${otHours}h OT)` : ''}
@@ -2993,9 +3132,10 @@ export default function RecordProductionScreen() {
           }
 
           // Actual production window, shown when it differs from the nominal
-          // hour in the label (the slots either side of lunch).
+          // hour in the label (the slots either side of lunch). A slot
+          // clipped to the production start already shows it in its label.
           const windowPrefix = (s: Slot) =>
-            s.startMinutesAbs !== s.hourStartAbs || s.endMinutesAbs !== s.hourEndAbs
+            !s.startAdjusted && (s.startMinutesAbs !== s.hourStartAbs || s.endMinutesAbs !== s.hourEndAbs)
               ? `${formatAbsMinutesToAmPm(s.startMinutesAbs)}–${formatAbsMinutesToAmPm(s.endMinutesAbs)} · `
               : '';
 

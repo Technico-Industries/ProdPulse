@@ -76,6 +76,9 @@ export type ScheduleSlot = {
   productiveMinutes: number;
   // True for the 12–1 slot, which covers only the lunch break.
   isBreak: boolean;
+  // True for the slot whose start was clipped to the session's actual
+  // production start time (see buildSlots). Its label shows that window.
+  startAdjusted: boolean;
   label: string;
 };
 
@@ -152,10 +155,21 @@ export function slotProductiveMinutes(hourStartAbs: number, from: number, to: nu
 // Hourly slots for a shift. `changeoverIntervals` are subtracted from the
 // productive minutes of every slot they overlap, so a changeover crossing an
 // hour boundary is split across the slots it actually covers.
+//
+// `productionStartAbs` is the session's actual production start (null for
+// sessions started before it was recorded — the full shift, as before).
+// Slots that end on or before it are left out, and only the slot it falls
+// inside has its start clipped to it; every later slot keeps its scheduled
+// boundaries. Slot indices are those of the full shift either way, so
+// productionRecords IDs and every per-slot map keep pointing at the same slot.
+// Breaks, the startup reserve and the fixed-hour ceilings are applied to the
+// clipped window unchanged — e.g. a 14:15 start leaves 14:15–15:00, whose
+// 45 productive minutes are already below the 2–3 PM 50-minute ceiling.
 export function buildSlots(
   shift: ShiftCode,
   otHours: number,
-  changeoverIntervals: TimeInterval[] = []
+  changeoverIntervals: TimeInterval[] = [],
+  productionStartAbs: number | null = null
 ): ScheduleSlot[] {
   const { start: shiftStart, end: shiftEnd } = shiftWindow(shift, otHours);
 
@@ -180,18 +194,32 @@ export function buildSlots(
     windows[lunchIdx + 1].start = LUNCH_BREAK.end;
   }
 
+  const start = productionStartAbs != null && Number.isFinite(productionStartAbs) && productionStartAbs > shiftStart
+    ? productionStartAbs
+    : null;
+
   const nonProductive = [...scheduledNonProductive(shift, otHours), ...changeoverIntervals];
-  return windows.map((w, idx) => ({
-    index: idx,
-    hourStartAbs: w.hourStart,
-    hourEndAbs: w.hourEnd,
-    startMinutesAbs: w.start,
-    endMinutesAbs: w.end,
-    durationMinutes: w.end - w.start,
-    productiveMinutes: slotProductiveMinutes(w.hourStart, w.start, w.end, nonProductive),
-    isBreak: w.isBreak,
-    label: `${formatAbsMinutesToAmPm(w.hourStart)} - ${formatAbsMinutesToAmPm(w.hourEnd)}${w.hourEnd - w.hourStart < 60 ? ' (partial)' : ''}`,
-  }));
+  return windows
+    .map((w, idx) => ({ w, idx }))
+    .filter(({ w }) => start == null || w.end > start)
+    .map(({ w, idx }) => {
+      const startAdjusted = start != null && start > w.start;
+      const from = startAdjusted ? start : w.start;
+      return {
+        index: idx,
+        hourStartAbs: w.hourStart,
+        hourEndAbs: w.hourEnd,
+        startMinutesAbs: from,
+        endMinutesAbs: w.end,
+        durationMinutes: w.end - from,
+        productiveMinutes: slotProductiveMinutes(w.hourStart, from, w.end, nonProductive),
+        isBreak: w.isBreak,
+        startAdjusted,
+        label: startAdjusted
+          ? `${formatAbsMinutesToAmPm(from)} - ${formatAbsMinutesToAmPm(w.end)}`
+          : `${formatAbsMinutesToAmPm(w.hourStart)} - ${formatAbsMinutesToAmPm(w.hourEnd)}${w.hourEnd - w.hourStart < 60 ? ' (partial)' : ''}`,
+      };
+    });
 }
 
 // Theoretical parts for a number of productive minutes at a cycle time
@@ -315,6 +343,51 @@ export function parseTimeInput(text: string): number | null {
 // belong to the night that started the previous evening.
 export function timeOfDayToShiftAbs(minuteOfDay: number, shift: ShiftCode): number {
   return shift === 'B' && minuteOfDay < 12 * 60 ? minuteOfDay + 1440 : minuteOfDay;
+}
+
+// Absolute minutes → 24-hour "HH:MM", the format the supervisor types.
+export function formatAbsMinutes24(mAbs: number) {
+  const m = ((mAbs % 1440) + 1440) % 1440;
+  return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+}
+
+// ─── Production start time ───────────────────────────────────────────────────
+// The time production actually started, typed as 24-hour "HH:MM" before
+// Start Production. It must fall inside the selected shift's window
+// (including OT), [shift start, shift end) — a start on or after the end
+// would leave no slot to record. `nowAbs` is the current time in the same
+// production-day frame; when given, a start later than it is rejected (the
+// app has no scheduled future production). An earlier time is accepted, so
+// a supervisor entering data late can record when production really began.
+export type ProductionStartCheck =
+  | { ok: true; startAbs: number }
+  | { ok: false; error: string };
+
+export function validateProductionStartTime(
+  text: string,
+  shift: ShiftCode,
+  otHours: number,
+  nowAbs: number | null = null
+): ProductionStartCheck {
+  const minuteOfDay = parseTimeInput(text);
+  if (minuteOfDay == null) {
+    return { ok: false, error: 'Enter the production start time as HH:MM in 24-hour format, e.g. 07:05 or 14:15.' };
+  }
+  const startAbs = timeOfDayToShiftAbs(minuteOfDay, shift);
+  const { start, end } = shiftWindow(shift, otHours);
+  if (startAbs < start || startAbs >= end) {
+    return {
+      ok: false,
+      error: `Shift ${shift} runs ${formatAbsMinutes24(start)}–${formatAbsMinutes24(end)}${otHours > 0 ? ` (incl. ${otHours}h OT)` : ''}. Enter a start time inside it.`,
+    };
+  }
+  if (nowAbs != null && startAbs > nowAbs) {
+    return {
+      ok: false,
+      error: `${formatAbsMinutes24(startAbs)} is later than the current time (${formatAbsMinutes24(nowAbs)}). Enter the time production actually started.`,
+    };
+  }
+  return { ok: true, startAbs };
 }
 
 // ─── Single-time changeover ──────────────────────────────────────────────────

@@ -21,6 +21,18 @@ export function productionDayKeyFor(epochMs: number): string {
   return `${y}-${m}-${day}`;
 }
 
+// Local instant of an absolute shift minute (minutes from midnight of the
+// production day, past 1440 for Shift B's after-midnight hours).
+export function productionDayMinuteToMillis(key: string, minuteAbs: number): number {
+  const [y, m, d] = key.split('-').map(Number);
+  return new Date(y, m - 1, d, 0, minuteAbs).getTime();
+}
+
+// Inverse of productionDayMinuteToMillis, rounded down to the minute.
+export function millisToProductionDayMinute(key: string, epochMs: number): number {
+  return Math.floor((epochMs - productionDayMinuteToMillis(key, 0)) / 60000);
+}
+
 export function isProductionDayKey(v: unknown): v is string {
   return typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v);
 }
