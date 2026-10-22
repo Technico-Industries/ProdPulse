@@ -24,6 +24,7 @@ import { Platform } from 'react-native';
 import * as XLSX from 'xlsx-js-style';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
+import { recordProductionDayKey } from './productionDay';
 
 // ─── Shared types (structural only — matches KPIAnalysisScreen's interfaces) ─
 
@@ -816,7 +817,7 @@ function buildRejectionSheet(filters: KpiFilters, records: KpiProductionRecord[]
   // BY DATE
   const byDateMap = new Map<string, { produced: number; rejections: number }>();
   records.forEach((rec) => {
-    const key = rec.productionDate ?? dateKeyFromMs(rec.createdAtMs);
+    const key = recordProductionDayKey(rec) ?? 'unknown';
     const ex = byDateMap.get(key);
     if (ex) { ex.produced += rec.producedThisSlot ?? 0; ex.rejections += rec.rejections ?? 0; }
     else byDateMap.set(key, { produced: rec.producedThisSlot ?? 0, rejections: rec.rejections ?? 0 });
@@ -908,7 +909,7 @@ function buildLossSheet(filters: KpiFilters, records: KpiProductionRecord[]): XL
   // BY DATE
   const byDateMap = new Map<string, { plan: number; actual: number; downtime: number }>();
   records.forEach((rec) => {
-    const key = rec.productionDate ?? dateKeyFromMs(rec.createdAtMs);
+    const key = recordProductionDayKey(rec) ?? 'unknown';
     const dt = (rec.stopEvents ?? []).reduce((s, se) => s + (se.durationMinutes ?? 0), 0);
     const ex = byDateMap.get(key);
     if (ex) { ex.plan += rec.expectedParts ?? 0; ex.actual += rec.producedThisSlot ?? 0; ex.downtime += dt; }

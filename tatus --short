@@ -1,0 +1,159 @@
+warning: in the working copy of 'package.json', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/screens/RecordProductionScreen.tsx', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/package.json b/package.json[m
+[1mindex 6eb72d5..c7e1e27 100644[m
+[1m--- a/package.json[m
+[1m+++ b/package.json[m
+[36m@@ -48,6 +48,7 @@[m
+     "test:quality": "tsx scripts/testQualityMetrics.ts",[m
+     "test:live-quality": "tsx scripts/testLiveQuality.ts",[m
+     "test:downtime": "tsx scripts/testDowntime.ts",[m
+[32m+[m[32m    "test:production-draft": "tsx scripts/testProductionDraft.ts",[m
+     "build": "expo export --platform web"[m
+   },[m
+   "private": true[m
+[1mdiff --git a/src/screens/RecordProductionScreen.tsx b/src/screens/RecordProductionScreen.tsx[m
+[1mindex 5af4326..c4865f5 100644[m
+[1m--- a/src/screens/RecordProductionScreen.tsx[m
+[1m+++ b/src/screens/RecordProductionScreen.tsx[m
+[36m@@ -52,9 +52,37 @@[m [mimport {[m
+   query,[m
+   where,[m
+   Timestamp,[m
+[32m+[m[32m  onSnapshot,[m
+[32m+[m[32m  runTransaction,[m
+ } from 'firebase/firestore';[m
+[32m+[m[32mimport AsyncStorage from '@react-native-async-storage/async-storage';[m
+ import { db } from '../services/firebase';[m
+ import { useAuthStore } from '../stores/authStore';[m
+[32m+[m[32mimport {[m
+[32m+[m[32m  DraftScope,[m
+[32m+[m[32m  ProductionSlotIdentity,[m
+[32m+[m[32m  RestoreRecord,[m
+[32m+[m[32m  SlotSegment,[m
+[32m+[m[32m  StopLike,[m
+[32m+[m[32m  SyncConflict,[m
+[32m+[m[32m  SyncState,[m
+[32m+[m[32m  createDraft,[m
+[32m+[m[32m  createDraftStore,[m
+[32m+[m[32m  createSessionWriteQueue,[m
+[32m+[m[32m  emptySyncState,[m
+[32m+[m[32m  fieldsForRecordUpdate,[m
+[32m+[m[32m  isCompleteScope,[m
+[32m+[m[32m  planSessionSync,[m
+[32m+[m[32m  productionRecordId,[m
+[32m+[m[32m  resolveRestore,[m
+[32m+[m[32m  saveDraft,[m
+[32m+[m[32m  serializeLossReasons,[m
+[32m+[m[32m  serializeStops,[m
+[32m+[m[32m  syncRetryDelayMs,[m
+[32m+[m[32m  syncStatesEqual,[m
+[32m+[m[32m  threeWayMerge,[m
+[32m+[m[32m  withTimeout,[m
+[32m+[m[32m} from '../utils/productionDraft';[m
+ import {[m
+   millisToProductionDayMinute,[m
+   productionDayKeyFor,[m
+[36m@@ -176,6 +204,58 @@[m [minterface ActiveSessionDoc {[m
+   // started before it existed — those keep the full-shift schedule.[m
+   productionStartMinutesAbs?: number | null; // same absolute-minute frame as the schedule[m
+   productionStartedAt?: any;                 // Timestamp of that instant on the production day[m
+[32m+[m[32m  // Added for draft persistence / restore (all optional — older session[m
+[32m+[m[32m  // docs don't have them):[m
+[32m+[m[32m  lossReasonBySlot?: Record<string, { code: string; label: string; note: string | null }>;[m
+[32m+[m[32m  savedSlotIndices?: number[];   // slots whose productionRecords write AND session sync succeeded[m
+[32m+[m[32m  clientUpdatedAtMs?: number;    // device time of the last write (informational)[m
+[32m+[m[32m  sessionInstanceId?: string;    // identifies this run of the line's session (draft scope)[m
+[32m+[m[32m  // Multi-device sync (all optional — older session docs don't have them):[m
+[32m+[m[32m  revision?: number;             // bumped by one on every sync (in a transaction)[m
+[32m+[m[32m  syncConflicts?: Record<string, SyncConflict | null>; // values not kept in a merge (null = dismissed)[m
+[32m+[m[32m  updatedBy?: { uid: string | null; deviceId: string | null };[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m// Thrown inside a sync transaction when the session doc is gone (finalized[m
+[32m+[m[32m// elsewhere) or belongs to a new run of the line's session.[m
+[32m+[m[32mclass SessionGoneError extends Error {[m
+[32m+[m[32m  constructor(public kind: 'finalized' | 'replaced') {[m
+[32m+[m[32m    super(kind);[m
+[32m+[m[32m  }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m// A random id per app install (per browser profile on web), recorded on[m
+[32m+[m[32m// syncs and conflicts so a supervisor can tell their devices apart.[m
+[32m+[m[32mconst DEVICE_ID_KEY = 'prodpulse.deviceId';[m
+[32m+[m[32mlet deviceIdPromise: Promise<string> | null = null;[m
+[32m+[m[32mfunction getDeviceId(): Promise<string> {[m
+[32m+[m[32m  deviceIdPromise ??= (async () => {[m
+[32m+[m[32m    try {[m
+[32m+[m[32m      const existing = await AsyncStorage.getItem(DEVICE_ID_KEY);[m
+[32m+[m[32m      if (existing) return existing;[m
+[32m+[m[32m      const id = `dev-${newSessionInstanceId()}`;[m
+[32m+[m[32m      await AsyncStorage.setItem(DEVICE_ID_KEY, id);[m
+[32m+[m[32m      return id;[m
+[32m+[m[32m    } catch {[m
+[32m+[m[32m      return `dev-${newSessionInstanceId()}`;[m
+[32m+[m[32m    }[m
+[32m+[m[32m  })();[m
+[32m+[m[32m  return deviceIdPromise;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m// Session-save timing: local draft shortly after the last change (cheap,[m
+[32m+[m[32m// on-device), server write after a short pause so typing a number is one[m
+[32m+[m[32m// write, not one per keystroke. A server write that hasn't settled in[m
+[32m+[m[32m// SESSION_WRITE_TIMEOUT_MS is reported as not synced (the draft is kept).[m
+[32m+[m[32mconst DRAFT_SAVE_DEBOUNCE_MS = 300;[m
+[32m+[m[32mconst SESSION_SAVE_DEBOUNCE_MS = 1200;[m
+[32m+[m[32mconst SESSION_WRITE_TIMEOUT_MS = 15000;[m
+[32m+[m[32mconst RESTORE_RECORDS_TIMEOUT_MS = 10000;[m
+[32m+[m
+[32m+[m[32mconst draftStore = createDraftStore(AsyncStorage);[m
+[32m+[m
+[32m+[m[32mfunction newSessionInstanceId() {[m
+[32m+[m[32m  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;[m
+ }[m
+ [m
+ // A start time entered more than this many minutes before "now" asks the[m
+[36m@@ -187,26 +267,8 @@[m [mconst LATE_START_CONFIRM_MINUTES = 10;[m
+ // writing a slot that was already saved) updates that doc instead of adding[m
+ // another. A slot is identified by productionDate + lineId + shift +[m
+ // slotIndex + segment ('full' for a normal slot, 'before'/'after' for the[m
+[31m-// two halves of a changeover slot).[m
+[31m-[m
+[31m-type SlotSegment = 'full' | 'before' | 'after';[m
+[31m-[m
+[31m-interface ProductionSlotIdentity {[m
+[31m-  productionDate: string;[m
+[31m-  lineId: string;[m
+[31m-  shift: string;[m
+[31m-  slotIndex: number;[m
+[31m-  segment: SlotSegment;[m
+[31m-}[m
+[31m-[m
+[31m-// Deterministic doc ID. Each part is URI-encoded, so it can never contain[m
+[31m-// '/' (illegal in an ID) or the '|' separator — distinct identities can't[m
+[31m-// collide.[m
+[31m-function productionRecordId(id: ProductionSlotIdentity): string {[m
+[31m-  return ['pr', id.productionDate, id.lineId, id.shift, String(id.slotIndex), id.segment][m
+[31m-    .map((v) => encodeURIComponent(v))[m
+[31m-    .join('|');[m
+[31m-}[m
+[32m+[m[32m// two halves of a changeover slot). SlotSegment, ProductionSlotIdentity and[m
+[32m+[m[32m// the deterministic productionRecordId() live in utils/productionDraft.[m
+ [m
+ // Resolves the doc a slot should be written to, in order:[m
+ //   1. the canonical (deterministic-ID) doc, if it already exists;[m
+[36m@@ -257,21 +319,25 @@[m [masync function resolveProductionRecordRef(id: ProductionSlotIdentity) {[m
+ // time is kept on every later save); updatedAt is stamped every time.[m
+ // `resolved` caches which doc each slot resolved to, so later saves in the[m
+ // same session skip the lookup and always hit the same document.[m
+[32m+[m[32m// `keepExistingWhenNull`: fields that, when null here, are left out of an[m
+[32m+[m[32m// UPDATE so the stored value is kept (a new record still gets them as null).[m
+ async function upsertProductionRecord([m
+   id: ProductionSlotIdentity,[m
+   data: Record<string, any>,[m
+[31m-  resolved: Map<string, string>[m
+[32m+[m[32m  resolved: Map<string, string>,[m
+[32m+[m[32m  options: { keepExistingWhenNull?: string[] } = {}[m
+ ) {[m
+   const { createdAt: _createdAt, ...fields } = data;[m
+[3

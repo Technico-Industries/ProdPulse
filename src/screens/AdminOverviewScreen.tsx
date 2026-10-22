@@ -8,9 +8,9 @@
 // drawer (src/components/AppDrawer.tsx).
 //
 // DATA SOURCE — the real `productionRecords` collection written by
-// RecordProductionScreen. Same collection, same `createdAt` Timestamp range
-// filter and same per-record field names GenerateReportScreen and
-// KPIAnalysisScreen already use. Nothing here reads
+// RecordProductionScreen. Same collection, same production-date range
+// (services/productionRecordQueries) and same per-record field names
+// GenerateReportScreen and KPIAnalysisScreen already use. Nothing here reads
 // sampleProductionRecords (the seed script's collection) or any mock data.
 //
 // ONE Firestore read per date change. Every KPI below is then computed
@@ -57,8 +57,9 @@ import {
 import { Ionicons } from '@expo/vector-icons';
 import WebRefreshButton from '../components/WebRefreshButton';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { collection, getDocs, onSnapshot, query, where, orderBy, Timestamp } from 'firebase/firestore';
+import { collection, getDocs, onSnapshot } from 'firebase/firestore';
 import { db } from '../services/firebase';
+import { fetchProductionRecordsForDateRange } from '../services/productionRecordQueries';
 import { PLANTS, WORKSHOPS, DIVISIONS } from '../constants/lineOptions';
 import AppDrawer from '../components/AppDrawer';
 import { ADMIN_MENU_ITEMS } from '../constants/adminMenu';
@@ -438,23 +439,12 @@ export default function AdminOverviewScreen() {
     if (!silent) setLoading(true);
     setLoadError(null);
     try {
-      // Local business day → the same Timestamp range GenerateReportScreen
-      // builds. `new Date('YYYY-MM-DDTHH:mm:ss')` (no trailing Z) is parsed
-      // in the device's local zone, so 00:00:00 → 23:59:59.999 is the local
-      // day, not a UTC one.
-      const fromTs = Timestamp.fromDate(new Date(`${dateStr}T00:00:00`));
-      const toTs = Timestamp.fromDate(new Date(`${dateStr}T23:59:59.999`));
+      // The selected production day, same query as GenerateReportScreen —
+      // by productionDate, so an overnight Shift B (slots saved after
+      // midnight included) counts on the night it started.
+      const docs = await fetchProductionRecordsForDateRange(dateStr, dateStr);
 
-      const snap = await getDocs(
-        query(
-          collection(db, 'productionRecords'),
-          where('createdAt', '>=', fromTs),
-          where('createdAt', '<=', toTs),
-          orderBy('createdAt', 'asc')
-        )
-      );
-
-      const mapped: ProductionRecord[] = snap.docs.map((d) => {
+      const mapped: ProductionRecord[] = docs.map((d) => {
         const data: any = d.data();
         return {
           id: d.id,

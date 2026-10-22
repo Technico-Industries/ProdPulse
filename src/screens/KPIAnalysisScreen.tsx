@@ -33,6 +33,8 @@ import { Ionicons } from '@expo/vector-icons';
 import { useNavigation } from '@react-navigation/native';
 import { collection, getDocs, query, where, orderBy, Timestamp } from 'firebase/firestore';
 import { db } from '../services/firebase';
+import { fetchProductionRecordsForDateRange } from '../services/productionRecordQueries';
+import { recordProductionDayKey } from '../utils/productionDay';
 import { PLANTS, WORKSHOPS, DIVISIONS } from '../constants/lineOptions';
 // Charting: react-native-gifted-charts (peer dep: react-native-svg). If these
 // aren't installed yet: `npx expo install react-native-gifted-charts react-native-svg`
@@ -1384,15 +1386,11 @@ export default function KPIAnalysisScreen() {
         return;
       }
 
-      const q = query(
-        collection(db, 'productionRecords'),
-        where('createdAt', '>=', fromTs),
-        where('createdAt', '<=', toTs),
-        orderBy('createdAt', 'asc')
-      );
-      const snap = await getDocs(q);
+      // By production date, not createdAt — an overnight Shift B stays on
+      // the night it started (see services/productionRecordQueries).
+      const docs = await fetchProductionRecordsForDateRange(fromDate, toDate);
 
-      const all: ProductionRecord[] = snap.docs.map((d) => {
+      const all: ProductionRecord[] = docs.map((d) => {
         const data: any = d.data();
         return {
           id: d.id,
@@ -1489,7 +1487,7 @@ export default function KPIAnalysisScreen() {
         getDocs(query(collection(db, 'reworkRecords'), where('createdAt', '>=', fromTs), where('createdAt', '<=', toTs), orderBy('createdAt', 'desc'))),
         getDocs(query(collection(db, 'kaizenRecords'), where('createdAt', '>=', fromTs), where('createdAt', '<=', toTs), orderBy('createdAt', 'desc'))),
         getDocs(query(collection(db, 'pcsManHourRecords'), where('createdAt', '>=', fromTs), where('createdAt', '<=', toTs), orderBy('createdAt', 'asc'))),
-        getDocs(query(collection(db, 'productionRecords'), where('createdAt', '>=', fromTs), where('createdAt', '<=', toTs), orderBy('createdAt', 'asc'))),
+        fetchProductionRecordsForDateRange(fromDate, toDate),
       ]);
 
       const attendanceForExport: AttendanceRecord[] = attendanceSnap.docs
@@ -1683,7 +1681,7 @@ export default function KPIAnalysisScreen() {
         })
         .sort((a, b) => a.dateKey.localeCompare(b.dateKey));
 
-      const productionForExport: ProductionRecord[] = productionSnap.docs
+      const productionForExport: ProductionRecord[] = productionSnap
         .map((d) => {
           const data: any = d.data();
           return {
@@ -1834,7 +1832,7 @@ export default function KPIAnalysisScreen() {
   const rejectionByDate = useMemo(() => {
     const map = new Map<string, { produced: number; rejections: number }>();
     filteredRecords.forEach((r) => {
-      const key = r.productionDate ?? dateKeyFromMs(r.createdAtMs);
+      const key = recordProductionDayKey(r) ?? 'unknown';
       const produced = r.producedThisSlot ?? 0;
       const rejections = r.rejections ?? 0;
       const existing = map.get(key);
@@ -1862,7 +1860,7 @@ export default function KPIAnalysisScreen() {
   const lossByDate = useMemo(() => {
     const map = new Map<string, { plan: number; actual: number; downtimeMinutes: number }>();
     filteredRecords.forEach((r) => {
-      const key = r.productionDate ?? dateKeyFromMs(r.createdAtMs);
+      const key = recordProductionDayKey(r) ?? 'unknown';
       const plan = r.expectedParts ?? 0;
       const actual = r.producedThisSlot ?? 0;
       const downtime = (r.stopEvents ?? []).reduce((sum, se) => sum + (se.durationMinutes ?? 0), 0);

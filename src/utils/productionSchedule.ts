@@ -31,6 +31,29 @@ export const BREAKS: TimeInterval[] = [
   { start: 14 * 60, end: 14 * 60 + 10 },
 ];
 
+// Shift B's breaks, in its +1440 frame. Each is one interval, deducted only
+// from the minutes it overlaps — dinner straddles 10:00 PM, so it costs
+// 15 minutes in each of 9–10 PM and 10–11 PM (45 + 45), never 30 twice.
+export const SHIFT_B_DINNER_BREAK: TimeInterval = { start: 21 * 60 + 45, end: 22 * 60 + 15 };
+export const SHIFT_B_TEA_BREAK: TimeInterval = { start: 24 * 60 + 60 + 30, end: 24 * 60 + 60 + 40 };
+// Rejection clearance closes the regular shift: 3:20–3:30 AM, leaving
+// 3:00–3:30 AM with 20 productive minutes. Only applied without overtime —
+// with OT that slot becomes a full 3:00–4:00 AM hour, and whether the
+// clearance still applies there is not yet decided, so it keeps its
+// previous behaviour (no deduction).
+export const SHIFT_B_REJECTION_CLEARANCE: TimeInterval = { start: 24 * 60 + 3 * 60 + 20, end: SHIFT_B_END_ABS };
+// Overtime tea break, 4:30–4:40 AM — only reached when OT runs past 4:30.
+export const SHIFT_B_OT_TEA_BREAK: TimeInterval = { start: 24 * 60 + 4 * 60 + 30, end: 24 * 60 + 4 * 60 + 40 };
+
+function shiftBreaks(shift: ShiftCode, otHours: number): TimeInterval[] {
+  if (shift === 'A') return BREAKS;
+  return [
+    SHIFT_B_DINNER_BREAK,
+    SHIFT_B_TEA_BREAK,
+    ...(otHours > 0 ? [SHIFT_B_OT_TEA_BREAK] : [SHIFT_B_REJECTION_CLEARANCE]),
+  ];
+}
+
 // The first slot of a shift reserves its first 10 minutes for startup.
 export const STARTUP_RESERVE_MINUTES = 10;
 
@@ -136,12 +159,12 @@ export function shiftWindow(shift: ShiftCode, otHours: number): TimeInterval {
   return { start, end };
 }
 
-// Scheduled non-productive time for a shift: breaks and the first slot's
-// startup reserve. Overtime has no break of its own — 4–5 PM is a full
-// 60-minute slot.
+// Scheduled non-productive time for a shift: its breaks and the first
+// slot's startup reserve. Shift A's overtime has no break of its own — 4–5 PM
+// is a full 60-minute slot; Shift B's has the 4:30–4:40 AM tea break.
 export function scheduledNonProductive(shift: ShiftCode, otHours: number): TimeInterval[] {
   const { start } = shiftWindow(shift, otHours);
-  return [...BREAKS, { start, end: start + STARTUP_RESERVE_MINUTES }];
+  return [...shiftBreaks(shift, otHours), { start, end: start + STARTUP_RESERVE_MINUTES }];
 }
 
 // Productive minutes of one slot window: the window's own productive time,

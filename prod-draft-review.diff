@@ -1,0 +1,1683 @@
+diff --git a/package.json b/package.json
+index 6eb72d5..c7e1e27 100644
+--- a/package.json
++++ b/package.json
+@@ -48,6 +48,7 @@
+     "test:quality": "tsx scripts/testQualityMetrics.ts",
+     "test:live-quality": "tsx scripts/testLiveQuality.ts",
+     "test:downtime": "tsx scripts/testDowntime.ts",
++    "test:production-draft": "tsx scripts/testProductionDraft.ts",
+     "build": "expo export --platform web"
+   },
+   "private": true
+diff --git a/src/screens/RecordProductionScreen.tsx b/src/screens/RecordProductionScreen.tsx
+index 5af4326..c4865f5 100644
+--- a/src/screens/RecordProductionScreen.tsx
++++ b/src/screens/RecordProductionScreen.tsx
+@@ -52,9 +52,37 @@ import {
+   query,
+   where,
+   Timestamp,
++  onSnapshot,
++  runTransaction,
+ } from 'firebase/firestore';
++import AsyncStorage from '@react-native-async-storage/async-storage';
+ import { db } from '../services/firebase';
+ import { useAuthStore } from '../stores/authStore';
++import {
++  DraftScope,
++  ProductionSlotIdentity,
++  RestoreRecord,
++  SlotSegment,
++  StopLike,
++  SyncConflict,
++  SyncState,
++  createDraft,
++  createDraftStore,
++  createSessionWriteQueue,
++  emptySyncState,
++  fieldsForRecordUpdate,
++  isCompleteScope,
++  planSessionSync,
++  productionRecordId,
++  resolveRestore,
++  saveDraft,
++  serializeLossReasons,
++  serializeStops,
++  syncRetryDelayMs,
++  syncStatesEqual,
++  threeWayMerge,
++  withTimeout,
++} from '../utils/productionDraft';
+ import {
+   millisToProductionDayMinute,
+   productionDayKeyFor,
+@@ -176,6 +204,58 @@ interface ActiveSessionDoc {
+   // started before it existed — those keep the full-shift schedule.
+   productionStartMinutesAbs?: number | null; // same absolute-minute frame as the schedule
+   productionStartedAt?: any;                 // Timestamp of that instant on the production day
++  // Added for draft persistence / restore (all optional — older session
++  // docs don't have them):
++  lossReasonBySlot?: Record<string, { code: string; label: string; note: string | null }>;
++  savedSlotIndices?: number[];   // slots whose productionRecords write AND session sync succeeded
++  clientUpdatedAtMs?: number;    // device time of the last write (informational)
++  sessionInstanceId?: string;    // identifies this run of the line's session (draft scope)
++  // Multi-device sync (all optional — older session docs don't have them):
++  revision?: number;             // bumped by one on every sync (in a transaction)
++  syncConflicts?: Record<string, SyncConflict | null>; // values not kept in a merge (null = dismissed)
++  updatedBy?: { uid: string | null; deviceId: string | null };
++}
++
++// Thrown inside a sync transaction when the session doc is gone (finalized
++// elsewhere) or belongs to a new run of the line's session.
++class SessionGoneError extends Error {
++  constructor(public kind: 'finalized' | 'replaced') {
++    super(kind);
++  }
++}
++
++// A random id per app install (per browser profile on web), recorded on
++// syncs and conflicts so a supervisor can tell their devices apart.
++const DEVICE_ID_KEY = 'prodpulse.deviceId';
++let deviceIdPromise: Promise<string> | null = null;
++function getDeviceId(): Promise<string> {
++  deviceIdPromise ??= (async () => {
++    try {
++      const existing = await AsyncStorage.getItem(DEVICE_ID_KEY);
++      if (existing) return existing;
++      const id = `dev-${newSessionInstanceId()}`;
++      await AsyncStorage.setItem(DEVICE_ID_KEY, id);
++      return id;
++    } catch {
++      return `dev-${newSessionInstanceId()}`;
++    }
++  })();
++  return deviceIdPromise;
++}
++
++// Session-save timing: local draft shortly after the last change (cheap,
++// on-device), server write after a short pause so typing a number is one
++// write, not one per keystroke. A server write that hasn't settled in
++// SESSION_WRITE_TIMEOUT_MS is reported as not synced (the draft is kept).
++const DRAFT_SAVE_DEBOUNCE_MS = 300;
++const SESSION_SAVE_DEBOUNCE_MS = 1200;
++const SESSION_WRITE_TIMEOUT_MS = 15000;
++const RESTORE_RECORDS_TIMEOUT_MS = 10000;
++
++const draftStore = createDraftStore(AsyncStorage);
++
++function newSessionInstanceId() {
++  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+ }
+ 
+ // A start time entered more than this many minutes before "now" asks the
+@@ -187,26 +267,8 @@ const LATE_START_CONFIRM_MINUTES = 10;
+ // writing a slot that was already saved) updates that doc instead of adding
+ // another. A slot is identified by productionDate + lineId + shift +
+ // slotIndex + segment ('full' for a normal slot, 'before'/'after' for the
+-// two halves of a changeover slot).
+-
+-type SlotSegment = 'full' | 'before' | 'after';
+-
+-interface ProductionSlotIdentity {
+-  productionDate: string;
+-  lineId: string;
+-  shift: string;
+-  slotIndex: number;
+-  segment: SlotSegment;
+-}
+-
+-// Deterministic doc ID. Each part is URI-encoded, so it can never contain
+-// '/' (illegal in an ID) or the '|' separator — distinct identities can't
+-// collide.
+-function productionRecordId(id: ProductionSlotIdentity): string {
+-  return ['pr', id.productionDate, id.lineId, id.shift, String(id.slotIndex), id.segment]
+-    .map((v) => encodeURIComponent(v))
+-    .join('|');
+-}
++// two halves of a changeover slot). SlotSegment, ProductionSlotIdentity and
++// the deterministic productionRecordId() live in utils/productionDraft.
+ 
+ // Resolves the doc a slot should be written to, in order:
+ //   1. the canonical (deterministic-ID) doc, if it already exists;
+@@ -257,21 +319,25 @@ async function resolveProductionRecordRef(id: ProductionSlotIdentity) {
+ // time is kept on every later save); updatedAt is stamped every time.
+ // `resolved` caches which doc each slot resolved to, so later saves in the
+ // same session skip the lookup and always hit the same document.
++// `keepExistingWhenNull`: fields that, when null here, are left out of an
++// UPDATE so the stored value is kept (a new record still gets them as null).
+ async function upsertProductionRecord(
+   id: ProductionSlotIdentity,
+   data: Record<string, any>,
+-  resolved: Map<string, string>
++  resolved: Map<string, string>,
++  options: { keepExistingWhenNull?: string[] } = {}
+ ) {
+   const { createdAt: _createdAt, ...fields } = data;
++  const updateFields = fieldsForRecordUpdate(fields, options.keepExistingWhenNull);
+   const key = productionRecordId(id);
+   const cachedDocId = resolved.get(key);
+   if (cachedDocId) {
+-    await setDoc(doc(db, 'productionRecords', cachedDocId), { ...fields, updatedAt: serverTimestamp() }, { merge: true });
++    await setDoc(doc(db, 'productionRecords', cachedDocId), { ...updateFields, updatedAt: serverTimestamp() }, { merge: true });
+     return;
+   }
+   const { ref, exists } = await resolveProductionRecordRef(id);
+   if (exists) {
+-    await setDoc(ref, { ...fields, updatedAt: serverTimestamp() }, { merge: true });
++    await setDoc(ref, { ...updateFields, updatedAt: serverTimestamp() }, { merge: true });
+   } else {
+     await setDoc(ref, { ...fields, createdAt: serverTimestamp(), updatedAt: serverTimestamp() });
+   }
+@@ -688,6 +754,13 @@ export default function RecordProductionScreen() {
+   const [sessionLineId, setSessionLineId] = useState<string | null>(null); // lineId of the restored session
+   const [productionDate, setProductionDate] = useState<string | null>(null); // pinned production-day key (YYYY-MM-DD)
+   const [savedSlotIndices, setSavedSlotIndices] = useState<Set<number>>(new Set());
++  // Mirrors savedSlotIndices synchronously — every change goes through
++  // applySavedSlots, so a session snapshot built right after a save sees it.
++  const savedSlotIndicesRef = useRef<Set<number>>(new Set());
++  const applySavedSlots = (next: Set<number>) => {
++    savedSlotIndicesRef.current = next;
++    setSavedSlotIndices(next);
++  };
+   // Hourly cards the supervisor deleted for this session — deleted slots are
+   // excluded from planning (shiftPlannedTotal, partTargetSummary) and hidden
+   // from the card list. Only unsaved slots can be deleted (see
+@@ -771,23 +844,73 @@ export default function RecordProductionScreen() {
+   //     Dashboard — only ever called when canGoBack() is true.
+   // This is the single source of truth for every "leave/reset this screen"
+   // action: header back button, hardware back, and Finalize & End Session.
+-  const goBackToProduction = () => {
++  // Clears the active session from this screen (nothing is written).
++  const resetSessionState = () => {
++    clearSaveTimers();
++    setPhase('setup');
++    setSessionLineId(null);
++    setProducedBySlot({});
++    setRejectionsBySlot({});
++    setStopsBySlot({});
++    stopsBySlotRef.current = {};
++    setStopSync('idle');
++    pendingResumeRef.current = null;
++    setChangeovers({});
++    setProducedSegment({});
++    lossReasonBySlotRef.current = {};
++    setLossReasonBySlot({});
++    applySavedSlots(new Set());
++    setDeletedSlotIndices(new Set());
++    setProductionDate(null);
++    setSessionStartAbs(null);
++    setStartTimeText(defaultStartTimeText(selectedShift));
++    sessionInstanceRef.current = null;
++    confirmedRevisionRef.current = revisionRef.current;
++    setSessionSync('saved');
++    setRestoreNotice(null);
++    clearRetryTimer();
++    syncFailuresRef.current = 0;
++    serverBaseRef.current = null;
++    remoteEndedRef.current = null;
++    setRemoteEnded(null);
++    syncConflictsRef.current = {};
++    setSyncConflicts({});
++    setLastSyncedAtMs(null);
++  };
++
++  // Leaving an active session first pushes any unsaved change to the server
++  // (and waits for a save already in flight). If that fails, the entries
++  // stay in the on-device draft, and the supervisor decides whether to leave.
++  const leavingRef = useRef(false);
++  const goBackToProduction = async () => {
+     if (phase === 'active') {
+-      setPhase('setup');
+-      setSessionLineId(null);
+-      setProducedBySlot({});
+-      setRejectionsBySlot({});
+-      setStopsBySlot({});
+-      stopsBySlotRef.current = {};
+-      setStopSync('idle');
+-      pendingResumeRef.current = null;
+-      setChangeovers({});
+-      setProducedSegment({});
+-      setSavedSlotIndices(new Set());
+-      setDeletedSlotIndices(new Set());
+-      setProductionDate(null);
+-      setSessionStartAbs(null);
+-      setStartTimeText(defaultStartTimeText(selectedShift));
++      if (leavingRef.current) return;
++      // Ended on another device: nothing can be saved to it any more (the
++      // device draft keeps whatever hadn't synced).
++      if (remoteEndedRef.current) {
++        resetSessionState();
++        return;
++      }
++      if (savingSlotsRef.current.size > 0) {
++        notify('Slot still saving', 'Wait for the slot save to finish before leaving this session.');
++        return;
++      }
++      leavingRef.current = true;
++      try {
++        const ok = hasPendingChanges() ? await flushSessionNow() : true;
++        await sessionQueueRef.current.idle();
++        if (!ok) {
++          const leave = await confirmAsync(
++            'Changes not saved to server',
++            'Your latest entries could not be saved to the server, so other devices can\'t see them yet. They are kept on this device and will be synced when you reopen this session on this device. Leave anyway?',
++            'Leave'
++          );
++          if (!leave) return;
++        }
++        resetSessionState();
++      } finally {
++        leavingRef.current = false;
++      }
+       return;
+     }
+     if (navigation.canGoBack()) {
+@@ -826,6 +949,11 @@ export default function RecordProductionScreen() {
+   // Only populated once a shortfall (produced < expected) has actually been
+   // confirmed with a reason via the modal below.
+   const [lossReasonBySlot, setLossReasonBySlot] = useState<Record<string, LossReason | undefined>>({});
++  // Latest reasons, also updated synchronously by confirmLossReason so the
++  // save it resumes sees the reason just picked (state only updates on the
++  // next render, and the resumed callback is from an earlier one).
++  const lossReasonBySlotRef = useRef<Record<string, LossReason | undefined>>({});
++  lossReasonBySlotRef.current = lossReasonBySlot;
+   const [lossModalVisible, setLossModalVisible] = useState(false);
+   const [lossModalKey, setLossModalKey] = useState<string | null>(null);
+   const [lossModalAmount, setLossModalAmount] = useState(0);
+@@ -868,6 +996,51 @@ export default function RecordProductionScreen() {
+   const [startingProduction, setStartingProduction] = useState(false);
+   const [persistingSession, setPersistingSession] = useState(false);
+ 
++  // ── Session persistence (see persistSession / the autosave effect)
++  // Every write of activeSessions/{lineId} goes through this queue: one at a
++  // time, each built from the CURRENT state when it starts, so an older
++  // snapshot can never overwrite a newer one.
++  const sessionQueueRef = useRef(createSessionWriteQueue());
++  // Bumped on every change to persisted session data; confirmedRevisionRef
++  // is the highest revision the server has accepted. Pending = they differ.
++  const revisionRef = useRef(0);
++  const confirmedRevisionRef = useRef(0);
++  const sessionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
++  const draftTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
++  // activeSessions.sessionInstanceId (or `startedAt:<ms>` for older
++  // sessions) — part of the local draft's scope.
++  const sessionInstanceRef = useRef<string | null>(null);
++  // Set while Finalize runs: no session write may land during/after it.
++  const finalizingRef = useRef(false);
++  // Bumped whenever a session is started or restored; the autosave effect
++  // treats that render as "loaded", not as an edit (unless the restore
++  // merged in data the server doesn't have yet — syncAfterRestoreRef).
++  const [restoreToken, setRestoreToken] = useState(0);
++  const restoreTokenSeenRef = useRef(0);
++  const syncAfterRestoreRef = useRef(false);
++  const [sessionSync, setSessionSync] = useState<'saved' | 'pending' | 'error'>('saved');
++  const [restoreNotice, setRestoreNotice] = useState<string | null>(null);
++  const [restoringSession, setRestoringSession] = useState(false);
++  const openingSessionRef = useRef(false);
++
++  // ── Multi-device sync
++  // The server copy this device last synced (revision + data) — the base of
++  // the three-way merge when another device synced in between.
++  const serverBaseRef = useRef<{ revision: number; state: SyncState } | null>(null);
++  const deviceIdRef = useRef<string | null>(null);
++  useEffect(() => { getDeviceId().then((id) => { deviceIdRef.current = id; }); }, []);
++  const syncFailuresRef = useRef(0);
++  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
++  // Whether the last sync brought in changes from another device.
++  const lastSyncMergedRemoteRef = useRef(false);
++  const [lastSyncedAtMs, setLastSyncedAtMs] = useState<number | null>(null);
++  // Set once the session doc is finalized/replaced on another device.
++  const remoteEndedRef = useRef<'finalized' | 'replaced' | null>(null);
++  const [remoteEnded, setRemoteEnded] = useState<'finalized' | 'replaced' | null>(null);
++  const [syncConflicts, setSyncConflicts] = useState<Record<string, SyncConflict | null>>({});
++  const syncConflictsRef = useRef<Record<string, SyncConflict | null>>({});
++  syncConflictsRef.current = syncConflicts;
++
+   // ── Derived
+   // Every changeover's [start, end) interval. Legacy changeovers (recorded
+   // before manual entry) are an instant at atAbs.
+@@ -1048,6 +1221,20 @@ export default function RecordProductionScreen() {
+     [stopsBySlot]
+   );
+ 
++  // Everything a session write reads, refreshed every render. Session writes
++  // run from timers, the write queue and lifecycle listeners — reading this
++  // ref (never a render's closure) is what keeps them from writing stale data.
++  const latestRef = useRef({
++    phase, sessionLineId, selectedLineId, selectedLine, plant, workshop, division, selectedShift, otHours,
++    selectedPartIndex, supervisorName, supervisorCode, operators, producedBySlot, rejectionsBySlot, producedSegment,
++    allChangeovers, deletedSlotIndices, productionDate, shiftPlannedTotal, uid: user?.uid ?? null,
++  });
++  latestRef.current = {
++    phase, sessionLineId, selectedLineId, selectedLine, plant, workshop, division, selectedShift, otHours,
++    selectedPartIndex, supervisorName, supervisorCode, operators, producedBySlot, rejectionsBySlot, producedSegment,
++    allChangeovers, deletedSlotIndices, productionDate, shiftPlannedTotal, uid: user?.uid ?? null,
++  };
++
+   const filteredLines = useMemo(() => {
+     return allLines.filter((l) => {
+       if (plant && l.plant && String(l.plant).toLowerCase() !== String(plant).toLowerCase()) return false;
+@@ -1240,11 +1427,15 @@ export default function RecordProductionScreen() {
+     if (!selectedLineId) return;
+     (async () => {
+       try {
++        // Already showing this session (e.g. restoreSession just set this
++        // same line) — don't load and restore it a second time.
++        const cur = latestRef.current;
++        if (cur.phase === 'active' && cur.sessionLineId === selectedLineId) return;
+         const snap = await getDoc(doc(db, 'activeSessions', selectedLineId));
+         if (!mounted) return;
+         if (snap.exists()) {
+           const sd = snap.data() as ActiveSessionDoc;
+-          restoreSession(sd, allLines, snap.id);
++          await openSession(sd, snap.id);
+         }
+       } catch (e) {
+         console.error('[restore on select] ', e);
+@@ -1265,51 +1456,171 @@ export default function RecordProductionScreen() {
+         loadActiveSessions();
+         return;
+       }
+-      restoreSession(snap.data() as ActiveSessionDoc, allLines, snap.id);
++      await openSession(snap.data() as ActiveSessionDoc, snap.id);
+     } catch (e) {
+       console.error('[continueSession]', e);
+       Alert.alert('Could not open session', 'The latest session data could not be loaded. Check your connection and try again.');
+     }
+   };
+ 
+-  function restoreSession(sd: ActiveSessionDoc, lineList: Line[], docId: string) {
++  // The production date a stored session belongs to (same rule restoreSession
++  // pins): its stored productionDate, else derived from its startedAt.
++  function storedSessionProductionDate(sd: ActiveSessionDoc): string | null {
++    return resolveSessionProductionDate({ storedDate: (sd as any).productionDate, startedAt: sd.startedAt });
++  }
++
++  type RestorePlan = {
++    state: SyncState;
++    base: SyncState;
++    baseRevision: number;
++    sessionInstance: string | null;
++    needsSync: boolean;
++    notice: string | null;
++  };
++
++  // Opens a stored session: loads this device's draft and the session's saved
++  // productionRecords FIRST, merges them (precedence: see
++  // utils/productionDraft resolveRestore), and only then shows the session —
++  // so nothing loaded late can overwrite what the supervisor types. Opening
++  // never writes production records.
++  async function openSession(sd: ActiveSessionDoc, docId: string) {
++    const cur = latestRef.current;
++    if (cur.phase === 'active' && cur.sessionLineId === docId) return;
++    if (openingSessionRef.current) return;
++    openingSessionRef.current = true;
++    setRestoringSession(true);
++    try {
++      let plan: RestorePlan | null = null;
++      try {
++        plan = await loadRestorePlan(sd, docId);
++      } catch (e) {
++        console.warn('[openSession] could not merge draft / saved records — opening the server copy as is', e);
++      }
++      restoreSession(sd, allLines, docId, plan);
++    } finally {
++      openingSessionRef.current = false;
++      setRestoringSession(false);
++    }
++  }
++
++  async function loadRestorePlan(sd: ActiveSessionDoc, docId: string): Promise<RestorePlan> {
++    const pd = storedSessionProductionDate(sd);
++    const startedAtMs = timestampToMillis(sd.startedAt);
++    const sessionInstance = sd.sessionInstanceId ?? (startedAtMs != null ? `startedAt:${startedAtMs}` : null);
++    const scope: Partial<DraftScope> = {
++      uid: user?.uid ?? undefined, lineId: docId, productionDate: pd ?? undefined, shift: sd.shift, sessionInstance: sessionInstance ?? undefined,
++    };
++
++    // 1. This device's draft for exactly this user/line/date/shift/session.
++    //    (Another device's drafts are never here — only its synced data is.)
++    let draft = null;
++    if (isCompleteScope(scope)) {
++      const loaded = await draftStore.load(scope);
++      if (loaded.ok) draft = loaded.draft;
++      else if (loaded.reason !== 'missing') console.warn('[restore] local draft ignored:', loaded.reason);
++    }
++
++    // 2. Saved records of this line + date + shift (read only).
++    let records: RestoreRecord[] | null = null;
++    if (pd) {
++      try {
++        const snap = await withTimeout(
++          getDocs(query(
++            collection(db, 'productionRecords'),
++            where('productionDate', '==', pd),
++            where('lineId', '==', sd.lineId ?? docId),
++            where('shift', '==', sd.shift)
++          )),
++          RESTORE_RECORDS_TIMEOUT_MS,
++          'loading saved slots'
++        );
++        records = snap.docs.map((d) => {
++          const r: any = d.data();
++          const seg = r.partSegment === 'before' || r.partSegment === 'after' ? r.partSegment : null;
++          return {
++            id: d.id,
++            slotIndex: typeof r.slotIndex === 'number' ? r.slotIndex : null,
++            partSegment: seg,
++            producedThisSlot: typeof r.producedThisSlot === 'number' ? r.producedThisSlot : null,
++            rejections: typeof r.rejections === 'number' ? r.rejections : null,
++            lossReasonCode: r.lossReasonCode ?? null,
++            lossReasonLabel: r.lossReasonLabel ?? null,
++            lossReasonNote: r.lossReasonNote ?? null,
++            createdAtMs: timestampToMillis(r.createdAt),
++            updatedAtMs: timestampToMillis(r.updatedAt),
++          };
++        });
++      } catch (e) {
++        console.warn('[restore] saved slot records could not be loaded', e);
++      }
++    }
++
++    // Slots a set of changeovers splits into BEFORE/AFTER — the same rule as
++    // the `changeovers` memo (a changeover on a slot's start doesn't split).
++    const storedStart = typeof sd.productionStartMinutesAbs === 'number' ? sd.productionStartMinutesAbs : null;
++    const splitSlotsFor = (cos: SyncState['changeovers']) => {
++      const list = Object.values(cos).filter(Boolean) as unknown as ChangeoverInfo[];
++      const intervals = list.map((co) => ({ start: co.startAbs ?? co.atAbs, end: co.endAbs ?? co.atAbs }));
++      const sched = buildSlots(sd.shift, sd.otHours ?? 0, intervals, storedStart);
++      const split = new Set<number>();
++      for (const co of list) {
++        const slot = sched.find((s) => s.index === co.slotIndex);
++        if (slot && !isChangeoverAtSlotStart(slot, { start: co.startAbs ?? co.atAbs, end: co.endAbs ?? co.atAbs })) split.add(co.slotIndex);
++      }
++      return split;
++    };
++
++    const server = syncStateFromDoc(sd);
++    const serverRevision = typeof sd.revision === 'number' ? sd.revision : 0;
++    const r = resolveRestore({
++      server,
++      serverRevision,
++      draft,
++      records,
++      identity: { productionDate: pd ?? '', lineId: sd.lineId ?? docId, shift: sd.shift },
++      sessionStartedAtMs: startedAtMs,
++      splitSlotsFor,
++      deviceId: deviceIdRef.current,
++      nowMs: Date.now(),
++    });
++    // A draft with nothing beyond the server copy is done with.
++    if (draft && !r.draftApplied && isCompleteScope(scope)) draftStore.retire(scope, Number.MAX_SAFE_INTEGER);
++
++    const notices: string[] = [];
++    if (r.draftApplied) {
++      notices.push(r.conflicts.length
++        ? `Recovered unsynced entries from this device. ${r.conflicts.length} clashed with newer changes from another device — the newer values were kept (see below).`
++        : 'Recovered entries saved on this device that had not reached the server.');
++    }
++    if (r.filledFromRecords > 0) notices.push('Filled missing values from saved slot records.');
++    if (pd && records == null) notices.push('Saved-slot status could not be checked (offline?) — shown as last stored.');
++    return {
++      state: r.state, base: r.base, baseRevision: r.baseRevision, sessionInstance,
++      needsSync: r.needsSync, notice: notices.join(' ') || null,
++    };
++  }
++
++  // plan: the merged draft/record data from loadRestorePlan; null restores
++  // the session doc exactly as stored.
++  function restoreSession(sd: ActiveSessionDoc, lineList: Line[], docId: string, plan: RestorePlan | null = null) {
+     setPlant(sd.plant);
+     setWorkshop(sd.workshop);
+     setDivision(sd.division);
+     setSelectedShift(sd.shift);
+-    setOtHours(sd.otHours);
+     setSelectedLineId(sd.lineId);
+     setSelectedPartIndex(sd.selectedPartIndex);
+     setSupervisorName(sd.supervisorName);
+     setSupervisorCode(sd.supervisorCode);
+-    setOperators(sd.operators?.length ? sd.operators : [{ id: 'op-restored', name: '', code: '' }]);
+-
+-    // Convert string keys back to number keys
+-    const cumNum: Record<number, number | null> = {};
+-    Object.entries(sd.producedBySlot ?? {}).forEach(([k, v]) => { cumNum[Number(k)] = v; });
+-    setProducedBySlot(cumNum);
+-
+-    // Rejections are keyed by string (plain slot index, or a
+-    // '<slot>:before' / '<slot>:after' segment key) both in Firestore and
+-    // locally, so copy as-is — Number(k) would turn a segment key into NaN.
+-    setRejectionsBySlot({ ...(sd.rejectionsBySlot ?? {}) });
+-
+-    const stopsNum: Record<number, StopEvent[]> = {};
+-    Object.entries(sd.stopsBySlot ?? {}).forEach(([k, v]) => { stopsNum[Number(k)] = Array.isArray(v) ? v : []; });
+-    // A running stop comes back with its original persisted startAbs, so
+-    // the timer continues from the real stop time, not from app launch.
+-    stopsBySlotRef.current = stopsNum;
+-    setStopsBySlot(stopsNum);
++
++    // Slot values, stops, OT, operators: the merged plan when there is one,
++    // else the doc as stored. A running stop comes back with its original
++    // persisted startAbs, so the timer continues from the real stop time.
++    const server = syncStateFromDoc(sd);
++    applySyncStateToScreen(plan?.state ?? server, !!plan?.needsSync);
++    if (!(plan?.state ?? server).operators.length) setOperators([{ id: 'op-restored', name: '', code: '' }]);
+     setStopSync('idle');
+     pendingResumeRef.current = null;
+ 
+-    const coNum: Record<number, ChangeoverInfo | null> = {};
+-    Object.entries(sd.changeovers ?? {}).forEach(([k, v]) => { coNum[Number(k)] = v; });
+-    setChangeovers(coNum);
+-
+-    setProducedSegment(sd.producedSegment ?? {});
+-    setDeletedSlotIndices(new Set(sd.deletedSlotIndices ?? []));
+-
+     // The start time stored when the session began — never re-derived from
+     // the clock. Legacy sessions without it keep the full-shift schedule.
+     const storedStart = sd.productionStartMinutesAbs;
+@@ -1335,45 +1646,175 @@ export default function RecordProductionScreen() {
+         .catch((e) => console.error('[restoreSession] failed to pin productionDate', e));
+     }
+ 
++    const startedAtMs = timestampToMillis(sd.startedAt);
++    sessionInstanceRef.current = plan?.sessionInstance ?? sd.sessionInstanceId ?? (startedAtMs != null ? `startedAt:${startedAtMs}` : null);
++    // The server copy this device is now based on — the base of its next
++    // sync's merge.
++    serverBaseRef.current = {
++      revision: plan?.baseRevision ?? (typeof sd.revision === 'number' ? sd.revision : 0),
++      state: plan?.base ?? server,
++    };
++    // Nothing is pending for the data just loaded — unless the merge brought
++    // in values the server copy lacks, which the autosave then writes back.
++    clearSaveTimers();
++    clearRetryTimer();
++    syncFailuresRef.current = 0;
++    remoteEndedRef.current = null;
++    setRemoteEnded(null);
++    confirmedRevisionRef.current = revisionRef.current;
++    setSessionSync('saved');
++    setLastSyncedAtMs(Date.now());
++    setRestoreNotice(plan?.notice ?? null);
++
+     setSessionLineId(docId);
+     setPhase('active');
+   }
+ 
++  // A session doc → the SyncState it holds.
++  function syncStateFromDoc(d: ActiveSessionDoc): SyncState {
++    return {
++      producedBySlot: { ...(d.producedBySlot ?? {}) },
++      producedSegment: { ...(d.producedSegment ?? {}) },
++      rejectionsBySlot: { ...(d.rejectionsBySlot ?? {}) },
++      lossReasonBySlot: serializeLossReasons(d.lossReasonBySlot ?? {}),
++      changeovers: { ...((d.changeovers ?? {}) as unknown as SyncState['changeovers']) },
++      deletedSlotIndices: [...(d.deletedSlotIndices ?? [])],
++      savedSlotIndices: [...(d.savedSlotIndices ?? [])],
++      stopsBySlot: serializeStops((d.stopsBySlot ?? {}) as Record<string, StopLike[]>),
++      otHours: typeof d.otHours === 'number' ? d.otHours : 0,
++      operators: Array.isArray(d.operators) ? d.operators : [],
++      syncConflicts: { ...(d.syncConflicts ?? {}) },
++    };
++  }
++
++  // Puts a SyncState on screen. Refs (and latestRef) are updated at once, so
++  // a sync that starts before the next render already sees it. The render it
++  // causes is not treated as an edit by the autosave, unless `syncAfter`.
++  function applySyncStateToScreen(s: SyncState, syncAfter = false) {
++    const produced: Record<number, number | null> = {};
++    Object.entries(s.producedBySlot).forEach(([k, v]) => { produced[Number(k)] = v; });
++    const stops: Record<number, StopEvent[]> = {};
++    Object.entries(s.stopsBySlot).forEach(([k, v]) => { stops[Number(k)] = Array.isArray(v) ? (v as StopEvent[]) : []; });
++    const cos: Record<number, ChangeoverInfo | null> = {};
++    Object.entries(s.changeovers).forEach(([k, v]) => { cos[Number(k)] = v as unknown as ChangeoverInfo | null; });
++    const reasons: Record<string, LossReason> = {};
++    Object.entries(s.lossReasonBySlot).forEach(([k, r]) => {
++      if (r?.code) reasons[k] = { code: r.code, label: r.label ?? r.code, ...(r.note ? { note: r.note } : {}) };
++    });
++    const operatorsNext = s.operators.length ? (s.operators as Operator[]) : latestRef.current.operators;
++
++    latestRef.current = {
++      ...latestRef.current,
++      producedBySlot: produced,
++      producedSegment: { ...s.producedSegment },
++      rejectionsBySlot: { ...s.rejectionsBySlot },
++      allChangeovers: cos,
++      deletedSlotIndices: new Set(s.deletedSlotIndices),
++      otHours: s.otHours,
++      operators: operatorsNext,
++    };
++    lossReasonBySlotRef.current = reasons;
++    stopsBySlotRef.current = stops;
++    syncConflictsRef.current = { ...s.syncConflicts };
++
++    setProducedBySlot(produced);
++    setProducedSegment({ ...s.producedSegment });
++    setRejectionsBySlot({ ...s.rejectionsBySlot });
++    setLossReasonBySlot(reasons);
++    setChangeovers(cos);
++    setDeletedSlotIndices(new Set(s.deletedSlotIndices));
++    applySavedSlots(new Set(s.savedSlotIndices));
++    setStopsBySlot(stops);
++    setOtHours(s.otHours);
++    setOperators(operatorsNext);
++    setSyncConflicts({ ...s.syncConflicts });
++    syncAfterRestoreRef.current = syncAfter;
++    setRestoreToken((t) => t + 1);
++  }
++
+   // ─────────────────────────────────────────────────────────────────────────────
+-  // PERSIST SESSION to Firestore whenever production data changes
+-  // (unchanged except it will now be used to "save session" without deleting)
++  // SYNC SESSION with Firestore (activeSessions/{lineId})
++  //
++  // Every write goes through sessionQueueRef (one at a time, in order) and is
++  // built when it STARTS, from latestRef / the stop, reason and saved-slot
++  // refs — never from the calling render's closure. The on-device draft is
++  // written first, so entries survive a failed or unfinished server write.
++  //
++  // The write is a transaction on the session doc's `revision`: if the
++  // server is still at the revision this device last synced, this device's
++  // state is written as is; if another device synced in between, the two are
++  // three-way merged against that last-synced copy (utils/productionDraft
++  // threeWayMerge) — the server value is kept on a clash and the other value
++  // is preserved in syncConflicts. Either way revision + 1 is written and the
++  // merged result is put on screen. A transaction never runs offline, so an
++  // old offline write can never land later over newer data; failed syncs
++  // retry with backoff and when the device comes back online.
++  //
++  // overrideStops: stop & resume write their next stops explicitly; the
++  // stops on screen are only replaced by the synced result once it succeeds.
++  // extraSavedSlots / preferLocalKeys: Save Slot's slot is marked saved, and
++  // its explicitly saved values win any clash.
+   // Resolves true once Firestore has accepted the write, false if it failed.
+   // ─────────────────────────────────────────────────────────────────────────────
+ 
+-    const persistSession = async (
+-    overrideStops?: Record<number, StopEvent[]>,
+-    lineStopped?: boolean
+-  ): Promise<boolean> => {
+-    // require a selected line id
+-    if (!selectedLineId) return false;
++  function currentSyncState(extraSavedSlots: number[] = [], overrideStops?: Record<number, StopEvent[]>): SyncState {
++    const L = latestRef.current;
++    const producedBySlot: Record<string, number | null> = {};
++    Object.entries(L.producedBySlot).forEach(([k, v]) => { producedBySlot[k] = v; });
++    const changeovers: SyncState['changeovers'] = {};
++    Object.entries(L.allChangeovers).forEach(([k, v]) => { changeovers[k] = v as unknown as Record<string, unknown> | null; });
++    const stops: Record<string, StopLike[]> = {};
++    Object.entries(overrideStops ?? stopsBySlotRef.current).forEach(([k, v]) => { stops[k] = v; });
++    return {
++      producedBySlot,
++      producedSegment: { ...L.producedSegment },
++      rejectionsBySlot: { ...L.rejectionsBySlot },
++      lossReasonBySlot: serializeLossReasons(lossReasonBySlotRef.current),
++      changeovers,
++      deletedSlotIndices: Array.from(L.deletedSlotIndices).sort((a, b) => a - b),
++      savedSlotIndices: Array.from(new Set([...savedSlotIndicesRef.current, ...extraSavedSlots])).sort((a, b) => a - b),
++      stopsBySlot: serializeStops(stops),
++      otHours: L.otHours,
++      operators: L.operators.map((o) => ({ id: o.id, name: o.name, code: o.code })),
++      syncConflicts: { ...syncConflictsRef.current },
++    };
++  }
+ 
+-    // Stops come from the ref, not this render's state: many callers run
+-    // persistSession from a setTimeout closure, and an older render's
+-    // stopsBySlot would otherwise overwrite a stop/resume saved since.
+-    const stopsToSave = overrideStops ?? stopsBySlotRef.current;
+-    const stopped = lineStopped ?? isAnyStopRunning(stopsToSave);
++  // Draft scope of the session on screen, or null when there is none (no
++  // signed-in user, setup phase, or no pinned date yet).
++  function currentDraftScope(): DraftScope | null {
++    const L = latestRef.current;
++    const scope = {
++      uid: L.uid ?? undefined,
++      lineId: L.sessionLineId ?? undefined,
++      productionDate: L.productionDate ?? undefined,
++      shift: L.selectedShift,
++      sessionInstance: sessionInstanceRef.current ?? undefined,
++    };
++    return L.phase === 'active' && isCompleteScope(scope) ? scope : null;
++  }
+ 
+-    setPersistingSession(true);
++  function buildDraft(local: SyncState = currentSyncState(), revision = revisionRef.current) {
++    const scope = currentDraftScope();
++    const base = serverBaseRef.current;
++    return scope && base ? createDraft(scope, base.state, base.revision, local, Date.now(), revision) : null;
++  }
+ 
+-    // Convert number keys → string for Firestore
+-    const cumStr: Record<string, number | null> = {};
+-    Object.entries(producedBySlot).forEach(([k, v]) => { cumStr[k] = v; });
+-    const rejStr: Record<string, number> = {};
+-    Object.entries(rejectionsBySlot).forEach(([k, v]) => { rejStr[k] = v; });
+-    const stopsStr: Record<string, StopEvent[]> = {};
+-    Object.entries(stopsToSave).forEach(([k, v]) => { stopsStr[k] = v; });
+-    const coStr: Record<string, ChangeoverInfo | null> = {};
+-    Object.entries(allChangeovers).forEach(([k, v]) => { coStr[k] = v; });
+-
+-    // Compute downtime per-slot and totals. For running stops, use nowMs for end.
++  async function writeLocalDraftNow(local: SyncState = currentSyncState(), revision = revisionRef.current): Promise<boolean> {
++    const draft = buildDraft(local, revision);
++    if (!draft) return false;
++    const ok = await draftStore.save(draft);
++    if (!ok) console.warn('[draft] could not save the on-device copy');
++    return ok;
++  }
++
++  // The activeSessions fields written for a synced state.
++  function sessionPayload(s: SyncState, revision: number): Record<string, any> {
++    const L = latestRef.current;
++    // Downtime per slot and in total; a running stop counts up to now.
+     const stopsSummaryBySlot: Record<string, { totalDowntimeMinutes: number; stopCount: number }> = {};
+     let totalDowntimeMinutes = 0;
+-    Object.entries(stopsToSave).forEach(([k, arr]) => {
++    Object.entries(s.stopsBySlot).forEach(([k, arr]) => {
+       let ms = 0;
+       arr.forEach((ev) => {
+         const end = ev.endAbs ?? (ev.running ? Date.now() : undefined);
+@@ -1384,74 +1825,413 @@ export default function RecordProductionScreen() {
+       totalDowntimeMinutes += minutes;
+     });
+     totalDowntimeMinutes = Math.round(totalDowntimeMinutes);
++    const totalRejections = Object.values(s.rejectionsBySlot).reduce((sum, v) => sum + (v ?? 0), 0);
+ 
+-    // Total rejections across slots
+-    const totalRejections = Object.values(rejectionsBySlot).reduce((s, v) => s + (v ?? 0), 0);
+-
+-    const sessionData: Omit<ActiveSessionDoc, 'startedAt'> & { startedAt?: any; updatedAt: any } & {
+-      totalDowntimeMinutes: number;
+-      totalRejections: number;
+-      stopsSummaryBySlot: Record<string, { totalDowntimeMinutes: number; stopCount: number }>;
+-    } = {
+-      lineId: selectedLineId,
+-      lineName: selectedLine?.lineName ?? null,
++    return {
++      lineId: L.selectedLineId,
++      lineName: L.selectedLine?.lineName ?? null,
+       // BUG FIX: use the selected line's own plant/workshop/division rather
+       // than the Plant/Workshop/Division filter chips used to narrow the Line
+       // list. Those chips are often left on "Any" once the supervisor knows
+       // which line to pick, which was silently writing null location data
+       // onto every record/session for that line.
+-      plant: selectedLine?.plant ?? plant ?? null,
+-      workshop: selectedLine?.workshop ?? workshop ?? null,
+-      division: selectedLine?.division ?? division ?? null,
+-      shift: selectedShift,
+-      otHours,
+-      selectedPartIndex,
+-      supervisorName,
+-      supervisorCode,
+-      supervisorUid: user?.uid ?? null,
+-      operators,
+-      producedBySlot: cumStr,
+-      rejectionsBySlot: rejStr,
+-      stopsBySlot: stopsStr,
+-      changeovers: coStr,
+-      producedSegment,
+-      deletedSlotIndices: Array.from(deletedSlotIndices),
+-      lineStopped: stopped,
++      plant: L.selectedLine?.plant ?? L.plant ?? null,
++      workshop: L.selectedLine?.workshop ?? L.workshop ?? null,
++      division: L.selectedLine?.division ?? L.division ?? null,
++      shift: L.selectedShift,
++      otHours: s.otHours,
++      selectedPartIndex: L.selectedPartIndex,
++      supervisorName: L.supervisorName,
++      supervisorCode: L.supervisorCode,
++      supervisorUid: L.uid,
++      operators: s.operators,
++      producedBySlot: s.producedBySlot,
++      rejectionsBySlot: s.rejectionsBySlot,
++      stopsBySlot: s.stopsBySlot,
++      changeovers: s.changeovers,
++      producedSegment: s.producedSegment,
++      deletedSlotIndices: s.deletedSlotIndices,
++      lossReasonBySlot: s.lossReasonBySlot,
++      savedSlotIndices: s.savedSlotIndices,
++      syncConflicts: s.syncConflicts,
++      lineStopped: isAnyStopRunning(s.stopsBySlot),
++      revision,
++      clientUpdatedAtMs: Date.now(),
++      updatedBy: { uid: L.uid, deviceId: deviceIdRef.current },
+       updatedAt: serverTimestamp(),
+ 
+       // new structured summaries. productionDate is deliberately NOT part
+       // of this payload — it's pinned when the session starts and an update
+       // must never overwrite it (see the create branch below).
+-      plannedProductionTotal: shiftPlannedTotal,
++      plannedProductionTotal: L.shiftPlannedTotal,
+       totalDowntimeMinutes,
+       totalRejections,
+       stopsSummaryBySlot,
+     };
++  }
++
++  async function writeSessionNow(
++    overrideStops?: Record<number, StopEvent[]>,
++    extraSavedSlots: number[] = [],
++    preferLocalKeys?: Set<string>
++  ): Promise<boolean> {
++    const L = latestRef.current;
++    // Nothing to write outside an active session (e.g. a timer that outlived
++    // a reset), while/after Finalize, or once the session ended elsewhere.
++    if (finalizingRef.current || remoteEndedRef.current || L.phase !== 'active') return false;
++    // require a selected line id
++    if (!L.selectedLineId) return false;
++
++    const revision = revisionRef.current;
++    const local = currentSyncState(extraSavedSlots, overrideStops);
++    // Device copy first: survives a failed or never-finished server write.
++    await writeLocalDraftNow(local, revision);
+ 
+-    const docRef = doc(db, 'activeSessions', sessionLineId ?? selectedLineId);
++    setPersistingSession(true);
++    const docRef = doc(db, 'activeSessions', L.sessionLineId ?? L.selectedLineId);
++    const base = serverBaseRef.current;
++    let outcome: { merged: SyncState; revision: number; conflicts: number } | null = null;
+     try {
+-      if (!sessionLineId) {
++      if (!L.sessionLineId) {
+         // create doc (set startedAt and productionDate only first time) —
+         // this is a genuinely new session, so its production day is pinned
+         // here, from now.
+-        const pd = productionDate ?? productionDayKeyFor(Date.now());
+-        await setDoc(docRef, { ...sessionData, productionDate: pd, startedAt: serverTimestamp() });
+-        setSessionLineId(selectedLineId);
++        const pd = L.productionDate ?? productionDayKeyFor(Date.now());
++        await withTimeout(setDoc(docRef, { ...sessionPayload(local, 1), productionDate: pd, startedAt: serverTimestamp() }), SESSION_WRITE_TIMEOUT_MS, 'session save');
++        setSessionLineId(L.selectedLineId);
+         setProductionDate(pd);
+         sessionStartedAtMsRef.current = Date.now();
++        outcome = { merged: local, revision: 1, conflicts: 0 };
+       } else {
+-        // update existing
+-        await updateDoc(docRef, sessionData as any);
++        const instance = sessionInstanceRef.current;
++        await withTimeout(runTransaction(db, async (tx) => {
++          const snap = await tx.get(docRef);
++          if (!snap.exists()) throw new SessionGoneError('finalized');
++          const remoteDoc = snap.data() as ActiveSessionDoc;
++          if (instance && remoteDoc.sessionInstanceId && remoteDoc.sessionInstanceId !== instance) throw new SessionGoneError('replaced');
++          // Merged only if another device synced since this device's last sync.
++          const plan = planSessionSync(
++            base,
++            local,
++            { revision: typeof remoteDoc.revision === 'number' ? remoteDoc.revision : 0, state: syncStateFromDoc(remoteDoc) },
++            { preferLocalKeys, deviceId: deviceIdRef.current, nowMs: Date.now() }
++          );
++          tx.update(docRef, sessionPayload(plan.merged, plan.revision));
++          outcome = { merged: plan.merged, revision: plan.revision, conflicts: plan.conflicts.length };
++        }), SESSION_WRITE_TIMEOUT_MS, 'session save');
+       }
+-      return true;
+     } catch (e) {
++      setPersistingSession(false);
++      if (e instanceof SessionGoneError) {
++        handleRemoteEnded(e.kind);
++        return false;
++      }
+       console.error('[persistSession] error', e);
++      syncFailuresRef.current += 1;
++      setSessionSync('error');
++      scheduleSyncRetry();
+       return false;
+-    } finally {
+-      setPersistingSession(false);
+     }
++    setPersistingSession(false);
++    const done = outcome as unknown as { merged: SyncState; revision: number; conflicts: number };
++
++    serverBaseRef.current = { revision: done.revision, state: done.merged };
++    confirmedRevisionRef.current = Math.max(confirmedRevisionRef.current, revision);
++    syncFailuresRef.current = 0;
++    clearRetryTimer();
++    setLastSyncedAtMs(Date.now());
++    // Bring what the merge took from other devices onto the screen —
++    // without undoing anything typed here while the sync was running.
++    lastSyncMergedRemoteRef.current = !syncStatesEqual(done.merged, local);
++    if (lastSyncMergedRemoteRef.current) {
++      const current = currentSyncState(extraSavedSlots);
++      const next = threeWayMerge(local, current, done.merged, {
++        prefer: 'local', recordConflicts: false, deviceId: deviceIdRef.current, nowMs: Date.now(),
++      }).merged;
++      if (overrideStops) next.stopsBySlot = done.merged.stopsBySlot;
++      applySyncStateToScreen(next);
++      if (done.conflicts > 0) setRestoreNotice(`${done.conflicts} change(s) clashed with newer edits from another device — the newer values were kept (see below).`);
++    } else if (overrideStops) {
++      // Stop / Resume: the stops just synced are now the ones on screen.
++      const stops: Record<number, StopEvent[]> = {};
++      Object.entries(done.merged.stopsBySlot).forEach(([k, v]) => { stops[Number(k)] = v as StopEvent[]; });
++      stopsBySlotRef.current = stops;
++      setStopsBySlot(stops);
++    }
++    if (confirmedRevisionRef.current >= revisionRef.current && !sessionTimerRef.current) setSessionSync('saved');
++    // The server has everything up to `revision` — drop the device copy
++    // unless a newer edit has been written to it since.
++    const scope = currentDraftScope();
++    if (scope) draftStore.retire(scope, revision);
++    return true;
++  }
++
++  // lineStopped is kept for the existing callers; it is now derived from the
++  // synced stops themselves.
++  const persistSession = (
++    overrideStops?: Record<number, StopEvent[]>,
++    _lineStopped?: boolean,
++    extraSavedSlots?: number[],
++    preferLocalKeys?: Set<string>
++  ): Promise<boolean> => {
++    if (overrideStops || extraSavedSlots) {
++      // An explicit change (stop / resume / slot saved) — pending until synced.
++      revisionRef.current += 1;
++      setSessionSync('pending');
++      return sessionQueueRef.current.explicit(() => writeSessionNow(overrideStops, extraSavedSlots, preferLocalKeys));
++    }
++    return sessionQueueRef.current.latest(() => writeSessionNow());
++  };
++
++  function clearSaveTimers() {
++    if (sessionTimerRef.current) { clearTimeout(sessionTimerRef.current); sessionTimerRef.current = null; }
++    if (draftTimerRef.current) { clearTimeout(draftTimerRef.current); draftTimerRef.current = null; }
++  }
++
++  function clearRetryTimer() {
++    if (retryTimerRef.current) { clearTimeout(retryTimerRef.current); retryTimerRef.current = null; }
++  }
++
++  // After a failed sync: try again after 5s, 10s, 20s, 40s, then every 60s
++  // while changes are pending (sooner when the device comes back online —
++  // see the lifecycle effect).
++  function scheduleSyncRetry() {
++    if (retryTimerRef.current || remoteEndedRef.current) return;
++    retryTimerRef.current = setTimeout(() => {
++      retryTimerRef.current = null;
++      if (hasPendingChanges()) persistSession();
++    }, syncRetryDelayMs(syncFailuresRef.current));
++  }
++
++  function retrySyncNow() {
++    if (!hasPendingChanges() || remoteEndedRef.current) return;
++    clearRetryTimer();
++    persistSession();
++  }
++
++  function hasPendingChanges() {
++    return revisionRef.current > confirmedRevisionRef.current || !!sessionTimerRef.current;
++  }
++
++  // Writes now instead of after the debounce (blur, background, leaving).
++  // The device draft is written straight away too — the server write may
++  // have to wait for one already in flight.
++  function flushSessionNow(): Promise<boolean> {
++    clearSaveTimers();
++    writeLocalDraftNow();
++    return persistSession();
++  }
++
++  function flushIfPending() {
++    if (hasPendingChanges()) flushSessionNow();
++  }
++
++  // The session doc was deleted (finalized on another device) or replaced
++  // by a new session: stop syncing, keep this device's draft, and say so.
++  function handleRemoteEnded(kind: 'finalized' | 'replaced') {
++    if (remoteEndedRef.current || finalizingRef.current) return;
++    remoteEndedRef.current = kind;
++    setRemoteEnded(kind);
++    clearSaveTimers();
++    clearRetryTimer();
++    const unsynced = hasPendingChanges();
++    notify(
++      kind === 'finalized' ? 'Session finalized on another device' : 'Session replaced on another device',
++      (unsynced
++        ? 'Entries made on this device that had not synced yet are NOT part of that session\'s records. They are still shown here and kept on this device. '
++        : '') + 'This screen no longer saves. Go back to continue.'
++    );
++  }
++
++  // Autosave: any change to the session's synced data saves the device
++  // draft almost at once and the server copy after a short pause. Stops are
++  // not watched here — Stop/Resume write them explicitly (awaited, with
++  // their own retry). Renders caused by loading/merging server data are
++  // skipped (restoreToken), so syncing can't loop between devices.
++  useEffect(() => {
++    if (phase !== 'active' || !sessionLineId || remoteEndedRef.current) return;
++    if (restoreTokenSeenRef.current !== restoreToken) {
++      // The render that loaded or merged server data — not an edit.
++      restoreTokenSeenRef.current = restoreToken;
++      if (!syncAfterRestoreRef.current) return;
++      syncAfterRestoreRef.current = false;
++    }
++    revisionRef.current += 1;
++    setSessionSync('pending');
++    clearSaveTimers();
++    draftTimerRef.current = setTimeout(() => {
++      draftTimerRef.current = null;
++      writeLocalDraftNow();
++    }, DRAFT_SAVE_DEBOUNCE_MS);
++    sessionTimerRef.current = setTimeout(() => {
++      sessionTimerRef.current = null;
++      persistSession();
++    }, SESSION_SAVE_DEBOUNCE_MS);
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [phase, sessionLineId, restoreToken, producedBySlot, producedSegment, rejectionsBySlot, lossReasonBySlot, storedChangeovers, deletedSlotIndices, otHours, operators, syncConflicts]);
++
++  // Live updates from other devices. A newer revision is put on screen
++  // straight away when this device has nothing pending or in flight;
++  // otherwise this device's next sync merges it. A deleted or replaced
++  // session doc ends syncing here (handleRemoteEnded).
++  useEffect(() => {
++    if (phase !== 'active' || !sessionLineId) return;
++    const unsubscribe = onSnapshot(
++      doc(db, 'activeSessions', sessionLineId),
++      (snap) => {
++        // No base = this screen already left the session (reset clears it
++        // synchronously), e.g. its own Finalize just deleted the doc.
++        if (snap.metadata.hasPendingWrites || finalizingRef.current || !serverBaseRef.current) return;
++        if (!snap.exists()) { handleRemoteEnded('finalized'); return; }
++        const d = snap.data() as ActiveSessionDoc;
++        const instance = sessionInstanceRef.current;
++        if (instance && d.sessionInstanceId && d.sessionInstanceId !== instance) { handleRemoteEnded('replaced'); return; }
++        const rev = typeof d.revision === 'number' ? d.revision : 0;
++        const base = serverBaseRef.current;
++        if (!base || rev <= base.revision) return; // own sync echo, or nothing new
++        if (
++          hasPendingChanges() || sessionQueueRef.current.busy() || savingSlotsRef.current.size > 0 ||
++          stopActionBusyRef.current || leavingRef.current
++        ) return; // merged by this device's next sync instead
++        const remote = syncStateFromDoc(d);
++        serverBaseRef.current = { revision: rev, state: remote };
++        applySyncStateToScreen(remote);
++        setLastSyncedAtMs(Date.now());
++        setRestoreNotice('Updated with changes from another device.');
++      },
++      (err) => console.warn('[session listener]', err)
++    );
++    return unsubscribe;
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [phase, sessionLineId]);
++
++  // App going to the background (native) or the tab being hidden (web —
++  // react-native-web reports visibilitychange as AppState) → save now; back
++  // in the foreground, or the browser back online → retry a failed sync at
++  // once. On web, pagehide also writes the device draft, which is
++  // synchronous there (localStorage); a network write started that late may
++  // not finish.
++  useEffect(() => {
++    if (phase !== 'active') return;
++    const sub = AppState.addEventListener('change', (st) => {
++      if (st !== 'active') flushIfPending();
++      else retrySyncNow();
++    });
++    // Direct (unqueued) write: localStorage.setItem runs synchronously inside
++    // AsyncStorage's web setItem, so it completes before the page goes away.
++    const onPageHide = () => {
++      const draft = hasPendingChanges() ? buildDraft() : null;
++      if (draft) saveDraft(AsyncStorage, draft);
++    };
++    const onOnline = () => retrySyncNow();
++    const web = Platform.OS === 'web' && typeof window !== 'undefined';
++    if (web) {
++      window.addEventListener('pagehide', onPageHide);
++      window.addEventListener('online', onOnline);
++    }
++    return () => {
++      sub.remove();
++      if (web) {
++        window.removeEventListener('pagehide', onPageHide);
++        window.removeEventListener('online', onOnline);
++      }
++    };
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [phase]);
++
++  // Leaving the screen entirely (drawer / navigation) — keep pending entries:
++  // device draft + server write, then stop the timers.
++  useEffect(() => () => {
++    clearRetryTimer();
++    if (!hasPendingChanges()) return;
++    clearSaveTimers();
++    writeLocalDraftNow();
++    persistSession();
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, []);
++
++  // Cross-platform yes/no (Alert buttons don't fire on react-native-web —
++  // see handleFinalizeSession).
++  function confirmAsync(title: string, message: string, confirmText: string): Promise<boolean> {
++    if (Platform.OS === 'web') return Promise.resolve(window.confirm(`${title}\n\n${message}`));
++    return new Promise((resolve) => {
++      Alert.alert(title, message, [
++        { text: 'Stay', style: 'cancel', onPress: () => resolve(false) },
++        { text: confirmText, style: 'destructive', onPress: () => resolve(true) },
++      ], { cancelable: true, onDismiss: () => resolve(false) });
++    });
++  }
++
++  // ── Sync conflicts (see threeWayMerge) — shown under the header.
++  // "Use this value" applies the value that was not kept, as a new edit.
++  function applyConflictValue(c: SyncConflict) {
++    const v = c.otherValue as any;
++    switch (c.field) {
++      case 'producedBySlot':
++        setProducedBySlot((p) => ({ ...p, [Number(c.key)]: v ?? null }));
++        break;
++      case 'producedSegment':
++        setProducedSegment((p) => ({ ...p, [c.key]: v ?? null }));
++        break;
++      case 'rejectionsBySlot':
++        setRejectionsBySlot((p) => { const n = { ...p }; if (v == null) delete n[c.key]; else n[c.key] = v; return n; });
++        break;
++      case 'lossReasonBySlot': {
++        const next = { ...lossReasonBySlotRef.current };
++        if (v?.code) next[c.key] = { code: v.code, label: v.label ?? v.code, ...(v.note ? { note: v.note } : {}) };
++        else delete next[c.key];
++        lossReasonBySlotRef.current = next;
++        setLossReasonBySlot(next);
++        break;
++      }
++      case 'changeovers':
++        setChangeovers((p) => { const n = { ...p }; if (v) n[Number(c.key)] = v; else delete n[Number(c.key)]; return n; });
++        markSlotUnsaved(Number(c.key));
++        break;
++      case 'otHours':
++        if (typeof v === 'number') setOtHours(v);
++        break;
++      case 'operators':
++        if (Array.isArray(v) && v.length) setOperators(v);
++        break;
++      default:
++        return; // stops: informational only
++    }
++    dismissConflict(c.id);
++  }
++
++  function dismissConflict(id: string) {
++    const next = { ...syncConflictsRef.current, [id]: null };
++    syncConflictsRef.current = next;
++    setSyncConflicts(next);
++  }
++
++  const CONFLICT_FIELD_LABELS: Record<SyncConflict['field'], string> = {
++    producedBySlot: 'Produced', producedSegment: 'Produced', rejectionsBySlot: 'Rejections',
++    lossReasonBySlot: 'Loss reason', changeovers: 'Changeover', stopsBySlot: 'Line stop', otHours: 'OT hours', operators: 'Operators',
+   };
+ 
++  function describeConflict(c: SyncConflict): string {
++    const label = CONFLICT_FIELD_LABELS[c.field] ?? c.field;
++    if (!c.key) return label;
++    const [idx, seg] = c.key.split(/[:|]/);
++    const slot = slots.find((s) => s.index === Number(idx));
++    const part = seg === 'before' ? ' (before changeover)' : seg === 'after' ? ' (after changeover)' : '';
++    return `${label} · ${slot?.label ?? `slot ${idx}`}${part}`;
++  }
++
++  function formatConflictValue(v: unknown): string {
++    if (v == null) return 'empty';
++    if (typeof v === 'number' || typeof v === 'string') return String(v);
++    if (Array.isArray(v)) return v.map((o: any) => o?.name).filter(Boolean).join(', ') || 'none';
++    const o = v as any;
++    if (o.label) return o.label;
++    if (typeof o.startAbs === 'number') return `${o.reason ?? 'stop'}${o.running ? ' (running)' : ''}`;
++    if (typeof o.atAbs === 'number') return formatAbsMinutesToAmPm(o.atAbs);
++    return 'value';
++  }
++
++
+   // ─────────────────────────────────────────────────────────────────────────────
+   // START PRODUCTION (unchanged except allows multiple active sessions per supervisor)
+   // ─────────────────────────────────────────────────────────────────────────────
+@@ -1504,6 +2284,7 @@ export default function RecordProductionScreen() {
+     // Planned total from the schedule for THIS start time (no changeovers or
+     // deleted slots exist yet), rather than the last render's value.
+     const plannedTotal = plannedTotalFor(buildSlots(selectedShift, otHours, [], startAbs), selectedLine, selectedPartIndex);
++    const sessionInstanceId = newSessionInstanceId();
+     try {
+       const docRef = doc(db, 'activeSessions', lineId);
+       await setDoc(docRef, {
+@@ -1530,6 +2311,13 @@ export default function RecordProductionScreen() {
+         plannedProductionTotal: plannedTotal,
+         productionStartMinutesAbs: startAbs,
+         productionStartedAt: Timestamp.fromMillis(productionDayMinuteToMillis(pd, startAbs)),
++        lossReasonBySlot: {},
++        savedSlotIndices: [],
++        sessionInstanceId,
++        revision: 1,
++        syncConflicts: {},
++        updatedBy: { uid: user?.uid ?? null, deviceId: deviceIdRef.current },
++        clientUpdatedAtMs: Date.now(),
+         startedAt: serverTimestamp(),
+         updatedAt: serverTimestamp(),
+       });
+@@ -1539,8 +2327,23 @@ export default function RecordProductionScreen() {
+       setProductionDate(pd);
+       setSessionStartAbs(startAbs);
+       sessionStartedAtMsRef.current = startedMs;
+-      setSavedSlotIndices(new Set());
+-      setDeletedSlotIndices(new Set());
++      sessionInstanceRef.current = sessionInstanceId;
++      // Just written in full at revision 1 — that is this device's base, and
++      // nothing is pending.
++      serverBaseRef.current = {
++        revision: 1,
++        state: { ...emptySyncState(), otHours, operators: operators.map((o) => ({ id: o.id, name: o.name, code: o.code })) },
++      };
++      applySyncStateToScreen(serverBaseRef.current.state);
++      clearSaveTimers();
++      clearRetryTimer();
++      syncFailuresRef.current = 0;
++      remoteEndedRef.current = null;
++      setRemoteEnded(null);
++      confirmedRevisionRef.current = revisionRef.current;
++      setSessionSync('saved');
++      setLastSyncedAtMs(Date.now());
++      setRestoreNotice(null);
+       setPhase('active');
+     } catch (e) {
+       Alert.alert('Error', 'Could not start session. Check your connection.');
+@@ -1766,6 +2569,9 @@ export default function RecordProductionScreen() {
+       productionDate: prodDate,
+       createdAt: serverTimestamp(),
+     };
++    // A slot with no reason in memory must not wipe a reason already stored
++    // on its record (e.g. one picked at Save Slot before the app restarted).
++    const keepStoredLossReason = { keepExistingWhenNull: ['lossReasonCode', 'lossReasonLabel', 'lossReasonNote'] };
+ 
+     // Same changeover rules as an individual save — refuse to write anything
+     // if a changeover (e.g. one restored from an older session) is invalid.
+@@ -1809,7 +2615,7 @@ export default function RecordProductionScreen() {
+           lossReasonNote: lossReasonAuto?.note ?? null,
+           rejections: rejectionsBySlot[s.index] ?? 0,
+           stopEvents: slotStopEvents,
+-        }, resolvedRecordIdsRef.current);
++        }, resolvedRecordIdsRef.current, keepStoredLossReason);
+         await removeSupersededProductionRecords(slotKey(s.index), 'full', resolvedRecordIdsRef.current);
+       } else {
+         // Changeover — two fully independent records, each with its own
+@@ -1841,7 +2647,7 @@ export default function RecordProductionScreen() {
+             lossReasonNote: lossReasonBeforeAuto?.note ?? null,
+             rejections: rejectionsBySlot[`${s.index}:before`] ?? 0, stopEvents: stopEventsBefore,
+             changeoverInfo: co, partSegment: 'before',
+-          }, resolvedRecordIdsRef.current);
++          }, resolvedRecordIdsRef.current, keepStoredLossReason);
+         }
+         const pa = producedSegment[`${s.index}:after`];
+         if (pa != null) {
+@@ -1865,7 +2671,7 @@ export default function RecordProductionScreen() {
+             lossReasonNote: lossReasonAfterAuto?.note ?? null,
+             rejections: rejectionsBySlot[`${s.index}:after`] ?? 0, stopEvents: stopEventsAfter,
+             changeoverInfo: co, partSegment: 'after',
+-          }, resolvedRecordIdsRef.current);
++          }, resolvedRecordIdsRef.current, keepStoredLossReason);
+         }
+         if (pb != null || pa != null) {
+           await removeSupersededProductionRecords(slotKey(s.index), 'split', resolvedRecordIdsRef.current);
+@@ -1893,7 +2699,33 @@ export default function RecordProductionScreen() {
+     }
+   }
+ 
+-  const handleFinalizeSession = () => {
++  const handleFinalizeSession = async () => {
++    // Finalize writes this device's view of the session into
++    // productionRecords, so it must first be in sync with every other
++    // device's changes.
++    if (remoteEndedRef.current) {
++      notify('Session already ended', 'This session was finalized or replaced on another device.');
++      return;
++    }
++    if (savingSlotsRef.current.size > 0) {
++      notify('Slot still saving', 'Wait for the slot save to finish, then tap Finalize & End again.');
++      return;
++    }
++    clearSaveTimers();
++    const synced = await persistSession();
++    if (!synced) {
++      if (!remoteEndedRef.current) {
++        notify(
++          'Not synced — cannot finalize yet',
++          'This device could not sync with the server (offline?), so changes made on other devices may be missing. Your entries are kept on this device. Try again once connected.'
++        );
++      }
++      return;
++    }
++    if (lastSyncMergedRemoteRef.current) {
++      notify('Updated from another device', 'Changes from another device were just merged in. Review them, then tap Finalize & End again.');
++      return;
++    }
+     console.log('[handleFinalizeSession] START — about to show the confirm dialog');
+     console.log('[handleFinalizeSession] state check', { sessionLineId, selectedLineId, platform: Platform.OS });
+ 
+@@ -1902,6 +2734,16 @@ export default function RecordProductionScreen() {
+     // call the exact same logic instead of duplicating it.
+     const proceedWithFinalize = async () => {
+       console.log('[handleFinalizeSession] CONFIRM (Finalize & End) CALLBACK FIRED');
++      // Device draft scope, captured before anything is reset.
++      const draftScope = currentDraftScope();
++      // From here no session write may start (one landing after the
++      // deleteDoc below would fail, or race the finalize writes). Let a
++      // write already in flight finish first; the device draft is kept
++      // until Finalize has succeeded.
++      clearSaveTimers();
++      finalizingRef.current = true;
++      await sessionQueueRef.current.idle();
++      let finalized = false;
+       try {
+         const docId = sessionLineId ?? selectedLineId;
+         console.log('[handleFinalizeSession] resolved docId', { docId, sessionLineId, selectedLineId });
+@@ -1926,8 +2768,25 @@ export default function RecordProductionScreen() {
+           console.log('[handleFinalizeSession] saveShiftSummary resolved');
+ 
+           console.log('[handleFinalizeSession] calling deleteDoc(activeSessions/', docId, ')…');
+-          await deleteDoc(doc(db, 'activeSessions', docId));
++          // Removed only if no other device synced a change since this one's
++          // last sync — otherwise the session stays open with that change
++          // (records written above are upserts, so finalizing again later
++          // just updates them).
++          const baseRevision = serverBaseRef.current?.revision ?? null;
++          await runTransaction(db, async (tx) => {
++            const ref = doc(db, 'activeSessions', docId);
++            const snap = await tx.get(ref);
++            if (!snap.exists()) return;
++            const rev = (snap.data() as ActiveSessionDoc).revision ?? 0;
++            if (baseRevision != null && rev !== baseRevision) {
++              throw new Error('Another device changed this session while it was being finalized. The records were saved; reopen the session, review the latest data and tap Finalize & End again.');
++            }
++            tx.delete(ref);
++          });
+           console.log('[handleFinalizeSession] deleteDoc resolved');
++          finalized = true;
++          // Everything is in productionRecords now — the device copy is done.
++          if (draftScope) await draftStore.retire(draftScope, Number.MAX_SAFE_INTEGER);
+         } else {
+           console.log('[handleFinalizeSession] SKIPPED Firestore writes — docId is falsy (no active session line resolved)');
+         }
+@@ -1942,8 +2801,13 @@ export default function RecordProductionScreen() {
+           Alert.alert('Error', String(e));
+         }
+       }
++      finalizingRef.current = false;
+       console.log('[handleFinalizeSession] calling goBackToProduction()');
+-      goBackToProduction();
++      // Finalized: the session doc is gone, so there is nothing left to
++      // save — just reset. Failed: leave the same way as Back (saves the
++      // current entries to the still-existing session, keeps the draft).
++      if (finalized) resetSessionState();
++      else await goBackToProduction();
+       console.log('[handleFinalizeSession] END — confirm callback completed');
+     };
+ 
+@@ -2020,12 +2884,11 @@ export default function RecordProductionScreen() {
+   // saved again — Finalize skips saved slots. The re-save replaces the old
+   // record(s); see removeSupersededProductionRecords.
+   function markSlotUnsaved(slotIndex: number) {
+-    setSavedSlotIndices((prev) => {
+-      if (!prev.has(slotIndex)) return prev;
+-      const next = new Set(prev);
+-      next.delete(slotIndex);
+-      return next;
+-    });
++    const prev = savedSlotIndicesRef.current;
++    if (!prev.has(slotIndex)) return;
++    const next = new Set(prev);
++    next.delete(slotIndex);
++    applySavedSlots(next);
+   }
+ 
+   // Every OTHER changeover's interval (a single-time changeover is an
+@@ -2108,8 +2971,7 @@ export default function RecordProductionScreen() {
+       setProducedSegment((p) => ({ ...p, [`${slot.index}:before`]: null, [`${slot.index}:after`]: null }));
+       markSlotUnsaved(slot.index);
+       setChangeModalVisible(false);
+-      // Persist immediately
+-      setTimeout(() => persistSession(), 100);
++      // Saved by the autosave effect (storedChangeovers changed).
+       Alert.alert(
+         'Changeover recorded',
+         atSlotStart
+@@ -2280,8 +3142,8 @@ export default function RecordProductionScreen() {
+       return;
+     }
+     pendingResumeRef.current = null;
+-    stopsBySlotRef.current = nextStops;
+-    setStopsBySlot(nextStops);
++    // The closed stop is on screen already: a successful sync puts the
++    // synced stops (these, plus any another device recorded) on screen.
+     setStopSync('idle');
+ 
+     // Clear the breakdown doc so both dashboards update in real time.
+@@ -2437,10 +3299,12 @@ export default function RecordProductionScreen() {
+     }
+     const meta = LOSS_REASONS.find((r) => r.code === lossModalCode);
+     const key = lossModalKey;
+-    setLossReasonBySlot((p) => ({
+-      ...p,
++    const next = {
++      ...lossReasonBySlotRef.current,
+       [key]: { code: lossModalCode, label: meta?.label ?? lossModalCode, note: lossModalCode === 'K' ? lossModalNote.trim() : undefined },
+-    }));
++    };
++    lossReasonBySlotRef.current = next;
++    setLossReasonBySlot(next);
+     setLossModalVisible(false);
+     setLossModalKey(null);
+     const resume = pendingAfterLossRef.current;
+@@ -2519,11 +3383,7 @@ export default function RecordProductionScreen() {
+             delete c[`${slotIndex}:after`];
+             return c;
+           });
+-          console.log('[handleDeleteSlot] scheduling persistSession() via setTimeout');
+-          setTimeout(() => {
+-            console.log('[handleDeleteSlot] persistSession() firing now (from setTimeout)');
+-            persistSession();
+-          }, 100);
++          // Saved by the autosave effect (deletedSlotIndices changed).
+           console.log('[handleDeleteSlot] END — confirm callback completed');
+         } catch (e) {
+           console.error('[handleDeleteSlot] EXCEPTION inside confirm callback', e);
+@@ -2580,6 +3440,10 @@ export default function RecordProductionScreen() {
+   // missing reason, resuming this same check afterward until everything is
+   // either on-target or has a reason attached.
+   function attemptSave(slot: Slot) {
++    // Reasons from the ref: when the loss modal resumes this check, this
++    // function may be an earlier render's copy, whose state lacks the reason
++    // that was just picked (which made the modal reopen instead of saving).
++    const lossReasonBySlot = lossReasonBySlotRef.current;
+     const co = changeovers[slot.index] ?? null;
+     if (!co) {
+       const produced = producedBySlot[slot.index];
+@@ -2643,6 +3507,7 @@ export default function RecordProductionScreen() {
+       const baseDoc = buildBaseDoc(prodDate);
+       const slotKey = { productionDate: prodDate, lineId: selectedLineId, shift: selectedShift, slotIndex: slot.index };
+       const slotId = (segment: SlotSegment): ProductionSlotIdentity => ({ ...slotKey, segment });
++      let savedMessage = '';
+       if (!co) {
+         // Independent record: the operator enters exactly what was produced
+         // in this slot — no counter, no baseline, no subtraction.
+@@ -2657,7 +3522,7 @@ export default function RecordProductionScreen() {
+         const productive = Math.max(0, slot.productiveMinutes - stopped);
+         const expParts = expectedParts(activePart, slot.productiveMinutes);
+         const slotLossParts = Math.max(0, expParts - produced);
+-        const lossReason = lossReasonBySlot[String(slot.index)] ?? null;
++        const lossReason = lossReasonBySlotRef.current[String(slot.index)] ?? null;
+         await upsertProductionRecord(slotId('full'), {
+           ...baseDoc,
+           partName: selectedLine.parts?.[activePart]?.name ?? null,
+@@ -2679,8 +3544,7 @@ export default function RecordProductionScreen() {
+           stopEvents: slotStopEvents,
+         }, resolvedRecordIdsRef.current);
+         await removeSupersededProductionRecords(slotKey, 'full', resolvedRecordIdsRef.current);
+-        Alert.alert('Saved', `Slot ${slot.label} saved.`);
+-        setSavedSlotIndices((prev) => new Set(prev).add(slot.index));
++        savedMessage = `Slot ${slot.label} saved.`;
+       } else {
+         // Changeover: two fully independent records, each with its own
+         // produced value exactly as entered.
+@@ -2695,8 +3559,8 @@ export default function RecordProductionScreen() {
+         const prodAfter = Math.max(0, co.afterMinutes - stopAfter);
+         const expBefore = expectedParts(co.oldPartIndex, co.beforeMinutes);
+         const expAfter = expectedParts(co.newPartIndex, co.afterMinutes);
+-        const lossReasonBefore = lossReasonBySlot[`${slot.index}:before`] ?? null;
+-        const lossReasonAfter = lossReasonBySlot[`${slot.index}:after`] ?? null;
++        const lossReasonBefore = lossReasonBySlotRef.current[`${slot.index}:before`] ?? null;
++        const lossReasonAfter = lossReasonBySlotRef.current[`${slot.index}:after`] ?? null;
+         const lossPartsBefore = Math.max(0, expBefore - pb);
+         const lossPartsAfter = Math.max(0, expAfter - pa);
+         await upsertProductionRecord(slotId('before'), {
+@@ -2736,11 +3600,33 @@ export default function RecordProductionScreen() {
+           changeoverInfo: co, partSegment: 'after',
+         }, resolvedRecordIdsRef.current);
+         await removeSupersededProductionRecords(slotKey, 'split', resolvedRecordIdsRef.current);
+-        Alert.alert('Saved', `Slot ${slot.label} saved (split).`);
+-        setSavedSlotIndices((prev) => new Set(prev).add(slot.index));
++        savedMessage = `Slot ${slot.label} saved (split).`;
++      }
++      // The record is written. Now the session must learn it: this write
++      // carries the slot's saved marker and everything entered so far —
++      // built when it runs, so input typed during the record write is
++      // included, never overwritten. The slot only shows as saved once it
++      // succeeds; if it fails, the record stays as written and a retry
++      // updates that same record (never adds one).
++      // The values just written to the record win any clash with another
++      // device's edits of this slot, so the session matches the record.
++      const segKeys = co ? [`${slot.index}:before`, `${slot.index}:after`] : [String(slot.index)];
++      const savedKeys = new Set<string>([
++        ...(co ? segKeys.map((k) => `producedSegment|${k}`) : [`producedBySlot|${slot.index}`]),
++        ...segKeys.map((k) => `rejectionsBySlot|${k}`),
++        ...segKeys.map((k) => `lossReasonBySlot|${k}`),
++      ]);
++      const synced = await persistSession(undefined, undefined, [slot.index], savedKeys);
++      if (synced) {
++        applySavedSlots(new Set(savedSlotIndicesRef.current).add(slot.index));
++        Alert.alert('Saved', savedMessage);
++      } else {
++        notify(
++          'Slot saved — session not updated',
++          `${savedMessage} The production record was written, but this session's progress could not be updated on the server, so other devices may not show it yet. ` +
++            'Your entries are kept on this device and sync is retried automatically. You can also tap Save Slot again — it updates the same record, it never adds another.'
++        );
+       }
+-      // Persist session after save so Firestore knows the current data
+-      persistSession();
+     } catch (err) {
+       console.error('saveSlot', err);
+       Alert.alert('Error', 'Could not save slot. Your entries are kept — tap Save Slot to retry.');
+@@ -2923,7 +3809,12 @@ export default function RecordProductionScreen() {
+           </Pressable>
+ 
+           {/* CONTINUE ACTIVE SESSION — tap a card to resume instantly, skipping setup */}
+-          {loadingActiveSessions ? (
++          {restoringSession ? (
++            <View style={{ marginTop: 18, alignItems: 'center', gap: 6 }}>
++              <ActivityIndicator color="#8A96A3" />
++              <Text style={styles.muted}>Opening session…</Text>
++            </View>
++          ) : loadingActiveSessions ? (
+             <View style={{ marginTop: 18, alignItems: 'center' }}>
+               <ActivityIndicator color="#8A96A3" />
+             </View>
+@@ -3020,6 +3911,37 @@ export default function RecordProductionScreen() {
+             <Text style={[styles.subtitle, { marginTop: 2, color: '#4C9A6A', fontWeight: '700' }]}>
+               Shift Planned Total: {shiftPlannedTotal} parts{otHours > 0 ? ` (incl. ${otHours}h OT)` : ''}
+             </Text>
++            {/* Session save status (see persistSession) */}
++            <Text style={[styles.subtitle, { marginTop: 2, fontWeight: '700', color: remoteEnded || sessionSync === 'error' ? '#D64545' : '#8A96A3' }]}>
++              {remoteEnded
++                ? `Session ${remoteEnded === 'finalized' ? 'finalized' : 'replaced'} on another device — no longer saving. Go back to continue.`
++                : sessionSync === 'error'
++                ? 'NOT SYNCED — latest changes are only on this device; other devices can\'t see them yet. Retrying automatically (or tap Save Session).'
++                : sessionSync === 'pending' || persistingSession
++                ? 'Syncing changes…'
++                : `All changes synced${lastSyncedAtMs ? ` · ${new Date(lastSyncedAtMs).toLocaleTimeString()}` : ''}`}
++            </Text>
++            {restoreNotice && (
++              <Text style={[styles.subtitle, { marginTop: 2, color: '#F2A93B' }]}>{restoreNotice}</Text>
++            )}
++            {/* Values not kept when edits from two devices clashed */}
++            {Object.values(syncConflicts).filter((c): c is SyncConflict => !!c).map((c) => (
++              <View key={c.id} style={{ marginTop: 6, padding: 8, borderRadius: 8, borderWidth: 1, borderColor: '#F2A93B' }}>
++                <Text style={{ color: '#ECEFF2', fontSize: 12 }}>
++                  {describeConflict(c)}: kept {formatConflictValue(c.keptValue)} (newer); not kept {formatConflictValue(c.otherValue)}
++                </Text>
++                <View style={{ flexDirection: 'row', gap: 12, marginTop: 4 }}>
++                  {c.field !== 'stopsBySlot' && (
++                    <Pressable onPress={() => applyConflictValue(c)} hitSlop={6}>
++                      <Text style={{ color: '#F2A93B', fontWeight: '700', fontSize: 12 }}>Use {formatConflictValue(c.otherValue)}</Text>
++                    </Pressable>
++                  )}
++                  <Pressable onPress={() => dismissConflict(c.id)} hitSlop={6}>
++                    <Text style={{ color: '#8A96A3', fontWeight: '700', fontSize: 12 }}>Dismiss</Text>
++                  </Pressable>
++                </View>
++              </View>
++            ))}
+ 
+             {partTargetSummary.length > 0 && (
+               <View style={styles.partTargetBox}>
+@@ -3035,7 +3957,13 @@ export default function RecordProductionScreen() {
+           </View>
+ 
+           {/* Save session (persist only) */}
+-          <Pressable onPress={() => persistSession()} style={[styles.stopProductionBtn, { borderColor: '#F2A93B' }]}>
++          <Pressable
++            onPress={async () => {
++              const ok = await flushSessionNow();
++              if (!ok) notify('Session not saved', 'Could not save to the server. Your entries are kept on this device — check your connection and tap Save Session again.');
++            }}
++            style={[styles.stopProductionBtn, { borderColor: '#F2A93B' }]}
++          >
+             <Ionicons name="save" size={18} color="#F2A93B" />
+             <Text style={[styles.stopProductionText, { color: '#F2A93B' }]}>Save Session</Text>
+           </Pressable>
+@@ -3075,9 +4003,8 @@ export default function RecordProductionScreen() {
+                 keyboardType="number-pad"
+                 onChangeText={(t) => {
+                   const v = Math.max(0, Math.min(8, Math.floor(Number(t) || 0)));
++                  // Saved by the autosave effect (otHours changed).
+                   setOtHours(v);
+-                  // persist OT change right away
+-                  setTimeout(() => persistSession(), 200);
+                 }}
+               />
+             </View>
+@@ -3103,7 +4030,7 @@ export default function RecordProductionScreen() {
+               <Text style={{ color: '#8A96A3', fontSize: 12, flex: 1, marginLeft: 8 }}>
+                 {selectedLine?.parts?.[co.oldPartIndex]?.name ?? '?'} → {selectedLine?.parts?.[co.newPartIndex]?.name ?? '?'} · {formatAbsMinutesToAmPm(co.startAbs ?? co.atAbs)}{(co.endAbs ?? co.atAbs) > (co.startAbs ?? co.atAbs) ? ` – ${formatAbsMinutesToAmPm(co.endAbs ?? co.atAbs)} (${co.durationMinutes ?? 0} min)` : ''}
+               </Text>
+-              <Pressable onPress={() => { const idx = co.slotIndex; setChangeovers((p) => { const c = { ...p }; delete c[idx]; return c; }); markSlotUnsaved(idx); setTimeout(() => persistSession(), 100); }} style={styles.removeChangeBtn}>
++              <Pressable onPress={() => { const idx = co.slotIndex; setChangeovers((p) => { const c = { ...p }; delete c[idx]; return c; }); markSlotUnsaved(idx); }} style={styles.removeChangeBtn}>
+                 <Ionicons name="close" size={16} color="#F2A93B" />
+               </Pressable>
+             </View>
+@@ -3152,6 +4079,9 @@ export default function RecordProductionScreen() {
+                 <View style={styles.slotHeader}>
+                   <Text style={styles.slotLabel}>{timeLabel}</Text>
+                   <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
++                    {savedSlotIndices.has(stopSlotIndex) && (
++                      <Text style={{ color: '#4C9A6A', fontSize: 11, fontWeight: '700' }}>✓ Saved</Text>
++                    )}
+                     <Text style={styles.muted}>{minutesLabel}</Text>
+                     <Pressable
+                       onPress={onDelete}
+@@ -3185,14 +4115,17 @@ export default function RecordProductionScreen() {
+                       value={enteredValue == null ? '' : String(enteredValue)}
+                       onChangeText={(t) => onChangeEntered(t === '' ? null : Number(t.replace(/[^0-9]/g, '')))}
+                       editable={!disabled}
+-                      onEndEditing={() => persistSession()}
++                      // onBlur, not onEndEditing: react-native-web's TextInput
++                      // never fires onEndEditing. Typing itself is saved by the
++                      // autosave effect; leaving the field just saves sooner.
++                      onBlur={flushIfPending}
+                     />
+                     <View style={{ marginTop: 8 }}>
+                       <Text style={styles.labelSmall}>Rejections</Text>
+                       <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 4 }}>
+-                        <Pressable onPress={() => { setRejectionsBySlot((p) => ({ ...p, [rejectKey]: Math.max(0, (p[rejectKey] ?? 0) - 1) })); setTimeout(() => persistSession(), 100); queueRejectionSync(rejectKey); }} style={[styles.smallBtn, disabled && styles.disabledBtn]} disabled={disabled}><Text style={styles.smallBtnText}>−</Text></Pressable>
++                        <Pressable onPress={() => { setRejectionsBySlot((p) => ({ ...p, [rejectKey]: Math.max(0, (p[rejectKey] ?? 0) - 1) })); queueRejectionSync(rejectKey); }} style={[styles.smallBtn, disabled && styles.disabledBtn]} disabled={disabled}><Text style={styles.smallBtnText}>−</Text></Pressable>
+                         <Text style={{ color: '#ECEFF2', fontWeight: '700', minWidth: 36, textAlign: 'center' }}>{rejectionsBySlot[rejectKey] ?? 0}</Text>
+-                        <Pressable onPress={() => { setRejectionsBySlot((p) => ({ ...p, [rejectKey]: (p[rejectKey] ?? 0) + 1 })); setTimeout(() => persistSession(), 100); queueRejectionSync(rejectKey); }} style={[styles.smallBtn, disabled && styles.disabledBtn]} disabled={disabled}><Text style={styles.smallBtnText}>+</Text></Pressable>
++                        <Pressable onPress={() => { setRejectionsBySlot((p) => ({ ...p, [rejectKey]: (p[rejectKey] ?? 0) + 1 })); queueRejectionSync(rejectKey); }} style={[styles.smallBtn, disabled && styles.disabledBtn]} disabled={disabled}><Text style={styles.smallBtnText}>+</Text></Pressable>
+                       </View>
+                     </View>
+                   </View>

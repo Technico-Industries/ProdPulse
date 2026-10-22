@@ -48,6 +48,8 @@
     "test:quality": "tsx scripts/testQualityMetrics.ts",
     "test:live-quality": "tsx scripts/testLiveQuality.ts",
     "test:downtime": "tsx scripts/testDowntime.ts",
+    "test:production-draft": "tsx scripts/testProductionDraft.ts",
+    "test:shift-b-overnight": "tsx scripts/testShiftBOvernight.ts",
     "build": "expo export --platform web"
   },
   "private": true

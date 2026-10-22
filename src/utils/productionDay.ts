@@ -51,6 +51,61 @@ export function timestampToMillis(ts: unknown): number | null {
   return null;
 }
 
+// ─── Reading productionRecords by production date ───────────────────────────
+// Reports must select records by the date they were filed under, NOT by
+// createdAt: a Shift B slot saved at 1:00 AM, or a Finalize pressed after
+// midnight, has a next-calendar-day createdAt but belongs to the night it
+// started on. A calendar-day createdAt range drops those records from their
+// own day and pulls them into the next one.
+
+function calendarDayKeyFor(epochMs: number): string {
+  const d = new Date(epochMs);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+export function addDaysToKey(key: string, days: number): string {
+  const [y, m, d] = key.split('-').map(Number);
+  return calendarDayKeyFor(new Date(y, m - 1, d + days).getTime());
+}
+
+// The production date of a stored productionRecords doc: its own
+// productionDate, else (records saved before that field existed) derived
+// from createdAt — by the 6:30 AM cutover for Shift B, so its after-midnight
+// slots stay on the night they belong to, and by calendar day for every
+// other shift, exactly as before.
+export function recordProductionDayKey(r: { productionDate?: unknown; shift?: unknown; createdAtMs?: number | null }): string | null {
+  if (isProductionDayKey(r.productionDate)) return r.productionDate;
+  if (r.createdAtMs == null || !Number.isFinite(r.createdAtMs)) return null;
+  return r.shift === 'B' ? productionDayKeyFor(r.createdAtMs) : calendarDayKeyFor(r.createdAtMs);
+}
+
+// createdAt window that can contain a legacy record (no productionDate) of
+// a day in [fromKey, toKey]: from the first day's midnight up to the 6:30 AM
+// cutover after the last day, which covers Shift B's after-midnight slots.
+export function legacyCreatedAtWindow(fromKey: string, toKey: string): { startMs: number; endMs: number } {
+  return {
+    startMs: productionDayMinuteToMillis(fromKey, 0),
+    endMs: productionDayMinuteToMillis(addDaysToKey(toKey, 1), PRODUCTION_DAY_CUTOVER_MINUTES),
+  };
+}
+
+export type StoredRecordRow<T> = { id: string; shift?: unknown; productionDate?: unknown; createdAtMs: number | null; doc: T };
+
+// Merges the results of the productionDate-range query and the legacy
+// createdAt-window query: de-duplicated by doc id, kept only when the
+// record's production date is inside [fromKey, toKey], oldest createdAt first.
+export function selectRecordsInProductionRange<T>(lists: StoredRecordRow<T>[][], fromKey: string, toKey: string): T[] {
+  const byId = new Map<string, StoredRecordRow<T>>();
+  for (const list of lists) for (const row of list) if (!byId.has(row.id)) byId.set(row.id, row);
+  return Array.from(byId.values())
+    .filter((row) => {
+      const key = recordProductionDayKey(row);
+      return key != null && key >= fromKey && key <= toKey;
+    })
+    .sort((a, b) => (a.createdAtMs ?? 0) - (b.createdAtMs ?? 0) || a.id.localeCompare(b.id))
+    .map((row) => row.doc);
+}
+
 // The production date a session's records belong to. It is pinned once,
 // when the session starts, and every later write (slot saves, Finalize, the
 // shift summary) must reuse it — never re-derive it from the current time,

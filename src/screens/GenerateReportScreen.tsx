@@ -34,8 +34,10 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useNavigation } from '@react-navigation/native';
-import { collection, getDocs, query, where, orderBy, Timestamp } from 'firebase/firestore';
+import { collection, getDocs } from 'firebase/firestore';
 import { db } from '../services/firebase';
+import { fetchProductionRecordsForDateRange } from '../services/productionRecordQueries';
+import { recordProductionDayKey } from '../utils/productionDay';
 import { PLANTS, WORKSHOPS, DIVISIONS } from '../constants/lineOptions';
 // npm install react-native-gifted-charts react-native-svg
 import { BarChart, LineChart, PieChart } from 'react-native-gifted-charts';
@@ -237,7 +239,7 @@ function isValidDateStr(s: string) {
 // after digit 6) rather than DD-MM-YYYY (dash after digit 2, dash after
 // digit 4) — fromDate/toDate feed straight into isValidDateStr's
 // /^\d{4}-\d{2}-\d{2}$/ check and into `new Date(`${fromDate}T00:00:00`)`
-// for the Firestore Timestamp range query above, both of which require
+// for the production-date range query, both of which require
 // YYYY-MM-DD. Matching the DD-MM-YYYY grouping shown in the original
 // examples would silently break both. Same 8-digit/10-character cap either
 // way — only the grouping differs.
@@ -276,10 +278,12 @@ function formatDateLabel(ms: number | null) {
   return `${pad2(d.getDate())} ${d.toLocaleString('en-US', { month: 'short' })}`;
 }
 
-function dateKey(ms: number | null) {
-  if (!ms) return 'unknown';
-  const d = new Date(ms);
-  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+// "21 Oct" for a production-date key — the BY LINE card shows the date the
+// group was filed under, not the calendar day of its first record's
+// createdAt (which, for Shift B, can be the next morning).
+function formatProductionDayLabel(key: string) {
+  if (!isValidDateStr(key)) return '—';
+  return formatDateLabel(new Date(`${key}T00:00:00`).getTime());
 }
 
 function formatDateTime(ms: number | null) {
@@ -462,10 +466,11 @@ export default function GenerateReportScreen() {
     setLineSlotRecordsLoading({});
     setLineSlotRecordsError({});
     try {
-      const fromTs = Timestamp.fromDate(new Date(`${fromDate}T00:00:00`));
-      const toTs = Timestamp.fromDate(new Date(`${toDate}T23:59:59.999`));
-      // Only range-filter in Firestore (createdAt); everything else —
-      // including a selected line — is filtered client-side below.
+      // Only the production-date range is filtered in Firestore (see
+      // fetchProductionRecordsForDateRange — by productionDate, not
+      // createdAt, so an overnight Shift B stays on the night it started);
+      // everything else — including a selected line — is filtered
+      // client-side below.
       //
       // selectedLineId used to be pushed into the query as an extra
       // equality constraint, which needs a composite
@@ -476,12 +481,6 @@ export default function GenerateReportScreen() {
       // query changes nothing about the result — only which indexes
       // Firestore needs.
       console.log('[GenerateReport] selectedLineId at query time:', selectedLineId);
-      const q = query(
-        collection(db, 'productionRecords'),
-        where('createdAt', '>=', fromTs),
-        where('createdAt', '<=', toTs),
-        orderBy('createdAt', 'asc')
-      );
 
       // TEMPORARY DEBUG LOGGING — confirms at runtime which collection and
       // filters this query actually used. Safe to remove once the
@@ -494,15 +493,15 @@ export default function GenerateReportScreen() {
       const t0 = Date.now();
       console.log('[GenerateReport] 1 before getDocs');
 
-      const snap = await getDocs(q);
+      const docs = await fetchProductionRecordsForDateRange(fromDate, toDate);
 
       // TEMPORARY DEBUG LOGGING — see note above.
-      console.log('[GenerateReport] DOCUMENT COUNT:', snap.size);
+      console.log('[GenerateReport] DOCUMENT COUNT:', docs.length);
 
       // ── Timing point 2: after getDocs — captures pure Firestore latency
-      console.log(`[GenerateReport] 2 after getDocs — ${Date.now() - t0}ms — ${snap.docs.length} docs`);
+      console.log(`[GenerateReport] 2 after getDocs — ${Date.now() - t0}ms — ${docs.length} docs`);
 
-      const all: ProductionRecord[] = snap.docs.map((d) => {
+      const all: ProductionRecord[] = docs.map((d) => {
         const data: any = d.data();
         return {
           id: d.id,
@@ -614,11 +613,9 @@ export default function GenerateReportScreen() {
     setLineSlotRecordsLoading((prev) => ({ ...prev, [lineId]: true }));
     setLineSlotRecordsError((prev) => ({ ...prev, [lineId]: null }));
     try {
-      const fromTs = Timestamp.fromDate(new Date(`${fromDate}T00:00:00`));
-      const toTs = Timestamp.fromDate(new Date(`${toDate}T23:59:59.999`));
-
-      // Range-filter on createdAt ONLY — lineId is applied client-side
-      // below, with the Shift/Part filters.
+      // Same production-date range as handleGenerate (productionDate, not
+      // createdAt) — lineId is applied client-side below, with the
+      // Shift/Part filters.
       //
       // This deliberately does NOT push `where('lineId', '==', lineId)`
       // into the query. Combining an equality filter on one field with a
@@ -628,22 +625,15 @@ export default function GenerateReportScreen() {
       // requires an index", so expanding a line's slot records always
       // failed. Every other query on this screen already range-filters on
       // createdAt alone and narrows the rest in memory for exactly this
-      // reason; this one is now consistent with them, and needs only the
-      // automatic single-field index on createdAt.
-      const q = query(
-        collection(db, 'productionRecords'),
-        where('createdAt', '>=', fromTs),
-        where('createdAt', '<=', toTs),
-        orderBy('createdAt', 'asc')
-      );
-
+      // reason; this one is now consistent with them, and needs only
+      // Firestore's automatic single-field indexes.
       console.log('[GenerateReport] slot fetch:', { lineId, fromDate, toDate });
 
-      const snap = await getDocs(q);
+      const docs = await fetchProductionRecordsForDateRange(fromDate, toDate);
 
-      console.log('[GenerateReport] slot fetch result:', snap.size, 'records');
+      console.log('[GenerateReport] slot fetch result:', docs.length, 'records');
 
-      const mapped: ProductionRecord[] = snap.docs.map((d) => {
+      const mapped: ProductionRecord[] = docs.map((d) => {
         const data: any = d.data();
         return {
           id: d.id,
@@ -761,7 +751,7 @@ export default function GenerateReportScreen() {
       // Group by productionDate + line + shift — a line can run more than
       // one part/session in the same shift now (via changeovers), and this
       // key treats all of them as one group for the "BY LINE" rollup.
-      const pd = r.productionDate ?? dateKey(r.createdAtMs);
+      const pd = recordProductionDayKey(r) ?? 'unknown';
       const key = `${r.lineId ?? 'unknown'}__${pd}__${r.shift}`;
       const downtime = (r.stopEvents ?? []).reduce((sum, se) => sum + (se.durationMinutes ?? 0), 0);
       const produced = r.producedThisSlot ?? 0;
@@ -785,7 +775,7 @@ export default function GenerateReportScreen() {
           lineId: r.lineId ?? 'unknown',
           lineName: r.lineName ?? 'Unknown line',
           shift: r.shift ?? null,
-          dateLabel: formatDateLabel(r.createdAtMs),
+          dateLabel: formatProductionDayLabel(pd),
           records: 1,
           totalProduction: produced,
           totalExpected: expected,
@@ -928,7 +918,7 @@ export default function GenerateReportScreen() {
   const productionTrend = useMemo(() => {
     const map = new Map<string, number>();
     records.forEach((r) => {
-      const pd = r.productionDate ?? dateKey(r.createdAtMs);
+      const pd = recordProductionDayKey(r) ?? 'unknown';
       map.set(pd, (map.get(pd) ?? 0) + (r.producedThisSlot ?? 0));
     });
     return Array.from(map.entries())
@@ -1142,7 +1132,7 @@ export default function GenerateReportScreen() {
       const detailRows: ExcelDetailRow[] = records.map((r) => {
         const downtimeMinutes = (r.stopEvents ?? []).reduce((sum, se) => sum + (se.durationMinutes ?? 0), 0);
         return {
-          productionDate: r.productionDate ?? dateKey(r.createdAtMs),
+          productionDate: recordProductionDayKey(r) ?? 'unknown',
           shift: r.shift,
           plant: r.plant,
           workshop: r.workshop,
@@ -1189,7 +1179,7 @@ export default function GenerateReportScreen() {
         const downtimeMinutes = (r.stopEvents ?? []).reduce((sum, se) => sum + (se.durationMinutes ?? 0), 0);
         const operatorNames = Array.from(new Set((r.operators ?? []).map((o) => o.name).filter(Boolean)));
         return {
-          productionDate: r.productionDate ?? dateKey(r.createdAtMs),
+          productionDate: recordProductionDayKey(r) ?? 'unknown',
           shift: r.shift,
           lineName: r.lineName,
           partName: r.partName,
