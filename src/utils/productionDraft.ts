@@ -319,6 +319,20 @@ export function planSessionSync(
   return { merged: m.merged, revision: remote.revision + 1, conflicts: m.conflicts };
 }
 
+// Whether a device may still write its session doc, given what its sync
+// transaction (or listener) just read: gone → 'finalized' (Finalize, or an
+// admin's End Production, deleted it), another run of the line's session →
+// 'replaced', else null. A device never re-creates a gone session doc —
+// only Start Production does.
+export function sessionWriteGate(
+  remote: { exists: boolean; sessionInstanceId?: string | null },
+  localInstance: string | null
+): 'finalized' | 'replaced' | null {
+  if (!remote.exists) return 'finalized';
+  if (localInstance && remote.sessionInstanceId && remote.sessionInstanceId !== localInstance) return 'replaced';
+  return null;
+}
+
 // ─── Local draft ─────────────────────────────────────────────────────────────
 
 export const DRAFT_VERSION = 2;

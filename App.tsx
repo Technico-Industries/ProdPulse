@@ -33,6 +33,7 @@ import AttendanceSheetScreen from './src/screens/AttendanceSheetScreen';
 import PCSPerHourScreen from './src/screens/PCSPerHourScreen';
 import QualityAnalysisScreen from './src/screens/QualityAnalysisScreen';
 import AIAssistantScreen from './src/screens/AIAssistantScreen';
+import ModelPartProductionScreen from './src/screens/ModelPartProductionScreen';
 
 
 // Unchanged — every existing route name, kept in one place so both
@@ -64,6 +65,7 @@ export type RootStackParamList = {
   PCSPerHour: undefined;
   QualityAnalysis: undefined;
   AIAssistant: undefined;
+  ModelPartProduction: undefined;
 };
 
 const AuthStack = createNativeStackNavigator<RootStackParamList>();
@@ -125,6 +127,7 @@ function AppNavigator() {
       <AppStack.Screen name="PCSPerHour" component={withScreenContainer(PCSPerHourScreen)} />
       <AppStack.Screen name="QualityAnalysis" component={withScreenContainer(QualityAnalysisScreen)} />
       <AppStack.Screen name="AIAssistant" component={withScreenContainer(AIAssistantScreen)} />
+      <AppStack.Screen name="ModelPartProduction" component={withScreenContainer(ModelPartProductionScreen)} />
     </AppStack.Navigator>
   );
 }
@@ -182,6 +185,7 @@ const linking: LinkingOptions<RootStackParamList> = {
       PCSPerHour: 'pcs-per-hour',
       QualityAnalysis: 'quality-analysis',
       AIAssistant: 'ai-assistant',
+      ModelPartProduction: 'model-part-production',
     },
   },
 };

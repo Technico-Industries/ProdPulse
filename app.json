@@ -17,7 +17,7 @@
     },
     "android": {
       "package": "com.technicoindustries.prodpulse",
-      "versionCode": 28,
+      "versionCode": 29,
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/logo.png",

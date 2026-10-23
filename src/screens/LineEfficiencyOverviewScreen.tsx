@@ -22,10 +22,13 @@
 //                     unmount.
 //
 // Efficiency and the colour bands are in src/utils/lineEfficiency.ts.
+// A running line's card has an admin-only "End Production" action
+// (src/utils/endProduction.ts): it archives and closes the line's session
+// without submitting unsaved slots.
 // This page is deliberately date-free: it shows what is running NOW. The
 // Production page keeps its own selected-date metrics and filters.
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   View,
   Text,
@@ -35,6 +38,8 @@ import {
   RefreshControl,
   ActivityIndicator,
   Modal,
+  Alert,
+  Platform,
   useWindowDimensions,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
@@ -60,6 +65,21 @@ import {
   productionFigures,
   summarize,
 } from '../utils/lineEfficiency';
+import { useAuthStore } from '../stores/authStore';
+import { adminEndProductionSession } from '../services/endProductionSession';
+import { EndProductionTarget, confirmAndEndProduction, sessionInstanceOf } from '../utils/endProduction';
+
+// Cross-platform yes/no — Alert buttons don't fire on react-native-web (see
+// RecordProductionScreen handleFinalizeSession).
+function confirmEndProduction(title: string, message: string): Promise<boolean> {
+  if (Platform.OS === 'web') return Promise.resolve(window.confirm(`${title}\n\n${message}`));
+  return new Promise((resolve) => {
+    Alert.alert(title, message, [
+      { text: 'Cancel', style: 'cancel', onPress: () => resolve(false) },
+      { text: 'End Production', style: 'destructive', onPress: () => resolve(true) },
+    ], { cancelable: true, onDismiss: () => resolve(false) });
+  });
+}
 
 function toMillis(ts: any): number | null {
   return ts?.toMillis ? ts.toMillis() : null;
@@ -132,7 +152,17 @@ function EfficiencyRing({ card }: { card: LineCard }) {
 
 // ─── Line card ───────────────────────────────────────────────────────────────
 
-function LineTile({ card, width }: { card: LineCard; width: string }) {
+function LineTile({
+  card,
+  width,
+  ending,
+  onEnd,
+}: {
+  card: LineCard;
+  width: string;
+  ending: boolean;
+  onEnd: ((card: LineCard) => void) | null;
+}) {
   const badgeColor =
     card.status === 'running' ? '#4C9A6A' : card.status === 'stopped' ? '#D64545' : INACTIVE_COLOR;
   const icon =
@@ -192,6 +222,25 @@ function LineTile({ card, width }: { card: LineCard; width: string }) {
           </Text>
         ) : null}
       </View>
+      {/* Running lines only — a stopped or inactive line has no action. */}
+      {card.status === 'running' && card.session && onEnd ? (
+        <Pressable
+          onPress={() => onEnd(card)}
+          disabled={ending}
+          style={({ pressed }) => [styles.endBtn, ending && styles.endBtnBusy, pressed && styles.pressed]}
+          accessibilityRole="button"
+          accessibilityLabel={`End production for ${card.lineName}`}
+          accessibilityState={{ disabled: ending, busy: ending }}
+        >
+          {ending ? (
+            <ActivityIndicator size="small" color="#D64545" />
+          ) : (
+            <Text style={styles.endBtnText} numberOfLines={1}>
+              End Production
+            </Text>
+          )}
+        </Pressable>
+      ) : null}
     </View>
   );
 }
@@ -372,6 +421,7 @@ export default function LineEfficiencyOverviewScreen() {
               stopsBySlot: data.stopsBySlot ?? null,
               startedAtMs: toMillis(data.startedAt),
               updatedAtMs: toMillis(data.updatedAt),
+              sessionInstance: sessionInstanceOf(data),
             };
           })
         );
@@ -466,6 +516,37 @@ export default function LineEfficiencyOverviewScreen() {
   const cards = useMemo(() => filterLineCards(allCards, { plant, workshop }), [allCards, plant, workshop]);
   const counts = useMemo(() => summarize(cards), [cards]);
   const activeFilterCount = [plant, workshop].filter(Boolean).length;
+
+  // ── End Production (admin) — see utils/endProduction. The UI check below
+  // is not the permission: the transaction re-reads the admin's profile.
+  const authUser = useAuthStore((s) => s.user);
+  const isAdmin = authUser?.role === 'admin';
+  const endingRef = useRef<Set<string>>(new Set());
+  const [endingLines, setEndingLines] = useState<Set<string>>(new Set());
+  const [endResult, setEndResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const endProduction = useCallback(async (card: LineCard) => {
+    if (!authUser) return;
+    const target: EndProductionTarget = {
+      lineId: card.lineId,
+      lineName: card.lineName,
+      sessionInstance: card.session?.sessionInstance ?? null,
+    };
+    const outcome = await confirmAndEndProduction(target, {
+      inFlight: endingRef.current,
+      confirm: confirmEndProduction,
+      end: (t) => adminEndProductionSession(t, { uid: authUser.uid, name: authUser.name, email: authUser.email }),
+      onBusyChange: (lineId, busy) =>
+        setEndingLines((prev) => {
+          const next = new Set(prev);
+          if (busy) next.add(lineId);
+          else next.delete(lineId);
+          return next;
+        }),
+    });
+    // The activeSessions listener takes the line off "running" by itself.
+    if (outcome.kind === 'ended') setEndResult({ ok: true, message: outcome.message });
+    else if (outcome.kind === 'error') setEndResult({ ok: false, message: outcome.message });
+  }, [authUser]);
 
   // ── Responsive grid. Percentage widths in a wrapping row, so nothing can
   // overflow horizontally at any breakpoint.
@@ -591,6 +672,21 @@ export default function LineEfficiencyOverviewScreen() {
               </View>
             ) : null}
 
+            {/* ── End Production result ───────────────────────────────── */}
+            {endResult ? (
+              <View style={[styles.warnBanner, endResult.ok && styles.okBanner]} accessibilityLiveRegion="polite">
+                <Ionicons
+                  name={endResult.ok ? 'checkmark-circle-outline' : 'alert-circle-outline'}
+                  size={16}
+                  color={endResult.ok ? '#4C9A6A' : '#D64545'}
+                />
+                <Text style={[styles.warnText, { color: endResult.ok ? '#4C9A6A' : '#D64545' }]}>{endResult.message}</Text>
+                <Pressable onPress={() => setEndResult(null)} hitSlop={8} accessibilityRole="button" accessibilityLabel="Dismiss">
+                  <Ionicons name="close" size={16} color="#8A96A3" />
+                </Pressable>
+              </View>
+            ) : null}
+
             {/* ── Legend ──────────────────────────────────────────────── */}
             <View style={styles.legend}>
               {LEGEND.map(({ band, range }) => (
@@ -631,7 +727,13 @@ export default function LineEfficiencyOverviewScreen() {
             ) : (
               <View style={styles.grid}>
                 {cards.map((card) => (
-                  <LineTile key={card.lineId} card={card} width={tileWidth} />
+                  <LineTile
+                    key={card.lineId}
+                    card={card}
+                    width={tileWidth}
+                    ending={endingLines.has(card.lineId)}
+                    onEnd={isAdmin ? endProduction : null}
+                  />
                 ))}
               </View>
             )}
@@ -752,6 +854,24 @@ const styles = StyleSheet.create({
     paddingVertical: 9,
   },
   warnText: { flex: 1, color: '#F2A93B', fontSize: 12, fontWeight: '600' },
+  okBanner: { borderColor: '#4C9A6A66', backgroundColor: '#4C9A6A14' },
+
+  endBtn: {
+    alignSelf: 'center',
+    marginTop: 7,
+    minHeight: 26,
+    minWidth: 96,
+    borderWidth: 1,
+    borderColor: '#D6454588',
+    backgroundColor: '#D6454518',
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  endBtnBusy: { opacity: 0.6 },
+  endBtnText: { color: '#D64545', fontSize: 10.5, fontWeight: '800' },
 
   legend: { flexDirection: 'row', flexWrap: 'wrap', columnGap: 14, rowGap: 6 },
   legendItem: { flexDirection: 'row', alignItems: 'center', gap: 6 },

@@ -54,7 +54,9 @@ import {
   Timestamp,
   onSnapshot,
   runTransaction,
+  FieldPath,
 } from 'firebase/firestore';
+import { ENDED_SESSIONS_COLLECTION, endedSessionId } from '../utils/endProduction';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { db } from '../services/firebase';
 import { useAuthStore } from '../stores/authStore';
@@ -77,6 +79,7 @@ import {
   resolveRestore,
   saveDraft,
   serializeLossReasons,
+  sessionWriteGate,
   serializeStops,
   syncRetryDelayMs,
   syncStatesEqual,
@@ -1036,7 +1039,8 @@ export default function RecordProductionScreen() {
   const [lastSyncedAtMs, setLastSyncedAtMs] = useState<number | null>(null);
   // Set once the session doc is finalized/replaced on another device.
   const remoteEndedRef = useRef<'finalized' | 'replaced' | null>(null);
-  const [remoteEnded, setRemoteEnded] = useState<'finalized' | 'replaced' | null>(null);
+  // 'ended' = ended by an admin (End Production), shown instead of 'finalized'.
+  const [remoteEnded, setRemoteEnded] = useState<'finalized' | 'replaced' | 'ended' | null>(null);
   const [syncConflicts, setSyncConflicts] = useState<Record<string, SyncConflict | null>>({});
   const syncConflictsRef = useRef<Record<string, SyncConflict | null>>({});
   syncConflictsRef.current = syncConflicts;
@@ -1906,9 +1910,9 @@ export default function RecordProductionScreen() {
         const instance = sessionInstanceRef.current;
         await withTimeout(runTransaction(db, async (tx) => {
           const snap = await tx.get(docRef);
-          if (!snap.exists()) throw new SessionGoneError('finalized');
+          const gone = sessionWriteGate({ exists: snap.exists(), sessionInstanceId: snap.exists() ? (snap.data() as ActiveSessionDoc).sessionInstanceId : null }, instance);
+          if (gone) throw new SessionGoneError(gone);
           const remoteDoc = snap.data() as ActiveSessionDoc;
-          if (instance && remoteDoc.sessionInstanceId && remoteDoc.sessionInstanceId !== instance) throw new SessionGoneError('replaced');
           // Merged only if another device synced since this device's last sync.
           const plan = planSessionSync(
             base,
@@ -2035,12 +2039,50 @@ export default function RecordProductionScreen() {
     clearSaveTimers();
     clearRetryTimer();
     const unsynced = hasPendingChanges();
-    notify(
+    const notifyEnded = () => notify(
       kind === 'finalized' ? 'Session finalized on another device' : 'Session replaced on another device',
       (unsynced
         ? 'Entries made on this device that had not synced yet are NOT part of that session\'s records. They are still shown here and kept on this device. '
         : '') + 'This screen no longer saves. Go back to continue.'
     );
+    if (kind !== 'finalized') { notifyEnded(); return; }
+    // A gone doc is either Finalize or an admin's End Production — the
+    // latter leaves an archive (utils/endProduction). Captured now: the
+    // screen may be reset while the lookup runs.
+    const L = latestRef.current;
+    const lineId = L.sessionLineId ?? L.selectedLineId;
+    const archiveId = lineId ? endedSessionId(lineId, sessionInstanceRef.current) : null;
+    const recovery = unsynced
+      ? { uid: L.uid ?? null, deviceId: deviceIdRef.current, savedAtMs: Date.now(), baseRevision: serverBaseRef.current?.revision ?? null, local: currentSyncState() }
+      : null;
+    (async () => {
+      let archive: Awaited<ReturnType<typeof getDoc>> | null = null;
+      try {
+        if (archiveId) archive = await getDoc(doc(db, ENDED_SESSIONS_COLLECTION, archiveId));
+      } catch (e) {
+        console.warn('[session ended] could not check for an admin end', e);
+      }
+      if (!archive?.exists()) { notifyEnded(); return; }
+      if (remoteEndedRef.current === 'finalized') setRemoteEnded('ended');
+      // Unsynced entries from this device go into the archive too (never
+      // into a session or productionRecords), so they stay recoverable
+      // beyond this device. The device draft is kept either way.
+      let copied = false;
+      if (recovery) {
+        try {
+          await updateDoc(archive.ref, new FieldPath('recoveredDrafts', recovery.deviceId ?? 'device'), recovery);
+          copied = true;
+        } catch (e) {
+          console.warn('[session ended] could not copy unsynced entries to the archive', e);
+        }
+      }
+      notify(
+        'Production ended by an admin',
+        (recovery
+          ? `Entries made on this device that had not synced yet were not saved as production records. They are still shown here, kept on this device${copied ? ' and copied to the ended session\'s archive' : ''}. `
+          : '') + 'Saved slots are unchanged. This screen no longer saves. Go back to continue.'
+      );
+    })();
   }
 
   // Autosave: any change to the session's synced data saves the device
@@ -2082,10 +2124,9 @@ export default function RecordProductionScreen() {
         // No base = this screen already left the session (reset clears it
         // synchronously), e.g. its own Finalize just deleted the doc.
         if (snap.metadata.hasPendingWrites || finalizingRef.current || !serverBaseRef.current) return;
-        if (!snap.exists()) { handleRemoteEnded('finalized'); return; }
+        const gone = sessionWriteGate({ exists: snap.exists(), sessionInstanceId: snap.exists() ? (snap.data() as ActiveSessionDoc).sessionInstanceId : null }, sessionInstanceRef.current);
+        if (gone) { handleRemoteEnded(gone); return; }
         const d = snap.data() as ActiveSessionDoc;
-        const instance = sessionInstanceRef.current;
-        if (instance && d.sessionInstanceId && d.sessionInstanceId !== instance) { handleRemoteEnded('replaced'); return; }
         const rev = typeof d.revision === 'number' ? d.revision : 0;
         const base = serverBaseRef.current;
         if (!base || rev <= base.revision) return; // own sync echo, or nothing new
@@ -3914,7 +3955,9 @@ export default function RecordProductionScreen() {
             {/* Session save status (see persistSession) */}
             <Text style={[styles.subtitle, { marginTop: 2, fontWeight: '700', color: remoteEnded || sessionSync === 'error' ? '#D64545' : '#8A96A3' }]}>
               {remoteEnded
-                ? `Session ${remoteEnded === 'finalized' ? 'finalized' : 'replaced'} on another device — no longer saving. Go back to continue.`
+                ? remoteEnded === 'ended'
+                  ? 'Production ended by an admin — no longer saving. Go back to continue.'
+                  : `Session ${remoteEnded === 'finalized' ? 'finalized' : 'replaced'} on another device — no longer saving. Go back to continue.`
                 : sessionSync === 'error'
                 ? 'NOT SYNCED — latest changes are only on this device; other devices can\'t see them yet. Retrying automatically (or tap Save Session).'
                 : sessionSync === 'pending' || persistingSession

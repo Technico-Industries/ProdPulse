@@ -97,6 +97,9 @@ export interface LiveSession {
   stopsBySlot: Record<string, SessionStopEvent[] | null | undefined> | null;
   startedAtMs: number | null;
   updatedAtMs: number | null;
+  // Which run of the line's session this is (utils/endProduction
+  // sessionInstanceOf) — checked by the admin End Production action.
+  sessionInstance?: string | null;
 }
 
 export type LineStatus = 'running' | 'stopped' | 'not_running';

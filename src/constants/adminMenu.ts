@@ -63,6 +63,14 @@ export const ADMIN_MENU_ITEMS: AdminMenuItem[] = [
     route: 'GenerateReport',
   },
   {
+    key: 'model-part-production',
+    title: 'Model / Part Production',
+    subtitle: 'Total production by model and part for a day or date range',
+    icon: 'cube',
+    accent: '#4C9A6A',
+    route: 'ModelPartProduction',
+  },
+  {
     key: 'kpi-analysis',
     title: 'KPI Analysis',
     subtitle: 'Track efficiency, downtime, and rejection trends',
