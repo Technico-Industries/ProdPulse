@@ -37,16 +37,15 @@ const db = getFirestore(app);
 // client, only this callable-function client.
 const functions = getFunctions(app);
 
-// Dev-only: point the Functions client at the local emulator instead of
-// production. Wrapped in try/catch (same pattern as initializeAuth above)
-// because Expo's fast refresh can re-run this module, and calling
-// connectFunctionsEmulator twice on an already-connected instance throws.
-// NOTE: 127.0.0.1 only resolves to the emulator from a web browser or iOS
-// simulator running on the same machine as the emulator. An Android
-// emulator needs 10.0.2.2 instead, and a physical device needs your
-// machine's LAN IP — this is left as 127.0.0.1 since that's what's
-// currently being used for web testing.
-if (__DEV__) {
+// Dev-only, opt-in: point the Functions client at the local emulator
+// (`npm --prefix functions run serve`) instead of production. Set
+// EXPO_PUBLIC_USE_FUNCTIONS_EMULATOR=1 in .env.local to enable it — it used
+// to be always on in dev, so every dev build called an emulator that was
+// usually not running. Wrapped in try/catch because Expo's fast refresh can
+// re-run this module, and connecting twice throws.
+// NOTE: an Android emulator reaches the host as 10.0.2.2; a physical device
+// needs your machine's LAN IP.
+if (__DEV__ && process.env.EXPO_PUBLIC_USE_FUNCTIONS_EMULATOR === '1') {
   try {
     const emulatorHost = Platform.OS === 'android' ? '10.0.2.2' : '127.0.0.1';
     connectFunctionsEmulator(functions, emulatorHost, 5001);

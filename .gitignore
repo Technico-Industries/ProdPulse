@@ -54,3 +54,6 @@ coverage/
 scripts/serviceAccountKey.json
 functions/.secret.local
 functions/.secret.local
+
+# Cloud Functions build output
+functions/lib/

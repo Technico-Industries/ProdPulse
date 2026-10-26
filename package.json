@@ -52,6 +52,8 @@
     "test:shift-b-overnight": "tsx scripts/testShiftBOvernight.ts",
     "test:end-production": "tsx scripts/testEndProduction.ts",
     "test:model-part": "tsx scripts/testModelPartProduction.ts",
+    "test:ai": "tsx functions/test/prodPulseAI.test.ts",
+    "test:cors": "tsx functions/test/cors.test.ts",
     "build": "expo export --platform web"
   },
   "private": true

@@ -10,6 +10,7 @@ import {
   ActivityIndicator,
   RefreshControl,
   Alert,
+  Platform,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import WebRefreshButton from '../components/WebRefreshButton';
@@ -17,7 +18,7 @@ import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { collection, getDocs, onSnapshot, query, where, orderBy, Timestamp, doc, updateDoc, serverTimestamp } from 'firebase/firestore';
 import { db } from '../services/firebase';
 import { useAuthStore } from '../stores/authStore';
-import { ADMIN_MENU_ITEMS } from '../constants/adminMenu';
+import { ADMIN_MENU_ITEMS, visibleMenuItems } from '../constants/adminMenu';
 import AdminDashboardPager, { QualityDashboardPager } from '../components/AdminDashboardPager';
 import { SUPERVISOR_MENU_ITEMS } from '../constants/supervisorMenu';
 import SupervisorOverviewScreen from './SupervisorOverviewScreen';
@@ -40,7 +41,7 @@ interface OptionConfig {
 // src/constants/adminMenu.ts and src/components/AppDrawer.tsx. Nothing
 // was deleted; only the entry point moved. Kept aliased here so the
 // `options` selection below stays unchanged for every other role.
-const ADMIN_OPTIONS: OptionConfig[] = ADMIN_MENU_ITEMS;
+const ADMIN_OPTIONS: OptionConfig[] = visibleMenuItems(ADMIN_MENU_ITEMS, Platform.OS);
 
 // The Supervisor entries used to live here as dashboard cards. The
 // Supervisor main dashboard is now SupervisorOverviewScreen (a digital

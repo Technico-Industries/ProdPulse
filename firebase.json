@@ -3,12 +3,14 @@
     {
       "source": "functions",
       "codebase": "default",
-      "runtime": "nodejs20",
+      "runtime": "nodejs22",
       "ignore": [
         "node_modules",
         ".git",
         "firebase-debug.log",
-        "*.local"
+        "*.local",
+        "test",
+        "scripts"
       ],
       "predeploy": [
         "npm --prefix \"$RESOURCE_DIR\" run build"

@@ -1,0 +1,27 @@
+{
+  "name": "prodpulse-functions",
+  "private": true,
+  "main": "lib/index.js",
+  "engines": {
+    "node": "22"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "tsx test/prodPulseAI.test.ts && tsx test/cors.test.ts",
+    "serve": "npm run build && firebase emulators:start --only functions",
+    "deploy": "firebase deploy --only functions:prodPulseAI",
+    "diagnose:xai": "tsx scripts/diagnoseXai.ts"
+  },
+  "dependencies": {
+    "firebase-admin": "^14.5.0",
+    "firebase-functions": "^7.4.0",
+    "openai": "^7.43.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.23.13",
+    "typescript": "~6.0.3"
+  }
+}

@@ -23,10 +23,11 @@ import {
   ScrollView,
   StyleSheet,
   useWindowDimensions,
+  Platform,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useNavigation } from '@react-navigation/native';
-import { AdminMenuItem } from '../constants/adminMenu';
+import { AdminMenuItem, visibleMenuItems } from '../constants/adminMenu';
 import { useAuthStore } from '../stores/authStore';
 
 interface Props {
@@ -126,7 +127,7 @@ export default function AppDrawer({ visible, onClose, items, dashboardSubtitle }
               </View>
             </Pressable>
 
-            {items.map((item) => (
+            {visibleMenuItems(items, Platform.OS).map((item) => (
               <Pressable
                 key={item.key}
                 onPress={() => go(item.route)}

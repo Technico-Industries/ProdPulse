@@ -19,6 +19,14 @@ export interface AdminMenuItem {
   icon: IconName;
   accent: string;
   route: string;
+  // Shown on the web app only (hidden on Android/iOS).
+  webOnly?: boolean;
+}
+
+// The entries to render on a platform (pass Platform.OS). Kept here, free of
+// react-native, so the node checks in scripts/ can import this file.
+export function visibleMenuItems<T extends { webOnly?: boolean }>(items: T[], platformOS: string): T[] {
+  return items.filter((i) => !i.webOnly || platformOS === 'web');
 }
 
 export const ADMIN_MENU_ITEMS: AdminMenuItem[] = [
@@ -93,5 +101,6 @@ export const ADMIN_MENU_ITEMS: AdminMenuItem[] = [
     icon: 'sparkles',
     accent: '#8A5CF5',
     route: 'AIAssistant',
+    webOnly: true,
   },
 ];
