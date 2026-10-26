@@ -3,7 +3,7 @@
 // Client-side call into the secure ProdPulse AI backend (functions/src). This
 // file contains NO API key and NO Firestore query logic — it only invokes
 // the prodPulseAI callable Cloud Function, which verifies the signed-in user
-// is an active admin, queries production data and calls the AI model (xAI Grok) server-side.
+// is an active admin, queries production data and calls the AI model (Gemini) server-side.
 
 import { httpsCallable } from 'firebase/functions';
 import { functions, firebaseConfig } from './firebase';

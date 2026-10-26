@@ -1,9 +1,9 @@
 // functions/src/index.ts
 //
 // ProdPulse AI backend — one callable function, prodPulseAI, used by the web
-// app's AI screen (src/services/prodPulseAI.ts). The AI provider is xAI
-// (Grok) through its OpenAI-compatible Responses API (xai.ts). See
-// functions/README.md for setup (XAI_API_KEY secret, model, deploy).
+// app's AI screen (src/services/prodPulseAI.ts). The AI provider is Google
+// Gemini through the official Gen AI SDK (gemini.ts). See functions/README.md
+// for setup (GEMINI_API_KEY secret, model, deploy).
 
 // Must run before anything computes a date — see timezone.ts.
 import './timezone';
@@ -15,32 +15,32 @@ import { initializeApp } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
 import { firestoreDataSource } from './dataSource';
 import { createRateLimiter, handleProdPulseAI } from './handler';
-import type { CreateResponseFn } from './assistant';
-import { createXaiResponseFn, DEFAULT_XAI_MODEL } from './xai';
+import type { GenerateFn } from './assistant';
+import { createGeminiGenerateFn, DEFAULT_GEMINI_MODEL } from './gemini';
 import { callableOptions } from './options';
 
 // Server-side only: stored in Cloud Secret Manager (production) or
 // functions/.secret.local (emulator). Never sent to the client.
-const XAI_API_KEY = defineSecret('XAI_API_KEY');
-const XAI_MODEL = defineString('XAI_MODEL', { default: DEFAULT_XAI_MODEL });
+const GEMINI_API_KEY = defineSecret('GEMINI_API_KEY');
+const GEMINI_MODEL = defineString('GEMINI_MODEL', { default: DEFAULT_GEMINI_MODEL });
 
 initializeApp();
 const db = getFirestore();
 const rateLimit = createRateLimiter();
 
-let createResponse: CreateResponseFn | null = null;
+let generate: GenerateFn | null = null;
 
 export const prodPulseAI = onCall(
   {
     ...callableOptions(process.env, (msg) => logger.warn(`[prodPulseAI] ${msg}`)),
-    secrets: [XAI_API_KEY],
+    secrets: [GEMINI_API_KEY],
   },
   (request) =>
     handleProdPulseAI(request, {
       data: firestoreDataSource(db),
       // Throws AIConfigError (→ AI_CONFIGURATION_ERROR) when the key is missing.
-      createResponse: () => (createResponse ??= createXaiResponseFn(XAI_API_KEY.value())),
-      model: XAI_MODEL.value(),
+      generate: () => (generate ??= createGeminiGenerateFn(GEMINI_API_KEY.value())),
+      model: GEMINI_MODEL.value(),
       rateLimit,
       // Metadata and (masked) provider error text only — never the question,
       // results, ID tokens or keys.

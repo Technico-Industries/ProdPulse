@@ -1,6 +1,6 @@
 // functions/src/tools.ts
 //
-// The read-only production tools the model (Grok) may call. Each tool:
+// The read-only production tools the model (Gemini) may call. Each tool:
 //   1. validates its arguments (dates, filters, groupings, limits) — an
 //      invalid argument is returned to the model as an error, never guessed;
 //   2. reads data only through ProductionDataSource (fixed collections and

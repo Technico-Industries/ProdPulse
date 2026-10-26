@@ -10,7 +10,7 @@ browser (signed-in admin)
             1. request.auth (Firebase ID token, verified by the runtime)
             2. users/{uid}: role === 'admin' && active !== false
             3. payload validation + per-user rate limit
-            4. xAI Grok (OpenAI SDK → https://api.x.ai/v1/responses, key from Secret Manager)
+            4. Gemini (@google/genai → generativelanguage.googleapis.com, key from Secret Manager)
                  ⇄ read-only tools (tools.ts) → Firestore via Admin SDK (dataSource.ts)
             5. { reply, results[], toolErrors[], dataRetrieved, model, generatedAt }
 ```
@@ -26,11 +26,12 @@ browser (signed-in admin)
   read only `productionRecords`, `productionLines`, `activeSessions`,
   `rejectionRecords` and `users`.
 
-## 1. xAI API key (`XAI_API_KEY`)
+## 1. Gemini API key (`GEMINI_API_KEY`)
 
-Create a key in the xAI console (https://console.x.ai). The team needs
-**credits or billing set up**. Without them xAI rejects calls, and the app
-says the xAI account has "no credits or a billing problem".
+Create a key in Google AI Studio (https://aistudio.google.com/apikey). The
+key's Google Cloud project must have **billing in good standing**. If the
+billing account has an outstanding balance, Gemini rejects calls, and the app
+reports a Gemini billing problem (`AI_CONFIGURATION_ERROR · NO_CREDITS`).
 
 The key is **server-side only**. Never put it in `app.json`, an
 `EXPO_PUBLIC_*` variable, a root `.env` file or any file under `src/`,
@@ -41,50 +42,60 @@ Firebase web `apiKey` in `src/services/firebase.ts`.
 the key:
 
 ```sh
-npx firebase functions:secrets:set XAI_API_KEY         # paste the key at the prompt
+npx firebase functions:secrets:set GEMINI_API_KEY --project technico-industries-ltd   # paste the key at the prompt
 ```
 
-Redeploy the function after rotating so it picks up the new version.
+Redeploy the function after setting or rotating the key. Each deploy pins
+the version that is latest at that moment.
 
 **Local emulator.** Put the key in `functions/.secret.local`, which is
 gitignored and never deployed:
 
 ```
-XAI_API_KEY=your-key
+GEMINI_API_KEY=your-key
 ```
 
-If the key is missing or empty, requests fail with `AI_CONFIGURATION_ERROR`
-("Ask the developer to set XAI_API_KEY"). This check runs only after the
-caller passes authentication and the admin check.
+If the key is missing or empty, requests fail with `AI_CONFIGURATION_ERROR ·
+KEY_MISSING`. This check runs only after the caller passes authentication and
+the admin check.
+
+**Check a key without exposing it.** Run the local diagnostic. It reads the
+key from stdin and prints only the HTTP status, Google's error status and
+reason, and the model's reply:
+
+```sh
+npx firebase functions:secrets:access GEMINI_API_KEY --project technico-industries-ltd \
+  | npm --prefix functions run -s diagnose:gemini -- gemini-3.8-flash
+```
 
 ## 2. Model and API
 
-- **API.** xAI's Responses API (`POST https://api.x.ai/v1/responses`), called
-  through the official `openai` npm SDK with `baseURL: https://api.x.ai/v1`
-  (`src/xai.ts`). xAI recommends the Responses API; it marks Chat
-  Completions as deprecated.
-- **Stateless.** Every request sets `store: false`, so no question or
-  production result is kept on xAI's servers. xAI's default is to store
-  responses for 30 days. The loop resends the conversation each round
-  instead, replaying the model's encrypted reasoning and function-call items
-  unchanged (`include: ["reasoning.encrypted_content"]`).
-- **Model.** The default is `grok-4.7`, xAI's recommended default model and
-  the one its function-calling guide uses. To change it, create
-  `functions/.env`:
+- **API.** The Gemini Developer API `generateContent` endpoint, called with
+  function calling through Google's official `@google/genai` SDK
+  (`src/gemini.ts`). The key goes in the `x-goog-api-key` header, never in
+  the URL.
+- **Model.** The default is `gemini-3.8-flash`, the same model ProdPulse AI
+  used before the xAI switch, and one of Google's stable models. To change
+  it, set it in `functions/.env.technico-industries-ltd` or `functions/.env`:
 
   ```
-  XAI_MODEL=grok-4.3
+  GEMINI_MODEL=gemini-3.5-flash-lite
   ```
 
-  If the model doesn't exist or the team has no access to it, requests fail
-  with `AI_CONFIGURATION_ERROR` ("check XAI_MODEL").
+  When you answer the deploy prompt for `GEMINI_MODEL`, enter a model name,
+  not the key. A value that isn't a model ID is refused before any request
+  (`MODEL_MISCONFIGURED`) and is never logged. An unknown model fails with
+  `MODEL_UNAVAILABLE`.
+- **Thought signatures.** `generateContent` is stateless. Each round resends
+  the whole conversation, and the model's function-call turn goes back
+  unchanged so its thought signatures are preserved.
 
-**Retired Gemini configuration.** `GEMINI_API_KEY` and `GEMINI_MODEL` are no
-longer read. If you stored `GEMINI_API_KEY` in Secret Manager, remove it after
-the xAI version is deployed:
+**Retired xAI configuration.** `XAI_API_KEY` and `XAI_MODEL` are no longer
+read. The next deploy drops the function's `XAI_API_KEY` binding and its
+`XAI_MODEL` variable. Once Gemini is confirmed working, delete the old secret:
 
 ```sh
-npx firebase functions:secrets:destroy GEMINI_API_KEY
+npx firebase functions:secrets:destroy XAI_API_KEY --project technico-industries-ltd
 ```
 
 ## 3. Allowed web origins (CORS)
@@ -131,7 +142,7 @@ SDK. The Admin SDK bypasses Firestore Security Rules, so authorization is
 enforced in code (`handler.ts`). No security-rule changes are needed or made.
 If you move the function to a dedicated service account, grant it
 `roles/datastore.viewer` (read-only) and `roles/secretmanager.secretAccessor`
-on `XAI_API_KEY`.
+on `GEMINI_API_KEY`.
 
 **Indexes.** None. Every query uses one single-field range, which Firestore's
 automatic indexes serve.
@@ -146,7 +157,7 @@ automatic indexes serve.
 | Docs per query | 20,000 | `dataSource.ts` |
 | Tool rounds / calls per round | 5 / 4 | `assistant.ts` |
 | Token budget per question | 120k | `assistant.ts` |
-| Per xAI call / whole request | 40 s / 75 s (function timeout 90 s) | `assistant.ts`, `index.ts` |
+| Per Gemini call / whole request | 40 s / 75 s (function timeout 90 s) | `assistant.ts`, `index.ts` |
 | Rate limit | 20 questions / 10 min per user per instance | `handler.ts` |
 | Instances | max 3 | `index.ts` |
 
@@ -164,6 +175,6 @@ in `.env.local` and run `npm run web`. The emulated function reads the
 ## 7. Tests
 
 ```sh
-npm run test:ai                        # from the repo root; xAI and Firestore are mocked (no network)
+npm run test:ai                        # from the repo root; Gemini and Firestore are mocked (no network)
 npm run test:cors                      # preflight / CORS headers through the real onCall wrapper on localhost
 ```

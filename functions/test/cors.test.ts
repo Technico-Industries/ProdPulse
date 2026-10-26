@@ -16,7 +16,7 @@ import { onCall } from 'firebase-functions/v2/https';
 import { callableOptions } from '../src/options';
 import { allowedOrigins, isValidOrigin, LOCAL_DEV_ORIGINS } from '../src/cors';
 import { createRateLimiter, handleProdPulseAI } from '../src/handler';
-import type { CreateResponseFn, XaiResponse } from '../src/assistant';
+import type { GenerateFn, GenResponse } from '../src/assistant';
 import type { ProductionDataSource } from '../src/dataSource';
 
 let passed = 0;
@@ -48,12 +48,12 @@ const data: ProductionDataSource = {
   async getActiveSessions() { return []; },
   async getRejectionLog() { return []; },
 };
-const reply: XaiResponse = { status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: 'OK from handler' }] }], usage: { total_tokens: 10 } };
-const createResponse: CreateResponseFn = async () => reply;
+const reply: GenResponse = { text: 'OK from handler', candidates: [{ content: { role: 'model', parts: [{ text: 'OK from handler' }] } }] };
+const generate: GenerateFn = async () => reply;
 
 const fn = onCall(callableOptions(ENV), (request) => {
   handlerCalls++;
-  return handleProdPulseAI(request, { data, createResponse: () => createResponse, model: 'grok-test', rateLimit: createRateLimiter() });
+  return handleProdPulseAI(request, { data, generate: () => generate, model: 'gemini-test', rateLimit: createRateLimiter() });
 });
 
 // Minimal stand-in for the Cloud Functions HTTP layer: JSON body + rawBody.
@@ -161,7 +161,7 @@ async function main() {
     assert.equal(r.headers.get('access-control-allow-origin'), PROD_ORIGIN);
     const body: any = await r.json();
     assert.equal(body.result.reply, 'OK from handler');
-    assert.equal(body.result.model, 'grok-test');
+    assert.equal(body.result.model, 'gemini-test');
     assert.equal(handlerCalls, before + 1);
   });
 

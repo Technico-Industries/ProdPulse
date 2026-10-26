@@ -1,20 +1,16 @@
 // functions/src/assistant.ts
 //
-// The tool-calling loop, on xAI's Responses API (Grok). Grok picks tools and
-// writes the explanation; every number comes from tools.ts. The loop
-// enforces:
+// The Gemini function-calling loop. Gemini picks tools and writes the
+// explanation; every number comes from tools.ts. The loop enforces:
 //   • at most MAX_TOOL_ROUNDS rounds and MAX_CALLS_PER_ROUND calls a round;
 //   • an overall deadline and a per-call timeout;
 //   • a token budget (when spent, the model must answer from what it has);
 //   • tool failures are reported to the model AND to the UI — the model is
 //     told never to present a failed query as data.
 //
-// STATELESS — every request is sent with store: false, so neither the
-// question nor any production result is kept on xAI's servers (the API's
-// default keeps responses for 30 days). The conversation is resent each
-// round instead: the model's output items (encrypted reasoning, function
-// calls) are replayed unchanged, followed by one function_call_output per
-// call, matched by call_id.
+// generateContent is stateless: the whole conversation is sent each round.
+// The model's own turn (function calls with their thought signatures) goes
+// back unchanged, followed by one functionResponse per call.
 
 import type { AIHistoryMessage, AIToolError, ProdPulseAIResponse, ResultBlock } from '../../src/utils/prodPulseAI';
 import { productionDayKeyFor } from '../../src/utils/productionDay';
@@ -29,87 +25,25 @@ export const REQUEST_DEADLINE_MS = 75_000;
 export const CALL_TIMEOUT_MS = 40_000;
 export const MAX_OUTPUT_TOKENS = 2048;
 
-// ─── xAI Responses API shapes (the subset the loop uses) ─────────────────────
-
-export interface XaiFunctionTool {
-  type: 'function';
-  name: string;
-  description: string;
-  parameters: unknown;
+// The subset of @google/genai's GenerateContentResponse the loop reads.
+export interface GenResponse {
+  functionCalls?: { id?: string; name?: string; args?: Record<string, unknown> }[];
+  text?: string;
+  candidates?: { content?: { role?: string; parts?: unknown[] } }[];
+  usageMetadata?: { totalTokenCount?: number };
 }
 
-export interface XaiRequest {
+export type GenerateFn = (params: {
   model: string;
-  instructions: string;
-  input: unknown[];
-  tools: XaiFunctionTool[];
-  tool_choice: 'auto' | 'none';
-  store: false;
-  include: ['reasoning.encrypted_content'];
-  max_output_tokens: number;
-  temperature: number;
-}
-
-export interface XaiOutputItem {
-  type: string;
-  // function_call
-  call_id?: string;
-  name?: string;
-  arguments?: string;
-  // message
-  content?: { type: string; text?: string }[];
-  [k: string]: unknown;
-}
-
-export interface XaiResponse {
-  status?: string;
-  output?: XaiOutputItem[];
-  output_text?: string;
-  usage?: { total_tokens?: number } | null;
-}
-
-export type CreateResponseFn = (request: XaiRequest, opts: { signal: AbortSignal }) => Promise<XaiResponse>;
-
-// The approved tools in xAI's flat function-tool shape.
-export const XAI_TOOLS: XaiFunctionTool[] = TOOL_DECLARATIONS.map((d) => ({
-  type: 'function',
-  name: d.name,
-  description: d.description,
-  parameters: d.parametersJsonSchema,
-}));
+  contents: unknown[];
+  config: Record<string, unknown>;
+}) => Promise<GenResponse>;
 
 export class AssistantError extends Error {
   constructor(public kind: 'timeout' | 'malformed', message: string, public cause?: unknown) {
     super(message);
     this.name = 'AssistantError';
   }
-}
-
-// Visible answer text: the output_text parts of message items (the SDK's
-// output_text convenience field as a fallback).
-export function responseText(res: XaiResponse): string {
-  const parts: string[] = [];
-  (res.output ?? []).forEach((item) => {
-    if (item?.type !== 'message' || !Array.isArray(item.content)) return;
-    item.content.forEach((c) => { if (c?.type === 'output_text' && typeof c.text === 'string') parts.push(c.text); });
-  });
-  const text = parts.length ? parts.join('') : typeof res.output_text === 'string' ? res.output_text : '';
-  return text.trim();
-}
-
-// A function call's arguments arrive as a JSON string; anything that is not
-// a JSON object is an invalid call, reported back to the model.
-export function parseArguments(raw: unknown): Record<string, unknown> {
-  if (raw == null || raw === '') return {};
-  if (typeof raw !== 'string') throw new ToolArgError('Tool arguments must be a JSON object.');
-  let v: unknown;
-  try {
-    v = JSON.parse(raw);
-  } catch {
-    throw new ToolArgError('Tool arguments were not valid JSON.');
-  }
-  if (!v || typeof v !== 'object' || Array.isArray(v)) throw new ToolArgError('Tool arguments must be a JSON object.');
-  return v as Record<string, unknown>;
 }
 
 function dayName(key: string) {
@@ -158,7 +92,7 @@ export interface RunOptions {
   question: string;
   history: AIHistoryMessage[];
   model: string;
-  createResponse: CreateResponseFn;
+  generate: GenerateFn;
   data: ProductionDataSource;
   nowMs?: number;
   // Tests only; production uses CALL_TIMEOUT_MS.
@@ -174,39 +108,33 @@ export async function runAssistant(opts: RunOptions): Promise<ProdPulseAIRespons
   const toolErrors: AIToolError[] = [];
   let tokens = 0;
 
-  // Earlier turns are text only; the app's 'model' role is the API's
-  // 'assistant'.
-  const input: unknown[] = [
-    ...opts.history.map((m) => ({ role: m.role === 'model' ? 'assistant' : 'user', content: m.text })),
-    { role: 'user', content: opts.question },
+  const contents: unknown[] = [
+    ...opts.history.map((m) => ({ role: m.role, parts: [{ text: m.text }] })),
+    { role: 'user', parts: [{ text: opts.question }] },
   ];
 
-  const call = async (allowTools: boolean): Promise<XaiResponse> => {
+  const call = async (allowTools: boolean): Promise<GenResponse> => {
     const remaining = REQUEST_DEADLINE_MS - (Date.now() - started);
     if (remaining <= 1000) throw new AssistantError('timeout', 'The request took too long.');
     const controller = new AbortController();
     const res = await withTimeout(
-      opts.createResponse(
-        {
-          model: opts.model,
-          instructions: systemInstruction(nowMs),
-          input,
-          tools: XAI_TOOLS,
-          tool_choice: allowTools ? 'auto' : 'none',
-          store: false,
-          include: ['reasoning.encrypted_content'],
-          max_output_tokens: MAX_OUTPUT_TOKENS,
+      opts.generate({
+        model: opts.model,
+        contents,
+        config: {
+          systemInstruction: systemInstruction(nowMs),
+          tools: [{ functionDeclarations: TOOL_DECLARATIONS }],
+          toolConfig: { functionCallingConfig: { mode: allowTools ? 'AUTO' : 'NONE' } },
           temperature: 0.2,
+          maxOutputTokens: MAX_OUTPUT_TOKENS,
+          abortSignal: controller.signal,
         },
-        { signal: controller.signal }
-      ),
+      }),
       Math.min(opts.callTimeoutMs ?? CALL_TIMEOUT_MS, remaining),
       controller
     );
-    if (!res || typeof res !== 'object' || !Array.isArray(res.output)) {
-      throw new AssistantError('malformed', 'The AI service returned an unexpected response.');
-    }
-    tokens += res.usage?.total_tokens ?? 0;
+    if (!res || typeof res !== 'object') throw new AssistantError('malformed', 'The AI service returned an unexpected response.');
+    tokens += res.usageMetadata?.totalTokenCount ?? 0;
     return res;
   };
 
@@ -214,26 +142,26 @@ export async function runAssistant(opts: RunOptions): Promise<ProdPulseAIRespons
   for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
     const allowTools = round < MAX_TOOL_ROUNDS && tokens < TOTAL_TOKEN_BUDGET;
     const res = await call(allowTools);
-    const output = res.output ?? [];
-    const calls = allowTools ? output.filter((o) => o?.type === 'function_call') : [];
+    const calls = allowTools ? (res.functionCalls ?? []) : [];
     if (!calls.length) {
-      reply = responseText(res);
+      reply = typeof res.text === 'string' ? res.text.trim() : '';
       break;
     }
-    if (calls.some((c) => typeof c.call_id !== 'string' || !c.call_id)) {
-      throw new AssistantError('malformed', 'The AI service returned a tool call without an id.');
-    }
-    // The model's turn goes back unchanged (encrypted reasoning + calls).
-    input.push(...output);
+    // The model turn goes back unchanged — Gemini 3 needs its thought
+    // signatures returned with the function call parts.
+    const modelContent = res.candidates?.[0]?.content;
+    if (!modelContent) throw new AssistantError('malformed', 'The AI service returned an unexpected response.');
+    contents.push(modelContent);
 
+    const parts: unknown[] = [];
     for (const [i, fc] of calls.entries()) {
-      const name = typeof fc.name === 'string' ? fc.name : '';
+      const name = fc.name ?? '';
       let response: Record<string, unknown>;
       if (i >= MAX_CALLS_PER_ROUND) {
         response = { error: `Skipped: at most ${MAX_CALLS_PER_ROUND} tool calls per step.` };
       } else {
         try {
-          const out = await executeTool(name, parseArguments(fc.arguments), ctx);
+          const out = await executeTool(name, fc.args ?? {}, ctx);
           if (out.block) results.push(out.block);
           response = { output: out.forModel };
         } catch (e) {
@@ -255,9 +183,9 @@ export async function runAssistant(opts: RunOptions): Promise<ProdPulseAIRespons
           }
         }
       }
-      // Exactly one output per call, matched by call_id.
-      input.push({ type: 'function_call_output', call_id: fc.call_id, output: JSON.stringify(response) });
+      parts.push({ functionResponse: { ...(fc.id ? { id: fc.id } : {}), name, response } });
     }
+    contents.push({ role: 'user', parts });
   }
 
   if (!reply) throw new AssistantError('malformed', 'The AI service returned an empty answer.');

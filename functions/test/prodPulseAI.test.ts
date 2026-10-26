@@ -2,13 +2,14 @@
 //
 // Checks for ProdPulse AI: the web-only gate, the backend's auth / admin /
 // validation / rate-limit path, the read-only tools against the app's own
-// report calculations, the Grok (xAI) loop's error handling, and the export.
+// report calculations, the Gemini loop's error handling, and the export.
 // Plain node:assert script, like the project's other checks:  npm run test:ai
 //
-// Firestore and xAI are mocked: an in-memory data source that selects
+// Firestore and Gemini are mocked: an in-memory data source that selects
 // productionRecords with the real utils/productionDay logic, a scripted
-// createResponse() function, and — for the real OpenAI SDK wiring — a fake
-// fetch that records what would be sent to api.x.ai. No live API is called.
+// generate() function, and — for the real @google/genai SDK wiring — a fake
+// fetch that records what would be sent to generativelanguage.googleapis.com.
+// No live API is called.
 
 import '../src/timezone'; // plant timezone first — exactly as the deployed function does
 import assert from 'node:assert/strict';
@@ -16,10 +17,9 @@ import { HttpsError } from 'firebase-functions/v2/https';
 import { applyProductionTimezone, DEFAULT_PRODUCTION_TIMEZONE } from '../src/timezone';
 import { createRateLimiter, handleProdPulseAI, HandlerDeps, providerDetail, toHttpsError } from '../src/handler';
 import { readFileSync } from 'node:fs';
-import { APIConnectionTimeoutError } from 'openai';
-import { runAssistant, CreateResponseFn, XaiRequest, XaiResponse, MAX_TOOL_ROUNDS, parseArguments, XAI_TOOLS } from '../src/assistant';
-import { createXaiResponseFn, DEFAULT_XAI_MODEL, isPlausibleModelId, XAI_BASE_URL } from '../src/xai';
-import { AIConfigError } from '../src/handler';
+import { runAssistant, GenerateFn, GenResponse, MAX_TOOL_ROUNDS } from '../src/assistant';
+import { AIConfigError, createGeminiGenerateFn, DEFAULT_GEMINI_MODEL, GEMINI_BASE_URL, geminiEndpoint, isPlausibleModelId } from '../src/gemini';
+import { googleErrorInfo } from '../src/handler';
 import {
   applyFilters,
   createToolContext,
@@ -146,44 +146,41 @@ function memorySource(overrides: Partial<ProductionDataSource> = {}): Production
 
 const ctx = (data: ProductionDataSource = memorySource()) => createToolContext(data, NOW);
 
-// Scripted xAI: each call returns the next response.
-function scripted(responses: (XaiResponse | Error | 'hang')[]) {
-  const calls: XaiRequest[] = [];
-  const fn: CreateResponseFn = async (request) => {
-    calls.push(JSON.parse(JSON.stringify(request)));
+// Scripted Gemini: each call returns the next response.
+function scripted(responses: (GenResponse | Error | 'hang')[]) {
+  const calls: { contents: unknown[]; config: Record<string, any> }[] = [];
+  const fn: GenerateFn = async (params) => {
+    calls.push({ contents: JSON.parse(JSON.stringify(params.contents)), config: params.config });
     const r = responses[Math.min(calls.length - 1, responses.length - 1)];
-    if (r === 'hang') return new Promise<XaiResponse>(() => {});
+    if (r === 'hang') return new Promise<GenResponse>(() => {});
     if (r instanceof Error) throw r;
     return r;
   };
   return { fn, calls };
 }
 
-// xAI Responses API output: an encrypted reasoning item, then the call(s).
-const toolCall = (name: string, args: Record<string, unknown> | string, id = 'call_1'): XaiResponse => ({
-  status: 'completed',
-  output: [
-    { type: 'reasoning', id: 'rs_1', summary: [], encrypted_content: 'enc-reasoning' },
-    { type: 'function_call', id: 'fc_1', call_id: id, name, arguments: typeof args === 'string' ? args : JSON.stringify(args), status: 'completed' },
-  ],
-  usage: { total_tokens: 500 },
+// Gemini generateContent output: the function call part carries a thought
+// signature that must be sent back unchanged.
+const toolCall = (name: string, args: Record<string, unknown>, id = 'c1'): GenResponse => ({
+  functionCalls: [{ id, name, args }],
+  candidates: [{ content: { role: 'model', parts: [{ functionCall: { id, name, args }, thoughtSignature: 'sig' }] } }],
+  usageMetadata: { totalTokenCount: 500 },
 });
-const answer = (text: string): XaiResponse => ({
-  status: 'completed',
-  output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text, annotations: [] } as { type: string; text: string }] }],
-  usage: { total_tokens: 300 },
-});
+const answer = (text: string): GenResponse => ({ text, candidates: [{ content: { role: 'model', parts: [{ text }] } }], usageMetadata: { totalTokenCount: 300 } });
 
-function apiError(status: number, message = 'provider detail that must not leak') {
-  return Object.assign(new Error(`${status} ${message}`), { status });
+// What the @google/genai SDK throws: ApiError with the HTTP status and
+// Google's JSON error body in the message.
+function apiError(status: number, message = 'provider detail that must not leak', googleStatus = 'UNKNOWN', reason?: string) {
+  const body = { error: { code: status, message, status: googleStatus, ...(reason ? { details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason, domain: 'googleapis.com' }] } : {}) } };
+  return Object.assign(new Error(`got status: ${status} . ${JSON.stringify(body)}`), { status });
 }
 
-function deps(over: Partial<HandlerDeps> & { gen?: CreateResponseFn } = {}): HandlerDeps & { clientBuilt: () => number } {
+function deps(over: Partial<HandlerDeps> & { gen?: GenerateFn } = {}): HandlerDeps & { clientBuilt: () => number } {
   let built = 0;
   const gen = over.gen ?? scripted([answer('Hello')]).fn;
   return {
     data: memorySource(),
-    createResponse: () => { built++; return gen; },
+    generate: () => { built++; return gen; },
     model: 'test-model',
     rateLimit: createRateLimiter(),
     now: () => NOW,
@@ -276,65 +273,62 @@ async function main() {
   });
 
   // ── 6. xAI failures ─────────────────────────────────────────────────────────
-  await test('6a. xAI key / credits / model / rate-limit / outage errors map to safe callable errors', async () => {
-    const cases: [Error, string, string, RegExp][] = [
-      [apiError(429, 'Rate limit reached'), 'resource-exhausted', 'AI_API_ERROR', /rate limit/],
-      [apiError(400, 'Incorrect API key provided: xa***yz.'), 'failed-precondition', 'AI_CONFIGURATION_ERROR', /XAI_API_KEY/],
-      [apiError(401, 'Unauthorized'), 'failed-precondition', 'AI_CONFIGURATION_ERROR', /XAI_API_KEY/],
-      [apiError(403, "Your team doesn't have any credits yet."), 'failed-precondition', 'AI_CONFIGURATION_ERROR', /credits or a billing problem/],
-      [apiError(404, 'The model grok-9 does not exist or your team does not have access to it.'), 'failed-precondition', 'AI_CONFIGURATION_ERROR', /XAI_MODEL/],
-      [apiError(400, 'The model grok-9 does not exist or your team does not have access to it.'), 'failed-precondition', 'AI_CONFIGURATION_ERROR', /XAI_MODEL/],
-      [apiError(400, 'Invalid request: tools[0] schema'), 'internal', 'AI_API_ERROR', /rejected the request/],
-      [apiError(503, 'Service unavailable'), 'unavailable', 'AI_API_ERROR', /temporarily unavailable/],
-      [new Error('fetch failed'), 'unavailable', 'AI_API_ERROR', /Could not reach/],
-      [new APIConnectionTimeoutError({ message: 'Request timed out.' }), 'deadline-exceeded', 'TIMEOUT', /too long/],
+  await test('6a. Gemini key / billing / model / quota / outage errors map to safe callable errors', async () => {
+    const cases: [Error, string, string, string, RegExp][] = [
+      [apiError(429, 'Resource has been exhausted (e.g. check quota).', 'RESOURCE_EXHAUSTED'), 'resource-exhausted', 'AI_API_ERROR', 'RATE_LIMITED', /quota/],
+      [apiError(400, 'API key not valid. Please pass a valid API key.', 'INVALID_ARGUMENT', 'API_KEY_INVALID'), 'failed-precondition', 'AI_CONFIGURATION_ERROR', 'KEY_INVALID', /GEMINI_API_KEY/],
+      [apiError(403, 'Your billing account has an outstanding balance.', 'PERMISSION_DENIED'), 'failed-precondition', 'AI_CONFIGURATION_ERROR', 'NO_CREDITS', /billing/],
+      [apiError(403, 'Requests to this API are blocked.', 'PERMISSION_DENIED', 'API_KEY_SERVICE_BLOCKED'), 'failed-precondition', 'AI_CONFIGURATION_ERROR', 'ACCESS_DENIED', /not allowed/],
+      [apiError(404, 'models/gemini-9 is not found for API version v1beta, or is not supported for generateContent.', 'NOT_FOUND'), 'failed-precondition', 'AI_CONFIGURATION_ERROR', 'MODEL_UNAVAILABLE', /GEMINI_MODEL/],
+      [apiError(400, 'Invalid JSON payload received.', 'INVALID_ARGUMENT'), 'internal', 'AI_API_ERROR', 'BAD_REQUEST', /rejected the request/],
+      [apiError(503, 'The model is overloaded.', 'UNAVAILABLE'), 'unavailable', 'AI_API_ERROR', 'PROVIDER_UNAVAILABLE', /temporarily unavailable/],
+      // The live failure: the model did not finish before X-Server-Timeout.
+      [apiError(504, 'Deadline expired before operation could complete.', 'DEADLINE_EXCEEDED'), 'deadline-exceeded', 'TIMEOUT', 'TIMEOUT', /did not finish answering in time/],
+      [apiError(429, 'Resource has been exhausted (e.g. check quota).', 'RESOURCE_EXHAUSTED'), 'resource-exhausted', 'AI_API_ERROR', 'RATE_LIMITED', /quota/],
+      [new Error('fetch failed'), 'unavailable', 'AI_API_ERROR', 'NETWORK', /Could not reach/],
+      [Object.assign(new Error('This operation was aborted'), { name: 'AbortError' }), 'deadline-exceeded', 'TIMEOUT', 'TIMEOUT', /too long/],
     ];
-    for (const [err, code, category, msg] of cases) {
+    for (const [err, code, category, reason, msg] of cases) {
       await assert.rejects(
         handleProdPulseAI({ auth: { uid: 'admin' }, data: { question: 'today?' } }, deps({ gen: scripted([err]).fn })),
-        (e: unknown) => e instanceof HttpsError && e.code === code && (e.details as any)?.category === category && msg.test(e.message) && !/provider detail|Incorrect API key|credits yet|does not exist/.test(e.message),
+        (e: unknown) => e instanceof HttpsError && e.code === code && (e.details as any)?.category === category && (e.details as any)?.reason === reason && msg.test(e.message) && !/provider detail|API key not valid|outstanding balance|overloaded/.test(e.message),
         `${err.message}`
       );
     }
   });
 
-  await test('6a2. a missing XAI_API_KEY is a configuration error, raised only after auth passes', async () => {
-    assert.throws(() => createXaiResponseFn(''), AIConfigError);
-    assert.throws(() => createXaiResponseFn(undefined), AIConfigError);
-    const noKey = deps({ createResponse: () => createXaiResponseFn('  ') });
+  await test('6a2. a missing GEMINI_API_KEY is a configuration error, raised only after auth passes', async () => {
+    assert.throws(() => createGeminiGenerateFn(''), AIConfigError);
+    assert.throws(() => createGeminiGenerateFn(undefined), AIConfigError);
+    const noKey = deps({ generate: () => createGeminiGenerateFn('  ') });
     await rejects(handleProdPulseAI({ auth: { uid: 'admin' }, data: { question: 'q' } }, noKey), 'failed-precondition', 'AI_CONFIGURATION_ERROR');
-    // A non-admin never reaches the key check.
-    await rejects(handleProdPulseAI({ auth: { uid: 'supervisor' }, data: { question: 'q' } }, deps({ createResponse: () => createXaiResponseFn('') })), 'permission-denied', 'ADMIN_FORBIDDEN');
+    await rejects(handleProdPulseAI({ auth: { uid: 'supervisor' }, data: { question: 'q' } }, deps({ generate: () => createGeminiGenerateFn('') })), 'permission-denied', 'ADMIN_FORBIDDEN');
   });
 
-  await test('6b. a hung xAI call times out', async () => {
+  await test('6b. a hung Gemini call times out', async () => {
     await assert.rejects(
-      runAssistant({ question: 'q', history: [], model: 'm', createResponse: scripted(['hang']).fn, data: memorySource(), nowMs: NOW, callTimeoutMs: 50 }),
+      runAssistant({ question: 'q', history: [], model: 'm', generate: scripted(['hang']).fn, data: memorySource(), nowMs: NOW, callTimeoutMs: 50 }),
       (e: any) => e?.kind === 'timeout'
     );
   });
 
-  await test('6c. empty or malformed xAI responses are errors, not blank answers', async () => {
+  await test('6c. empty or malformed Gemini responses are errors, not blank answers', async () => {
     const run = (r: any) => handleProdPulseAI({ auth: { uid: 'admin' }, data: { question: 'q' } }, deps({ gen: scripted([r]).fn }));
-    await rejects(run(answer('')), 'internal', 'INVALID_RESPONSE');
-    await rejects(run({ status: 'completed' }), 'internal', 'INVALID_RESPONSE');
-    await rejects(run({ output: 'nope' }), 'internal', 'INVALID_RESPONSE');
-    await rejects(run({ output: [{ type: 'function_call', name: 'getProductionSummary', arguments: '{}' }] }), 'internal', 'INVALID_RESPONSE');
+    await rejects(run({ text: '' }), 'internal', 'INVALID_RESPONSE');
+    await rejects(run({}), 'internal', 'INVALID_RESPONSE');
+    await rejects(run({ functionCalls: [{ name: 'getProductionSummary', args: {} }] }), 'internal', 'INVALID_RESPONSE');
   });
 
-  await test('6c2. malformed tool arguments go back to the model as an invalid call; the loop continues', async () => {
-    assert.throws(() => parseArguments('{not json'), ToolArgError);
-    assert.throws(() => parseArguments('[1,2]'), ToolArgError);
-    assert.deepEqual(parseArguments(''), {});
-    const g = scripted([toolCall('getProductionSummary', '{"fromDate": "2026-10-21",'), answer('Please rephrase.')]);
-    const res = await runAssistant({ question: 'q', history: [], model: 'm', createResponse: g.fn, data: memorySource(), nowMs: NOW });
-    assert.equal(res.reply, 'Please rephrase.');
+  await test('6c2. invalid tool arguments go back to the model as an invalid call; the loop continues', async () => {
+    const g = scripted([toolCall('getProductionSummary', { fromDate: '21-10-2026', toDate: '2026-10-21' }), answer('Please give the date as YYYY-MM-DD.')]);
+    const res = await runAssistant({ question: 'q', history: [], model: 'm', generate: g.fn, data: memorySource(), nowMs: NOW });
+    assert.equal(res.reply, 'Please give the date as YYYY-MM-DD.');
     assert.equal(res.dataRetrieved, false);
     assert.equal(res.toolErrors.length, 0, 'an invalid call is not a database failure');
-    const out = g.calls[1].input.at(-1) as any;
-    assert.equal(out.type, 'function_call_output');
-    assert.equal(out.call_id, 'call_1');
-    assert.deepEqual(JSON.parse(out.output), { error: 'Tool arguments were not valid JSON.', invalidArguments: true });
+    const fr = (g.calls[1].contents.at(-1) as any).parts[0].functionResponse;
+    assert.equal(fr.name, 'getProductionSummary');
+    assert.equal(fr.response.invalidArguments, true);
+    assert.match(fr.response.error, /YYYY-MM-DD/);
   });
 
   await test('6d. rate limit per user', async () => {
@@ -349,12 +343,12 @@ async function main() {
     assert.equal(d.clientBuilt(), 0);
   });
 
-  await test('6e. tool rounds are capped; the last round forces a text answer (tool_choice none)', async () => {
+  await test('6e. tool rounds are capped; the last round forces a text answer (function calling NONE)', async () => {
     const loop = scripted(Array.from({ length: MAX_TOOL_ROUNDS }, () => toolCall('getAvailableProductionFilters', {})).concat([answer('final')]));
-    const res = await runAssistant({ question: 'q', history: [], model: 'm', createResponse: loop.fn, data: memorySource(), nowMs: NOW });
+    const res = await runAssistant({ question: 'q', history: [], model: 'm', generate: loop.fn, data: memorySource(), nowMs: NOW });
     assert.equal(res.reply, 'final');
     assert.equal(loop.calls.length, MAX_TOOL_ROUNDS + 1);
-    assert.deepEqual(loop.calls.map((c) => c.tool_choice), [...Array(MAX_TOOL_ROUNDS).fill('auto'), 'none']);
+    assert.deepEqual(loop.calls.map((c) => c.config.toolConfig.functionCallingConfig.mode), [...Array(MAX_TOOL_ROUNDS).fill('AUTO'), 'NONE']);
   });
 
   // ── 7–10. Calculations ──────────────────────────────────────────────────────
@@ -486,21 +480,20 @@ async function main() {
   await test('12. a failed database query reaches the model and UI as a failure, not a result', async () => {
     const data = memorySource({ getProductionRecords: async () => { throw new Error('PERMISSION_DENIED: internal detail'); } });
     const g = scripted([toolCall('getProductionSummary', { fromDate: '2026-10-21', toDate: '2026-10-21' }), answer('I could not retrieve the data.')]);
-    const res = await runAssistant({ question: 'q', history: [], model: 'm', createResponse: g.fn, data, nowMs: NOW });
+    const res = await runAssistant({ question: 'q', history: [], model: 'm', generate: g.fn, data, nowMs: NOW });
     assert.equal(res.dataRetrieved, false);
     assert.equal(res.results.length, 0);
     assert.equal(res.toolErrors.length, 1);
     assert.ok(!res.toolErrors[0].message.includes('internal detail'));
-    const out = g.calls[1].input.at(-1) as any;
-    assert.equal(out.type, 'function_call_output');
-    assert.equal(out.call_id, 'call_1');
-    const parsed = JSON.parse(out.output);
-    assert.match(parsed.error, /failed/);
-    assert.equal(parsed.output, undefined);
-    // The model's own output (encrypted reasoning + the call) is replayed unchanged.
-    assert.deepEqual(g.calls[1].input.slice(1, 3), toolCall('getProductionSummary', { fromDate: '2026-10-21', toDate: '2026-10-21' }).output);
-    // The instructions forbid presenting failures as data.
-    assert.match(g.calls[0].instructions, /Never present a failed query as a result/);
+    const fr = (g.calls[1].contents.at(-1) as any).parts[0].functionResponse;
+    assert.equal(fr.name, 'getProductionSummary');
+    assert.equal(fr.id, 'c1');
+    assert.match(fr.response.error, /failed/);
+    assert.equal(fr.response.output, undefined);
+    // The model's own turn (with its thought signature) is sent back unchanged.
+    assert.equal((g.calls[1].contents.at(-2) as any).parts[0].thoughtSignature, 'sig');
+    // The system instruction forbids presenting failures as data.
+    assert.match(g.calls[0].config.systemInstruction, /Never present a failed query as a result/);
   });
 
   // ── 13. Export ──────────────────────────────────────────────────────────────
@@ -530,8 +523,8 @@ async function main() {
     assert.equal(classifyCallableError({ code: 'functions/internal', message: 'Response is missing data field.' }, false).category, 'INVALID_RESPONSE');
     assert.equal(classifyCallableError(new TypeError('x'), false).category, 'BACKEND_UNAVAILABLE');
     // A backend error keeps its own category and safe message.
-    const server = classifyCallableError({ code: 'functions/failed-precondition', message: 'Set XAI_API_KEY', details: { category: 'AI_CONFIGURATION_ERROR' } }, false);
-    assert.deepEqual(server, { category: 'AI_CONFIGURATION_ERROR', message: 'Set XAI_API_KEY', retryable: false });
+    const server = classifyCallableError({ code: 'functions/failed-precondition', message: 'Set GEMINI_API_KEY', details: { category: 'AI_CONFIGURATION_ERROR' } }, false);
+    assert.deepEqual(server, { category: 'AI_CONFIGURATION_ERROR', message: 'Set GEMINI_API_KEY', retryable: false });
     // Retired Gemini categories are not trusted any more.
     assert.equal(classifyCallableError({ code: 'functions/internal', message: 'internal', details: { category: 'GEMINI_API_ERROR' } }, false).category, 'BACKEND_UNAVAILABLE');
     assert.equal(classifyCallableError({ code: 'functions/permission-denied', message: 'x', details: { category: 'ADMIN_FORBIDDEN' } }, false).retryable, false);
@@ -552,13 +545,13 @@ async function main() {
     assert.equal(classifyCallableError({ code: 'functions/internal', message: 'internal', details: { category: 'EVIL' } }, false).category, 'BACKEND_UNAVAILABLE');
   });
 
-  await test('E2. provider billing / credit blocks are reported as a billing problem, without provider text', () => {
-    const billing = Object.assign(new Error('{"error":"Your team has reached its monthly spending limit."}'), { status: 403 });
-    const e = toHttpsError(billing);
+  await test('E2. Gemini billing block is reported as a billing problem, without provider text', () => {
+    const e = toHttpsError(apiError(403, 'Your billing account has an outstanding balance. Make a payment at https://aistudio.google.com/billing to restore service.', 'PERMISSION_DENIED'));
     assert.equal(e.code, 'failed-precondition');
     assert.equal((e.details as any).category, 'AI_CONFIGURATION_ERROR');
+    assert.equal((e.details as any).reason, 'NO_CREDITS');
     assert.match(e.message, /billing/);
-    assert.ok(!e.message.includes('spending limit'), 'provider text stays server-side');
+    assert.ok(!e.message.includes('outstanding balance'), 'provider text stays server-side');
   });
 
   await test('E3. server log detail masks key- and token-shaped strings', () => {
@@ -570,7 +563,7 @@ async function main() {
     const logs: any[] = [];
     const data = memorySource({ getProductionRecords: async () => { throw Object.assign(new Error('The query requires an index'), { code: 9 }); } });
     const g = scripted([toolCall('getProductionSummary', { fromDate: '2026-10-21', toDate: '2026-10-21' }), answer('Could not retrieve.')]);
-    const res = await runAssistant({ question: 'q', history: [], model: 'm', createResponse: g.fn, data, nowMs: NOW, log: (msg, meta) => logs.push({ msg, ...meta }) });
+    const res = await runAssistant({ question: 'q', history: [], model: 'm', generate: g.fn, data, nowMs: NOW, log: (msg, meta) => logs.push({ msg, ...meta }) });
     assert.equal(res.toolErrors[0].category, 'FIRESTORE_QUERY_ERROR');
     const entry = logs.find((l) => l.msg === 'tool failed');
     assert.equal(entry.level, 'error');
@@ -578,157 +571,121 @@ async function main() {
     assert.match(entry.detail, /requires an index/);
   });
 
-  await test('E5. profile read failure is FIRESTORE_QUERY_ERROR; provider failures are logged with category', async () => {
+  await test('E5. profile read failure is FIRESTORE_QUERY_ERROR; provider failures are logged with Google status and reason', async () => {
     const d = deps({ data: memorySource({ getUserProfile: async () => { throw new Error('UNAVAILABLE'); } }) });
     await rejects(handleProdPulseAI({ auth: { uid: 'admin' }, data: { question: 'q' } }, d), 'unavailable', 'FIRESTORE_QUERY_ERROR');
     const logs: any[] = [];
-    const gen = scripted([apiError(403, "Your team doesn't have any credits yet.")]).fn;
-    await rejects(handleProdPulseAI({ auth: { uid: 'admin' }, data: { question: 'q' } }, deps({ gen, log: (msg, meta) => logs.push({ msg, ...meta }) })), 'failed-precondition', 'AI_CONFIGURATION_ERROR');
+    const gen = scripted([apiError(400, 'API key not valid. Please pass a valid API key.', 'INVALID_ARGUMENT', 'API_KEY_INVALID')]).fn;
+    await rejects(handleProdPulseAI({ auth: { uid: 'admin' }, data: { question: 'q' } }, deps({ gen, model: 'gemini-3.8-flash', log: (msg, meta) => logs.push({ msg, ...meta }) })), 'failed-precondition', 'AI_CONFIGURATION_ERROR');
     const entry = logs.find((l) => l.msg === 'request failed');
-    assert.equal(entry.providerStatus, 403);
-    assert.match(entry.detail, /credits/);
+    assert.deepEqual(
+      [entry.reason, entry.providerStatus, entry.providerCode, entry.providerReason, entry.model, entry.keyConfigured, entry.endpoint],
+      ['KEY_INVALID', 400, 'INVALID_ARGUMENT', 'API_KEY_INVALID', 'gemini-3.8-flash', true, 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent']
+    );
+    assert.match(entry.detail, /API key not valid/);
+    assert.deepEqual(googleErrorInfo(new Error('no json here')), { status: null, reason: null });
   });
 
-  // ── xAI wiring (real OpenAI SDK, fake fetch — no network) ───────────────────
-  await test('X1. the backend calls xAI Grok (OpenAI SDK, Responses API), not Gemini', () => {
+  // ── Gemini wiring (real @google/genai SDK, fake fetch — no network) ─────────
+  await test('G1. the backend calls Gemini through @google/genai with GEMINI_API_KEY; no xAI code remains', () => {
     const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
-    assert.ok(pkg.dependencies.openai, 'openai SDK is a dependency');
-    assert.equal(pkg.dependencies['@google/genai'], undefined, 'Gemini SDK removed');
-    for (const f of ['index.ts', 'xai.ts', 'assistant.ts', 'handler.ts', 'tools.ts', 'dataSource.ts']) {
+    assert.ok(pkg.dependencies['@google/genai'], '@google/genai is a dependency');
+    assert.equal(pkg.dependencies.openai, undefined, 'OpenAI SDK (used only for xAI) removed');
+    for (const f of ['index.ts', 'gemini.ts', 'assistant.ts', 'handler.ts', 'tools.ts', 'dataSource.ts', 'cors.ts', 'options.ts']) {
       const src = readFileSync(new URL(`../src/${f}`, import.meta.url), 'utf8');
-      assert.ok(!/@google\/genai|GEMINI_|generativelanguage/.test(src), `${f} has no Gemini references`);
+      assert.ok(!/from 'openai'|api\.x\.ai|XAI_API_KEY|XAI_MODEL/.test(src), `${f} has no xAI references`);
     }
     const index = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
-    assert.match(index, /defineSecret\('XAI_API_KEY'\)/);
-    assert.match(index, /defineString\('XAI_MODEL'/);
-    assert.equal(XAI_BASE_URL, 'https://api.x.ai/v1');
-    assert.equal(DEFAULT_XAI_MODEL, 'grok-4.7');
+    assert.match(index, /defineSecret\('GEMINI_API_KEY'\)/);
+    assert.match(index, /defineString\('GEMINI_MODEL'/);
+    assert.equal(GEMINI_BASE_URL, 'https://generativelanguage.googleapis.com');
+    assert.equal(DEFAULT_GEMINI_MODEL, 'gemini-3.8-flash');
   });
 
-  await test('X2. a full question goes to https://api.x.ai/v1/responses with the right model, auth, tools and store:false', async () => {
-    const sent: { url: string; method: string; auth: string | null; body: any }[] = [];
-    const replies = [
-      toolCall('getProductionSummary', { fromDate: '2026-10-21', toDate: '2026-10-21' }),
-      answer('Production on 2026-10-21 was 270 good parts.'),
+  await test('G2. a full question goes to Gemini generateContent with the right model, key header and tools; tool results are real query output', async () => {
+    const sent: { url: string; method: string; key: string | null; auth: string | null; body: any }[] = [];
+    const bodies = [
+      { candidates: [{ content: { role: 'model', parts: [{ functionCall: { name: 'getProductionSummary', args: { fromDate: '2026-10-21', toDate: '2026-10-21' } }, thoughtSignature: 'c2ln' }] }, finishReason: 'STOP' }], usageMetadata: { totalTokenCount: 500 } },
+      { candidates: [{ content: { role: 'model', parts: [{ text: 'Production on 2026-10-21 was 270 good parts.' }] }, finishReason: 'STOP' }], usageMetadata: { totalTokenCount: 300 } },
     ];
     const fakeFetch = (async (url: any, init: any) => {
       const headers = new Headers(init?.headers);
-      sent.push({ url: String(url), method: init?.method, auth: headers.get('authorization'), body: JSON.parse(init?.body) });
-      const r = replies[sent.length - 1];
-      return new Response(JSON.stringify({ id: `resp_${sent.length}`, object: 'response', created_at: 0, model: DEFAULT_XAI_MODEL, ...r }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      });
+      sent.push({ url: String(url), method: init?.method, key: headers.get('x-goog-api-key'), auth: headers.get('authorization'), body: JSON.parse(init?.body) });
+      return new Response(JSON.stringify(bodies[sent.length - 1]), { status: 200, headers: { 'content-type': 'application/json' } });
     }) as typeof fetch;
-    const createResponse = createXaiResponseFn('xai-test-key-not-real', fakeFetch);
+    const generate = createGeminiGenerateFn('test-gemini-key-not-real', fakeFetch);
     const res = await handleProdPulseAI(
-      { auth: { uid: 'admin' }, data: { question: "What was production on Oct 21?", history: [{ role: 'user', text: 'hi' }, { role: 'model', text: 'Hello' }] } },
-      deps({ createResponse: () => createResponse, model: DEFAULT_XAI_MODEL })
+      { auth: { uid: 'admin' }, data: { question: 'What was production on Oct 21?', history: [{ role: 'user', text: 'hi' }, { role: 'model', text: 'Hello' }] } },
+      deps({ generate: () => generate, model: DEFAULT_GEMINI_MODEL })
     );
     assert.equal(sent.length, 2);
     for (const r of sent) {
-      assert.equal(r.url, 'https://api.x.ai/v1/responses');
+      assert.equal(r.url.split('?')[0], geminiEndpoint('gemini-3.8-flash'));
       assert.equal(r.method, 'POST');
-      assert.equal(r.auth, 'Bearer xai-test-key-not-real');
-      assert.equal(r.body.model, 'grok-4.7');
-      assert.equal(r.body.store, false, 'production data is not stored on xAI');
-      assert.deepEqual(r.body.include, ['reasoning.encrypted_content']);
-      assert.deepEqual(r.body.tools.map((t: any) => t.name).sort(), [...TOOL_NAMES].sort());
-      assert.ok(r.body.tools.every((t: any) => t.type === 'function' && t.parameters?.type === 'object' && !('function' in t)), 'flat Responses tool shape');
+      assert.equal(r.key, 'test-gemini-key-not-real', 'key sent in the x-goog-api-key header');
+      assert.ok(!r.url.includes('test-gemini-key-not-real'), 'key not in the URL');
+      assert.deepEqual(r.body.tools[0].functionDeclarations.map((d: any) => d.name).sort(), [...TOOL_NAMES].sort());
+      assert.match(JSON.stringify(r.body.systemInstruction ?? r.body.system_instruction), /ProdPulse AI/);
     }
-    assert.deepEqual(sent[0].body.input, [
-      { role: 'user', content: 'hi' },
-      { role: 'assistant', content: 'Hello' },
-      { role: 'user', content: 'What was production on Oct 21?' },
-    ]);
-    const output = sent[1].body.input.at(-1);
-    assert.equal(output.type, 'function_call_output');
-    assert.equal(output.call_id, 'call_1');
-    // The tool result returned to Grok is the real query output (270 from the fixture records).
-    assert.equal(JSON.parse(output.output).output.metrics['Produced (good parts)'], 270);
+    assert.deepEqual(sent[0].body.contents.map((c: any) => c.role), ['user', 'model', 'user']);
+    // Round 2 replays the model turn with its thought signature, then the real tool result.
+    const replay = sent[1].body.contents;
+    assert.equal(replay.at(-2).parts[0].thoughtSignature, 'c2ln');
+    const fr = replay.at(-1).parts[0].functionResponse;
+    assert.equal(fr.name, 'getProductionSummary');
+    assert.equal(fr.response.output.metrics['Produced (good parts)'], 270);
     assert.equal(res.reply, 'Production on 2026-10-21 was 270 good parts.');
     assert.equal(res.results[0].metrics.find((m) => m.label.startsWith('Produced'))!.value, 270);
-    assert.equal(res.model, 'grok-4.7');
+    assert.equal(res.model, 'gemini-3.8-flash');
   });
 
-  await test('X3. SDK HTTP errors from xAI keep their status and map to categories', async () => {
+  await test('G3. a real Gemini "API key not valid" through the SDK is KEY_INVALID, logged with Google status and reason — never the key', async () => {
+    const logs: any[] = [];
+    const key = 'AIzaSyFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE00';
     const fakeFetch = (async () =>
-      new Response(JSON.stringify({ code: 'Client specified an invalid argument', error: 'Incorrect API key provided: xa***ey.' }), {
+      new Response(JSON.stringify({ error: { code: 400, message: 'API key not valid. Please pass a valid API key.', status: 'INVALID_ARGUMENT', details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: 'API_KEY_INVALID', domain: 'googleapis.com' }] } }), {
         status: 400,
         headers: { 'content-type': 'application/json' },
       })) as typeof fetch;
-    const createResponse = createXaiResponseFn('xai-bad', fakeFetch);
-    await rejects(
-      handleProdPulseAI({ auth: { uid: 'admin' }, data: { question: 'q' } }, deps({ createResponse: () => createResponse })),
-      'failed-precondition',
-      'AI_CONFIGURATION_ERROR'
+    const generate = createGeminiGenerateFn(key, fakeFetch);
+    await assert.rejects(
+      handleProdPulseAI({ auth: { uid: 'admin' }, data: { question: 'q' } }, deps({ generate: () => generate, model: DEFAULT_GEMINI_MODEL, log: (msg, meta) => logs.push({ msg, ...meta }) })),
+      (e: unknown) => e instanceof HttpsError && (e.details as any).reason === 'KEY_INVALID' && !e.message.includes('not valid. Please')
     );
+    const entry = logs.find((l) => l.msg === 'request failed');
+    assert.equal(entry.providerStatus, 400);
+    assert.equal(entry.providerCode, 'INVALID_ARGUMENT');
+    assert.equal(entry.providerReason, 'API_KEY_INVALID');
+    assert.ok(!JSON.stringify(logs).includes(key), 'key never logged');
   });
 
-  await test('X4. only allowlisted tools are declared to Grok, each with an object schema', () => {
-    assert.deepEqual(XAI_TOOLS.map((t) => t.name), TOOL_DECLARATIONS.map((d) => d.name));
-    assert.ok(XAI_TOOLS.every((t) => /^get|^compare/.test(t.name)));
+  await test('G4. a secret stored with a trailing CR/LF (Windows paste) is sent trimmed', async () => {
+    let key: string | null = null;
+    const fakeFetch = (async (_url: any, init: any) => {
+      key = new Headers(init?.headers).get('x-goog-api-key');
+      return new Response(JSON.stringify({ candidates: [{ content: { role: 'model', parts: [{ text: 'ok' }] } }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch;
+    const generate = createGeminiGenerateFn('AIzaTrimMe\r\n', fakeFetch);
+    await handleProdPulseAI({ auth: { uid: 'admin' }, data: { question: 'q' } }, deps({ generate: () => generate, model: DEFAULT_GEMINI_MODEL }));
+    assert.equal(key, 'AIzaTrimMe');
   });
 
-  // ── xAI key / access diagnostics (AI_CONFIGURATION_ERROR) ───────────────────
-  await test('R1. each provider failure gets its own reason code', () => {
+  await test('R1. each provider failure gets its own reason code; the client keeps it', () => {
     const reasonOf = (e: unknown) => (toHttpsError(e).details as any).reason;
-    assert.equal(reasonOf(new AIConfigError('XAI_API_KEY is not set.')), 'KEY_MISSING');
-    assert.equal(reasonOf(apiError(400, 'Incorrect API key provided. You can obtain an API key from https://console.x.ai.')), 'KEY_INVALID');
-    assert.equal(reasonOf(apiError(401, 'Unauthorized')), 'KEY_INVALID');
-    assert.equal(reasonOf(apiError(403, 'The API key does not have permission to access this endpoint.')), 'ACCESS_DENIED');
-    assert.equal(reasonOf(apiError(403, "Your newly created team doesn't have any credits yet.")), 'NO_CREDITS');
-    assert.equal(reasonOf(apiError(429, 'You have reached your spending limit.')), 'NO_CREDITS');
-    assert.equal(reasonOf(apiError(429, 'Rate limit exceeded')), 'RATE_LIMITED');
-    assert.equal(reasonOf(apiError(404, 'The model grok-9 does not exist or your team does not have access to it.')), 'MODEL_UNAVAILABLE');
-    assert.equal(reasonOf(apiError(400, 'Invalid request content')), 'BAD_REQUEST');
-    assert.equal(reasonOf(apiError(502, 'Bad gateway')), 'PROVIDER_UNAVAILABLE');
-    assert.equal(reasonOf(new Error('getaddrinfo ENOTFOUND api.x.ai')), 'NETWORK');
-    assert.equal(reasonOf(new APIConnectionTimeoutError({ message: 'Request timed out.' })), 'TIMEOUT');
-    // Invalid key and denied access read differently to the user.
+    assert.equal(reasonOf(new AIConfigError('GEMINI_API_KEY is not set.')), 'KEY_MISSING');
+    assert.equal(reasonOf(apiError(401, 'Unauthorized', 'UNAUTHENTICATED')), 'KEY_INVALID');
+    assert.equal(reasonOf(apiError(400, 'API key expired. Please renew the API key.', 'INVALID_ARGUMENT', 'API_KEY_INVALID')), 'KEY_INVALID');
+    assert.equal(reasonOf(apiError(403, 'Method doesn\'t allow unregistered callers.', 'PERMISSION_DENIED')), 'ACCESS_DENIED');
     assert.notEqual(toHttpsError(apiError(401, 'x')).message, toHttpsError(apiError(403, 'x')).message);
-    // The client keeps the reason (and ignores unknown ones).
     const c = classifyCallableError({ code: 'functions/failed-precondition', message: 'm', details: { category: 'AI_CONFIGURATION_ERROR', reason: 'KEY_INVALID' } }, false);
     assert.equal(c.reason, 'KEY_INVALID');
     assert.equal(classifyCallableError({ code: 'functions/failed-precondition', message: 'm', details: { category: 'AI_CONFIGURATION_ERROR', reason: 'EVIL' } }, false).reason, undefined);
   });
 
-  await test('R2. a real xAI 400 "Incorrect API key" through the SDK is KEY_INVALID, logged with status, code and request id — never the key', async () => {
-    const logs: any[] = [];
-    const fakeFetch = (async () =>
-      new Response(JSON.stringify({ code: 'Client specified an invalid argument', error: 'Incorrect API key provided. You can obtain an API key from https://console.x.ai.' }), {
-        status: 400,
-        headers: { 'content-type': 'application/json', 'x-request-id': 'req_abc123' },
-      })) as typeof fetch;
-    const key = 'grok_0123456789abcdef0123456789abcdef_0123456789abcdef';
-    const createResponse = createXaiResponseFn(key, fakeFetch);
-    await assert.rejects(
-      handleProdPulseAI({ auth: { uid: 'admin' }, data: { question: 'q' } }, deps({ createResponse: () => createResponse, log: (msg, meta) => logs.push({ msg, ...meta }) })),
-      (e: unknown) => e instanceof HttpsError && (e.details as any).category === 'AI_CONFIGURATION_ERROR' && (e.details as any).reason === 'KEY_INVALID' && !e.message.includes('Incorrect')
-    );
-    const entry = logs.find((l) => l.msg === 'request failed');
-    assert.equal(entry.reason, 'KEY_INVALID');
-    assert.equal(entry.providerStatus, 400);
-    assert.equal(entry.providerRequestId, 'req_abc123');
-    assert.match(entry.detail, /Incorrect API key/);
-    assert.ok(!JSON.stringify(logs).includes(key), 'key never logged');
-  });
-
-  await test('R3. a secret stored with a trailing CR/LF (Windows paste) is sent trimmed', async () => {
-    let auth: string | null = null;
-    const fakeFetch = (async (_url: any, init: any) => {
-      auth = new Headers(init?.headers).get('authorization');
-      return new Response(JSON.stringify({ id: 'r', object: 'response', created_at: 0, model: 'grok-4.7', ...answer('ok') }), { status: 200, headers: { 'content-type': 'application/json' } });
-    }) as typeof fetch;
-    const createResponse = createXaiResponseFn('xai-abc123\r\n', fakeFetch);
-    await handleProdPulseAI({ auth: { uid: 'admin' }, data: { question: 'q' } }, deps({ createResponse: () => createResponse }));
-    assert.equal(auth, 'Bearer xai-abc123');
-  });
-
-  await test('R4. a key pasted into XAI_MODEL is refused before any xAI call, and never logged', async () => {
-    for (const m of ['grok-4.7', 'grok-4.3', 'grok-4.20-0309-reasoning', 'grok-build-0.1']) assert.ok(isPlausibleModelId(m), m);
-    const pasted = 'grok_29eef16b05610a3cabd982a9f33ee4d0_0123456789abcdef';
-    for (const m of [pasted, 'xai-AbCdEf0123456789', '', ' grok-4.7', 'Grok 4', 'a'.repeat(80), undefined]) assert.ok(!isPlausibleModelId(m), String(m));
+  await test('R4. a key pasted into GEMINI_MODEL is refused before any Gemini call, and never logged', async () => {
+    for (const m of ['gemini-3.8-flash', 'gemini-3.5-flash-lite', 'gemini-3.6-flash', 'gemini-2.5-pro']) assert.ok(isPlausibleModelId(m), m);
+    const pasted = 'AQ.Ab8FAKEFAKEFAKEFAKEFAKEFAKEFAKE';
+    for (const m of [pasted, 'AIzaSyFAKE', '', ' gemini-3.8-flash', 'Gemini 3', 'a'.repeat(80), undefined]) assert.ok(!isPlausibleModelId(m), String(m));
     const logs: any[] = [];
     const g = scripted([answer('should not be called')]);
     await rejects(
@@ -736,29 +693,21 @@ async function main() {
       'failed-precondition',
       'AI_CONFIGURATION_ERROR'
     );
-    assert.equal(g.calls.length, 0, 'no request reaches xAI');
+    assert.equal(g.calls.length, 0, 'no request reaches Gemini');
     const entry = logs.find((l) => l.msg === 'request failed');
     assert.equal(entry.reason, 'MODEL_MISCONFIGURED');
-    assert.equal(entry.endpoint, 'https://api.x.ai/v1/responses');
     assert.ok(!JSON.stringify(logs).includes(pasted), 'the pasted value is not logged');
-    // A non-admin never gets that far.
-    await rejects(handleProdPulseAI({ auth: { uid: 'supervisor' }, data: { question: 'q' } }, deps({ model: pasted })), 'permission-denied', 'ADMIN_FORBIDDEN');
   });
 
-  await test('R5. failure logs carry endpoint, model and whether a key is configured', async () => {
+  await test('R5. failure logs say whether a key is configured', async () => {
     const logs: any[] = [];
     await rejects(
-      handleProdPulseAI({ auth: { uid: 'admin' }, data: { question: 'q' } }, deps({ gen: scripted([apiError(401, 'Unauthorized')]).fn, model: 'grok-4.7', log: (msg, meta) => logs.push({ msg, ...meta }) })),
+      handleProdPulseAI({ auth: { uid: 'admin' }, data: { question: 'q' } }, deps({ generate: () => createGeminiGenerateFn(''), model: 'gemini-3.8-flash', log: (msg, meta) => logs.push({ msg, ...meta }) })),
       'failed-precondition'
     );
-    const e1 = logs.find((l) => l.msg === 'request failed');
-    assert.deepEqual([e1.endpoint, e1.model, e1.keyConfigured, e1.reason, e1.providerStatus], ['https://api.x.ai/v1/responses', 'grok-4.7', true, 'KEY_INVALID', 401]);
-    logs.length = 0;
-    await rejects(
-      handleProdPulseAI({ auth: { uid: 'admin' }, data: { question: 'q' } }, deps({ createResponse: () => createXaiResponseFn(''), model: 'grok-4.7', log: (msg, meta) => logs.push({ msg, ...meta }) })),
-      'failed-precondition'
-    );
-    assert.equal(logs.find((l) => l.msg === 'request failed').keyConfigured, false);
+    const entry = logs.find((l) => l.msg === 'request failed');
+    assert.equal(entry.keyConfigured, false);
+    assert.equal(entry.reason, 'KEY_MISSING');
   });
 
   // Mapping sanity — legacy shapes don't break the aggregation.

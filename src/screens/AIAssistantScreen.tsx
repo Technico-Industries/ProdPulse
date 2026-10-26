@@ -7,7 +7,7 @@
 // Sending a message calls src/services/prodPulseAI.ts's askProdPulseAI(),
 // which invokes the prodPulseAI Cloud Function (functions/src). The
 // backend checks the user is an active admin, runs read-only production
-// queries with the app's own calculations, and asks Grok (xAI) to explain them.
+// queries with the app's own calculations, and asks Gemini to explain them.
 // Nothing AI- or Firestore-related happens in this file and no API key
 // ever appears here.
 //
