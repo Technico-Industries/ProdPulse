@@ -20,14 +20,13 @@
 //   totalProduction  = Σ producedThisSlot          (GenerateReportScreen summary)
 //   plannedTotal     = Σ expectedParts             (GenerateReportScreen summary)
 //   lossParts        = Σ lossParts ?? max(0, expected - produced)
-//   downtimeMinutes  = Σ stopEvents[].durationMinutes of saved records, plus
-//                      for every session still running on this production
-//                      day, Σ its stopsBySlot intervals (live while stopped)
-//                      in place of that session's records — a stop reaches
-//                      a record only when its slot is saved, so records
-//                      alone showed 0 for an active line (utils/downtime
-//                      combinedDowntimeMinutes, same as the Supervisor
-//                      overview).
+//   downtimeMinutes  = every stop of the day's sessions, each once and in
+//                      full: live activeSessions (a running stop up to
+//                      now), admin-ended archives and Finalize's
+//                      shiftSummaries, with record stopEvents only for
+//                      stops none of those hold (utils/downtime
+//                      collectDowntimeIntervals — the same rule Generate
+//                      Report uses, so the two always agree).
 //   efficiency       = produced / expected * 100   (GenerateReportScreen summary)
 //   achievementPct   = actual / plan * 100         (KPIAnalysisScreen totals — same figure)
 //   goodParts        = Σ producedThisSlot  (KPIAnalysisScreen: produced is the GOOD output)
@@ -62,14 +61,19 @@ import { db } from '../services/firebase';
 import { fetchProductionRecordsForDateRange } from '../services/productionRecordQueries';
 import { PLANTS, WORKSHOPS, DIVISIONS } from '../constants/lineOptions';
 import AppDrawer from '../components/AppDrawer';
+import ProdAIButton, { PROD_AI_BUTTON_CLEARANCE } from '../components/ProdAIButton';
 import { ADMIN_MENU_ITEMS } from '../constants/adminMenu';
 import { counterQuality } from '../utils/qualityMetrics';
 import {
   DowntimeSessionLike,
-  combinedDowntimeMinutes,
+  DowntimeSessionSource,
+  DowntimeSummarySource,
+  collectDowntimeIntervals,
   formatDowntimeMinutes,
   isAnyStopRunning,
+  totalDowntimeMinutes,
 } from '../utils/downtime';
+import { fetchDowntimeSourcesForDateRange } from '../services/downtimeSources';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 // Same field set the other production screens map off each Firestore doc.
@@ -425,6 +429,12 @@ export default function AdminOverviewScreen() {
 
   const [allLines, setAllLines] = useState<Line[]>([]);
   const [records, setRecords] = useState<ProductionRecord[]>([]);
+  // The day's finished sessions' full stop intervals (admin-ended archives,
+  // Finalize shift summaries). Live sessions come from the listener below.
+  const [closedSources, setClosedSources] = useState<{ ended: DowntimeSessionSource[]; summaries: DowntimeSummarySource[] }>({
+    ended: [],
+    summaries: [],
+  });
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [hasLoaded, setHasLoaded] = useState(false);
@@ -442,7 +452,11 @@ export default function AdminOverviewScreen() {
       // The selected production day, same query as GenerateReportScreen —
       // by productionDate, so an overnight Shift B (slots saved after
       // midnight included) counts on the night it started.
-      const docs = await fetchProductionRecordsForDateRange(dateStr, dateStr);
+      const [docs, sources] = await Promise.all([
+        fetchProductionRecordsForDateRange(dateStr, dateStr),
+        fetchDowntimeSourcesForDateRange(dateStr, dateStr, { skipActive: true }),
+      ]);
+      setClosedSources({ ended: sources.endedSessions, summaries: sources.shiftSummaries });
 
       const mapped: ProductionRecord[] = docs.map((d) => {
         const data: any = d.data();
@@ -474,6 +488,7 @@ export default function AdminOverviewScreen() {
     } catch (e) {
       console.error('[AdminOverview] productionRecords fetch failed', e);
       setRecords([]);
+      setClosedSources({ ended: [], summaries: [] });
       setLoadError('Unable to load production data.');
     } finally {
       setLoading(false);
@@ -654,9 +669,33 @@ export default function AdminOverviewScreen() {
     return () => clearInterval(id);
   }, [anyLineStopped, filteredSessions]);
 
+  // Finished sessions of the day, through the same filters.
+  const filteredClosed = useMemo(() => {
+    const lineById = new Map(allLines.map((l) => [l.id, l]));
+    const keep = (s: { lineId: string | null; plant: string | null; workshop: string | null; division: string | null }) => {
+      const line = s.lineId ? lineById.get(s.lineId) : undefined;
+      if (plant && !sameValue(line?.plant ?? s.plant, plant)) return false;
+      if (workshop && !sameValue(line?.workshop ?? s.workshop, workshop)) return false;
+      if (division && !sameValue(line?.division ?? s.division, division)) return false;
+      return true;
+    };
+    return { ended: closedSources.ended.filter(keep), summaries: closedSources.summaries.filter(keep) };
+  }, [closedSources, allLines, plant, workshop, division]);
+
   const downtimeMinutes = useMemo(
-    () => combinedDowntimeMinutes(filteredRecords, filteredSessions, nowMs),
-    [filteredRecords, filteredSessions, nowMs]
+    () =>
+      totalDowntimeMinutes(
+        collectDowntimeIntervals(
+          {
+            records: filteredRecords,
+            activeSessions: filteredSessions,
+            endedSessions: filteredClosed.ended,
+            shiftSummaries: filteredClosed.summaries,
+          },
+          nowMs
+        )
+      ),
+    [filteredRecords, filteredSessions, filteredClosed, nowMs]
   );
 
   // ── Aggregates — all computed locally from the single fetch above.
@@ -1110,6 +1149,9 @@ export default function AdminOverviewScreen() {
         }}
       />
 
+      {/* Prod AI — admins only (the component checks), above the pager tabs */}
+      <ProdAIButton />
+
       <AppDrawer
         visible={drawerOpen}
         onClose={() => setDrawerOpen(false)}
@@ -1157,8 +1199,9 @@ const styles = StyleSheet.create({
   },
   rolePillText: { color: '#3E7CB1', fontSize: 10, fontWeight: '900', letterSpacing: 1 },
 
-  // Bottom padding clears the dashboard pager's floating page tabs.
-  scroll: { paddingHorizontal: 12, paddingTop: 12, paddingBottom: 72, gap: 11 },
+  // Bottom padding clears the dashboard pager's floating page tabs and the
+  // floating Prod AI button above them.
+  scroll: { paddingHorizontal: 12, paddingTop: 12, paddingBottom: PROD_AI_BUTTON_CLEARANCE, gap: 11 },
 
   sectionLabel: { color: '#5C6670', fontSize: 10, fontWeight: '800', letterSpacing: 1.2 },
 

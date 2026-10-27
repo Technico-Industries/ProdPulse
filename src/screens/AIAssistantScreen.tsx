@@ -1,15 +1,21 @@
 // src/screens/AIAssistantScreen.tsx
 //
-// ProdPulse AI — admin chat over the production database. Web only: on
-// Android/iOS the menu entry is hidden (constants/adminMenu webOnly) and
-// this screen shows a notice instead of the chat.
+// Prod AI — admin chat over the production database. Web only: on
+// Android/iOS the floating Prod AI button (components/ProdAIButton) is
+// hidden and this screen shows a notice instead of the chat.
 //
-// Sending a message calls src/services/prodPulseAI.ts's askProdPulseAI(),
-// which invokes the prodPulseAI Cloud Function (functions/src). The
-// backend checks the user is an active admin, runs read-only production
-// queries with the app's own calculations, and asks Gemini to explain them.
-// Nothing AI- or Firestore-related happens in this file and no API key
-// ever appears here.
+// The chat (ProdAIChat below) is normally opened as a popup over the Admin
+// Overview (components/ProdAIPanel). This route (/ai-assistant) renders the
+// same chat full-screen, so an old link or bookmark still works. Both read
+// the one conversation in stores/prodAIStore, so closing the popup — even
+// mid-request — keeps the conversation for the rest of the app session.
+//
+// Sending a message calls src/services/prodPulseAI.ts's askProdPulseAI()
+// (via the store), which invokes the prodPulseAI Cloud Function
+// (functions/src). The backend checks the user is an active admin, runs
+// read-only production queries with the app's own calculations, and asks
+// Gemini to explain them. Nothing AI- or Firestore-related happens in this
+// file and no API key ever appears here.
 //
 // What the user sees is kept apart:
 //   • "Database result" cards — ResultBlocks computed by the backend. Their
@@ -18,6 +24,9 @@
 //   • "AI summary" text — the model's interpretation of those results.
 // An answer with no successful query is labelled as such, and a failed
 // request shows an error with Retry — never a fabricated reply.
+//
+// Look: minimal monochrome (AI_THEME) — near-black surfaces, white text and
+// primary actions, grey for secondary text, hover, pressed and focus.
 
 import React, { useEffect, useRef, useState } from 'react';
 import {
@@ -30,64 +39,49 @@ import {
   ScrollView,
   KeyboardAvoidingView,
   Platform,
-  ActivityIndicator,
-  useWindowDimensions,
+  LayoutChangeEvent,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useNavigation } from '@react-navigation/native';
 import { BarChart } from 'react-native-gifted-charts';
-import { askProdPulseAI, ProdPulseAIError } from '../services/prodPulseAI';
-import {
-  AI_LIMITS,
-  AIErrorCategory,
-  AIHistoryMessage,
-  Cell,
-  ColumnKind,
-  isProdPulseAIAvailable,
-  ProdPulseAIResponse,
-  ResultBlock,
-} from '../utils/prodPulseAI';
+import { AI_LIMITS, Cell, ColumnKind, isProdPulseAIAvailable, ResultBlock } from '../utils/prodPulseAI';
 import { exportResultToExcel } from '../utils/prodPulseAIExcelExport';
+import { ChatMessage } from '../utils/prodAIConversation';
+import { prodAIConversation, useProdAI } from '../stores/prodAIStore';
+import { useAuthStore } from '../stores/authStore';
+import ProdAIThinking, { ProdAIBrain } from '../components/ProdAIThinking';
 
-const ACCENT = '#8A5CF5';
+export const AI_THEME = {
+  bg: '#0B0B0B',
+  surface: '#151515',
+  surface2: '#1D1D1D',
+  text: '#FFFFFF',
+  textMuted: '#A3A3A3',
+  border: '#2B2B2B',
+  hover: '#242424',
+  pressed: '#2E2E2E',
+} as const;
+const T = AI_THEME;
 
-const SUGGESTIONS: { group: string; icon: keyof typeof Ionicons.glyphMap; prompts: string[] }[] = [
-  { group: 'Daily production', icon: 'today-outline', prompts: ["What is today's total production?", 'Show production for each line yesterday.'] },
-  { group: 'Target variance', icon: 'trending-down-outline', prompts: ['Which lines are below their target today?', 'Which lines have the highest target shortfall this week?'] },
-  { group: 'Quality', icon: 'shield-checkmark-outline', prompts: ['Which parts have the highest rejection rate this month?', 'Compare rejection rates across shifts for the last 7 days.'] },
-  { group: 'Downtime', icon: 'pause-circle-outline', prompts: ['Which lines experienced the most downtime this week?', 'What were the most common stoppage reasons this month?'] },
-  { group: 'Model / part', icon: 'cube-outline', prompts: ['Which models produced the most parts this month?', 'Compare production this week with last week.'] },
+const SUGGESTIONS: string[] = [
+  "What is today's total production?",
+  'Which lines are below their target today?',
+  'Which parts have the highest rejection rate this month?',
+  'Which lines experienced the most downtime this week?',
+  'Which models produced the most parts this month?',
+  'Compare production this week with last week.',
 ];
 
-interface ChatMessage {
-  id: string;
-  role: 'user' | 'assistant';
-  text: string;
-  response?: ProdPulseAIResponse;
-  // Set only on a failed request — the bubble shows the error and, when the
-  // failure is retryable, a Retry that re-sends `question`.
-  error?: { message: string; retryable: boolean; category: AIErrorCategory; reason?: string; question: string };
-}
-
-let idSeq = 0;
-const newId = () => `${Date.now()}-${++idSeq}`;
-
-// Earlier turns sent as context (text only — never result rows), newest
-// kept, within the backend's limits.
-function historyFor(messages: ChatMessage[]): AIHistoryMessage[] {
-  const turns: AIHistoryMessage[] = messages
-    .filter((m) => !m.error && m.text.trim())
-    .map((m) => ({ role: m.role === 'user' ? 'user' : 'model', text: m.text.slice(0, AI_LIMITS.maxHistoryMessageChars) }));
-  const out: AIHistoryMessage[] = [];
-  let total = 0;
-  for (let i = turns.length - 1; i >= 0 && out.length < AI_LIMITS.maxHistoryMessages; i--) {
-    total += turns[i].text.length;
-    if (total > AI_LIMITS.maxHistoryTotalChars) break;
-    out.unshift(turns[i]);
-  }
-  // The conversation sent to the model opens with a user turn.
-  while (out.length && out[0].role !== 'user') out.shift();
-  return out;
+// Grey hover / pressed and a visible white keyboard-focus ring (web), for
+// every Pressable in the chat. `hovered` / `focused` only exist on web.
+type PressState = { pressed: boolean; hovered?: boolean; focused?: boolean };
+export function pressFeedback({ pressed, hovered, focused }: PressState, base?: object) {
+  return [
+    base,
+    hovered && { backgroundColor: T.hover },
+    pressed && { backgroundColor: T.pressed },
+    focused && Platform.OS === 'web' && ({ outlineColor: T.text, outlineWidth: 2, outlineStyle: 'solid', outlineOffset: 1 } as any),
+  ];
 }
 
 // ─── Formatting ──────────────────────────────────────────────────────────────
@@ -159,22 +153,22 @@ function ResultCard({ block, generatedAt, chartWidth }: { block: ResultBlock; ge
         .map((r) => ({
           value: r[block.chart!.valueKey] as number,
           label: String(r[block.chart!.labelKey] ?? '').slice(0, 10),
-          frontColor: ACCENT,
-          labelTextStyle: { color: '#8A96A3', fontSize: 9.5 },
+          frontColor: '#E5E5E5',
+          labelTextStyle: { color: T.textMuted, fontSize: 9.5 },
         }))
     : [];
 
   return (
     <View style={styles.resultCard}>
       <View style={styles.resultHeader}>
-        <View style={styles.dbBadge}>
-          <Ionicons name="server-outline" size={11} color="#4C9A6A" />
-          <Text style={styles.dbBadgeText}>Database result</Text>
+        <View style={styles.tag}>
+          <Ionicons name="server-outline" size={11} color={T.textMuted} />
+          <Text style={styles.tagText}>Database result</Text>
         </View>
         {!block.complete && (
-          <View style={styles.warnBadge}>
-            <Ionicons name="alert-circle-outline" size={11} color="#F2A93B" />
-            <Text style={styles.warnBadgeText}>Has data notes</Text>
+          <View style={styles.tag}>
+            <Ionicons name="alert-circle-outline" size={11} color={T.text} />
+            <Text style={[styles.tagText, { color: T.text }]}>Has data notes</Text>
           </View>
         )}
       </View>
@@ -207,15 +201,15 @@ function ResultCard({ block, generatedAt, chartWidth }: { block: ResultBlock; ge
           <ScrollView horizontal showsHorizontalScrollIndicator>
             <BarChart
               data={chartData}
-              barWidth={22}
-              spacing={18}
-              height={170}
-              width={Math.max(chartWidth, chartData.length * 40 + 40)}
+              barWidth={18}
+              spacing={14}
+              height={150}
+              width={Math.max(chartWidth, chartData.length * 34 + 40)}
               noOfSections={4}
-              yAxisTextStyle={{ color: '#8A96A3', fontSize: 10 }}
-              xAxisColor="#2C343C"
-              yAxisColor="#2C343C"
-              rulesColor="#232A31"
+              yAxisTextStyle={{ color: T.textMuted, fontSize: 10 }}
+              xAxisColor={T.border}
+              yAxisColor={T.border}
+              rulesColor={T.surface2}
               isAnimated={false}
             />
           </ScrollView>
@@ -235,15 +229,11 @@ function ResultCard({ block, generatedAt, chartWidth }: { block: ResultBlock; ge
             ) : (
               block.rows.map((r, i) => (
                 <View key={i} style={[styles.tr, i % 2 === 1 && styles.trAlt]}>
-                  {block.columns.map((c) => {
-                    const v = r[c.key];
-                    const negative = c.key === 'variance' && typeof v === 'number' && v < 0;
-                    return (
-                      <Text key={c.key} style={[styles.td, c.kind !== 'text' && styles.cellNum, negative && { color: '#D64545' }]}>
-                        {formatCell(v, c.kind)}
-                      </Text>
-                    );
-                  })}
+                  {block.columns.map((c) => (
+                    <Text key={c.key} style={[styles.td, c.kind !== 'text' && styles.cellNum]}>
+                      {formatCell(r[c.key], c.kind)}
+                    </Text>
+                  ))}
                 </View>
               ))
             )}
@@ -258,7 +248,7 @@ function ResultCard({ block, generatedAt, chartWidth }: { block: ResultBlock; ge
         <View style={styles.notesBox}>
           {block.notes.map((n, i) => (
             <View key={i} style={styles.bulletRow}>
-              <Ionicons name="information-circle-outline" size={13} color="#F2A93B" style={{ marginTop: 2 }} />
+              <Ionicons name="information-circle-outline" size={13} color={T.textMuted} style={{ marginTop: 2 }} />
               <Text style={[styles.noteText, { flex: 1 }]}>{n}</Text>
             </View>
           ))}
@@ -266,14 +256,20 @@ function ResultCard({ block, generatedAt, chartWidth }: { block: ResultBlock; ge
       )}
 
       <View style={styles.cardActions}>
-        <Pressable onPress={() => setShowDetails((v) => !v)} style={styles.linkButton} hitSlop={6}>
-          <Ionicons name={showDetails ? 'chevron-up' : 'chevron-down'} size={13} color="#8A96A3" />
+        <Pressable
+          onPress={() => setShowDetails((v) => !v)}
+          style={(s) => pressFeedback(s, styles.linkButton)}
+          hitSlop={6}
+          accessibilityRole="button"
+          accessibilityState={{ expanded: showDetails }}
+        >
+          <Ionicons name={showDetails ? 'chevron-up' : 'chevron-down'} size={13} color={T.textMuted} />
           <Text style={styles.linkButtonText}>How this is calculated</Text>
         </Pressable>
         {block.columns.length > 0 && (
-          <Pressable onPress={handleExport} style={({ pressed }) => [styles.exportButton, pressed && { opacity: 0.6 }]}>
-            <Ionicons name={exportState === 'done' ? 'checkmark' : 'download-outline'} size={14} color="#4C9A6A" />
-            <Text style={styles.exportButtonText}>
+          <Pressable onPress={handleExport} style={(s) => pressFeedback(s, styles.ghostButton)} accessibilityRole="button">
+            <Ionicons name={exportState === 'done' ? 'checkmark' : 'download-outline'} size={14} color={T.text} />
+            <Text style={styles.ghostButtonText}>
               {exportState === 'done' ? 'Downloaded' : exportState === 'error' ? 'Export failed — retry' : 'Export to Excel'}
             </Text>
           </Pressable>
@@ -291,45 +287,87 @@ function ResultCard({ block, generatedAt, chartWidth }: { block: ResultBlock; ge
   );
 }
 
-// ─── Screen ──────────────────────────────────────────────────────────────────
+// ─── Chat ────────────────────────────────────────────────────────────────────
 
-function NativeNotice() {
-  const navigation = useNavigation<any>();
-  return (
-    <SafeAreaView style={styles.safeArea}>
-      <Pressable onPress={() => navigation.goBack()} style={styles.backButton} hitSlop={12}>
-        <Ionicons name="arrow-back" size={22} color="#8A96A3" />
-        <Text style={styles.backText}>Back</Text>
-      </Pressable>
-      <View style={styles.chatEmpty}>
-        <View style={styles.chatEmptyIconBadge}>
-          <Ionicons name="desktop-outline" size={28} color={ACCENT} />
+function MessageView({ m, chartWidth, isSending }: { m: ChatMessage; chartWidth: number; isSending: boolean }) {
+  if (m.role === 'user') {
+    return (
+      <View style={[styles.messageRow, styles.messageRowUser]}>
+        <View style={styles.userBubble}>
+          <Text style={styles.messageText}>{m.text}</Text>
         </View>
-        <Text style={styles.chatEmptyTitle}>ProdPulse AI is available on the web app</Text>
-        <Text style={styles.chatEmptySubtitle}>Open ProdPulse in a browser and sign in with an admin account to use it.</Text>
       </View>
-    </SafeAreaView>
+    );
+  }
+  if (m.error) {
+    const err = m.error;
+    return (
+      <View style={[styles.messageRow, styles.messageRowAssistant]} accessibilityLiveRegion="polite">
+        <View style={styles.errorBox}>
+          <View style={styles.bulletRow}>
+            <Ionicons name="alert-circle-outline" size={16} color={T.text} style={{ marginTop: 2 }} />
+            <Text style={[styles.messageText, { flex: 1 }]}>{err.message}</Text>
+          </View>
+          <Text style={styles.errorCode}>Error code: {err.category}{err.reason ? ` · ${err.reason}` : ''}</Text>
+          {err.retryable && (
+            <Pressable
+              onPress={() => prodAIConversation.getState().retry(m.id)}
+              disabled={isSending}
+              style={(s) => pressFeedback(s, [styles.ghostButton, { alignSelf: 'flex-start', marginTop: 8 }, isSending && { opacity: 0.4 }])}
+              hitSlop={8}
+              accessibilityRole="button"
+              accessibilityLabel="Retry this question"
+            >
+              <Ionicons name="refresh" size={13} color={T.text} />
+              <Text style={styles.ghostButtonText}>Retry</Text>
+            </Pressable>
+          )}
+        </View>
+      </View>
+    );
+  }
+  return (
+    <View style={styles.answerBlock}>
+      {(m.response?.results ?? []).map((b) => (
+        <ResultCard key={b.id} block={b} generatedAt={m.response!.generatedAt} chartWidth={chartWidth} />
+      ))}
+      {(m.response?.toolErrors ?? []).length > 0 && (
+        <View style={styles.errorBox}>
+          <View style={styles.bulletRow}>
+            <Ionicons name="warning-outline" size={14} color={T.text} style={{ marginTop: 2 }} />
+            <Text style={[styles.noteText, { flex: 1, color: T.text }]}>
+              Some data could not be retrieved: {m.response!.toolErrors.map((t) => t.message).join(' ')}
+            </Text>
+          </View>
+        </View>
+      )}
+      <View style={styles.summary}>
+        <View style={styles.summaryHead}>
+          <ProdAIBrain size={13} color={T.textMuted} />
+          <Text style={styles.summaryHeadText}>AI summary</Text>
+          {!m.response?.dataRetrieved && <Text style={styles.noDataTag}>No database results in this answer</Text>}
+        </View>
+        <SummaryText text={m.text} />
+      </View>
+    </View>
   );
 }
 
-export default function AIAssistantScreen() {
-  if (!isProdPulseAIAvailable(Platform.OS)) return <NativeNotice />;
-  return <AIChat />;
-}
-
-function AIChat() {
-  const navigation = useNavigation<any>();
-  const { width } = useWindowDimensions();
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [input, setInput] = useState('');
-  const [isSending, setIsSending] = useState(false);
+// The chat, shown in the popup (`mode="panel"`, with a close button) or on
+// the /ai-assistant route (`mode="screen"`, with Back).
+export function ProdAIChat({ mode, onClose }: { mode: 'panel' | 'screen'; onClose: () => void }) {
+  const uid = useAuthStore((s) => s.user?.uid ?? null);
+  const messages = useProdAI((s) => s.messages);
+  const isSending = useProdAI((s) => s.isSending);
+  const draft = useProdAI((s) => s.draft);
   const scrollRef = useRef<ScrollView>(null);
-  // Bumped by "New conversation" so a reply still in flight for the old
-  // conversation is dropped instead of appearing in the new one.
-  const conversationRef = useRef(0);
+  const [width, setWidth] = useState(360);
+  const chartWidth = Math.max(220, width - 64);
 
-  const contentWidth = Math.min(width, 980);
-  const chartWidth = Math.max(240, contentWidth - 120);
+  // A conversation never carries over to another user on this device.
+  useEffect(() => {
+    prodAIConversation.getState().ensureOwner(uid);
+  }, [uid]);
 
   useEffect(() => {
     if (messages.length === 0 && !isSending) return;
@@ -337,56 +375,7 @@ function AIChat() {
     return () => clearTimeout(t);
   }, [messages.length, isSending]);
 
-  // Shared by the composer, the suggestions and Retry. `prior` is the
-  // conversation the question is asked in (without the question itself).
-  const sendQuestion = (text: string, prior: ChatMessage[], appendUserBubble: boolean) => {
-    if (isSending) return;
-    const conversation = conversationRef.current;
-    if (appendUserBubble) setMessages([...prior, { id: newId(), role: 'user', text }]);
-    setIsSending(true);
-
-    askProdPulseAI(text, historyFor(prior))
-      .then((response) => {
-        if (conversation !== conversationRef.current) return;
-        setMessages((prev) => [...prev, { id: newId(), role: 'assistant', text: response.reply.trim(), response }]);
-      })
-      .catch((err) => {
-        if (conversation !== conversationRef.current) return;
-        const e = err instanceof ProdPulseAIError ? err : new ProdPulseAIError("Sorry, I couldn't retrieve that information. Please try again.", true, 'INVALID_RESPONSE');
-        setMessages((prev) => [
-          ...prev,
-          { id: newId(), role: 'assistant', text: '', error: { message: e.message, retryable: e.retryable, category: e.category, reason: e.reason, question: text } },
-        ]);
-      })
-      .finally(() => {
-        if (conversation === conversationRef.current) setIsSending(false);
-      });
-  };
-
-  const handleSend = (raw = input) => {
-    const text = raw.trim();
-    if (!text || isSending) return;
-    setInput('');
-    sendQuestion(text, messages, true);
-  };
-
-  const handleRetry = (messageId: string, question: string) => {
-    if (isSending) return;
-    // Drop the failed bubble; the user's question stays above it.
-    const idx = messages.findIndex((m) => m.id === messageId);
-    const remaining = messages.filter((m) => m.id !== messageId);
-    setMessages(remaining);
-    // Context = everything before the question being retried.
-    const prior = messages.slice(0, Math.max(0, idx - 1));
-    sendQuestion(question, prior, false);
-  };
-
-  const handleNewConversation = () => {
-    conversationRef.current++;
-    setMessages([]);
-    setInput('');
-    setIsSending(false);
-  };
+  const send = (text = prodAIConversation.getState().draft) => prodAIConversation.getState().send(text);
 
   // Web: Enter sends, Shift+Enter inserts a newline.
   const handleKeyPress = (e: any) => {
@@ -394,158 +383,142 @@ function AIChat() {
     const ne = e?.nativeEvent ?? {};
     if (ne.key === 'Enter' && !ne.shiftKey && !ne.isComposing) {
       e.preventDefault?.();
-      handleSend();
+      send();
     }
   };
 
+  const canSend = !!draft.trim() && !isSending;
+
+  return (
+    <View style={styles.chat} onLayout={(e: LayoutChangeEvent) => setWidth(e.nativeEvent.layout.width)}>
+      <View style={styles.header}>
+        {mode === 'screen' && (
+          <Pressable onPress={onClose} style={(s) => pressFeedback(s, styles.iconButton)} hitSlop={8} accessibilityRole="button" accessibilityLabel="Back">
+            <Ionicons name="arrow-back" size={18} color={T.text} />
+          </Pressable>
+        )}
+        <ProdAIBrain size={20} />
+        <Text style={styles.headerTitle} accessibilityRole="header">Prod AI</Text>
+        <View style={{ flex: 1 }} />
+        <Pressable
+          onPress={() => prodAIConversation.getState().newConversation()}
+          disabled={messages.length === 0 && !isSending}
+          style={(s) => pressFeedback(s, [styles.iconButton, messages.length === 0 && !isSending && { opacity: 0.35 }])}
+          hitSlop={6}
+          accessibilityRole="button"
+          accessibilityLabel="Start a new conversation"
+        >
+          <Ionicons name="create-outline" size={18} color={T.text} />
+        </Pressable>
+        {mode === 'panel' && (
+          <Pressable onPress={onClose} style={(s) => pressFeedback(s, styles.iconButton)} hitSlop={6} accessibilityRole="button" accessibilityLabel="Close Prod AI">
+            <Ionicons name="close" size={20} color={T.text} />
+          </Pressable>
+        )}
+      </View>
+
+      <ScrollView
+        ref={scrollRef}
+        style={{ flex: 1 }}
+        contentContainerStyle={styles.chatArea}
+        keyboardShouldPersistTaps="handled"
+      >
+        {messages.length === 0 ? (
+          <View style={styles.empty}>
+            <Text style={styles.emptyTitle}>Ask about your production data</Text>
+            <Text style={styles.emptySubtitle}>Production, targets, rejections and downtime. Figures come from the database; the AI explains them.</Text>
+            <View style={styles.suggestions}>
+              {SUGGESTIONS.map((p) => (
+                <Pressable
+                  key={p}
+                  onPress={() => send(p)}
+                  disabled={isSending}
+                  style={(s) => pressFeedback(s, styles.suggestion)}
+                  accessibilityRole="button"
+                >
+                  <Text style={styles.suggestionText}>{p}</Text>
+                  <Ionicons name="arrow-forward" size={13} color={T.textMuted} />
+                </Pressable>
+              ))}
+            </View>
+          </View>
+        ) : (
+          messages.map((m) => <MessageView key={m.id} m={m} chartWidth={chartWidth} isSending={isSending} />)
+        )}
+
+        {isSending && (
+          <View style={[styles.messageRow, styles.messageRowAssistant, { paddingVertical: 6 }]}>
+            <ProdAIThinking />
+          </View>
+        )}
+      </ScrollView>
+
+      <View style={styles.composer}>
+        <View style={styles.inputRow}>
+          <TextInput
+            style={styles.input}
+            value={draft}
+            onChangeText={(t) => prodAIConversation.getState().setDraft(t)}
+            onKeyPress={handleKeyPress}
+            placeholder="Ask about production…"
+            placeholderTextColor="#6B6B6B"
+            multiline
+            maxLength={AI_LIMITS.maxQuestionChars}
+            editable={!isSending}
+            autoFocus={mode === 'panel' && Platform.OS === 'web'}
+            accessibilityLabel="Message Prod AI"
+          />
+          <Pressable
+            onPress={() => send()}
+            disabled={!canSend}
+            style={({ pressed, focused }: PressState) => [
+              styles.sendButton,
+              !canSend && styles.sendButtonDisabled,
+              pressed && { opacity: 0.8 },
+              focused && Platform.OS === 'web' && ({ outlineColor: T.text, outlineWidth: 2, outlineStyle: 'solid', outlineOffset: 2 } as any),
+            ]}
+            accessibilityRole="button"
+            accessibilityLabel="Send"
+            accessibilityState={{ disabled: !canSend, busy: isSending }}
+          >
+            <Ionicons name="arrow-up" size={18} color={canSend ? '#000000' : '#6B6B6B'} />
+          </Pressable>
+        </View>
+        <Text style={styles.composerHint}>
+          {Platform.OS === 'web' ? 'Enter to send · Shift+Enter for a new line · ' : ''}Read-only: Prod AI never changes data
+        </Text>
+      </View>
+    </View>
+  );
+}
+
+// ─── Screen ──────────────────────────────────────────────────────────────────
+
+function NativeNotice() {
+  const navigation = useNavigation<any>();
   return (
     <SafeAreaView style={styles.safeArea}>
-      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={90}>
-        <View style={[styles.column, { maxWidth: 980 }]}>
-          <View style={styles.topBar}>
-            <Pressable onPress={() => navigation.goBack()} style={styles.backButtonInline} hitSlop={12}>
-              <Ionicons name="arrow-back" size={22} color="#8A96A3" />
-              <Text style={styles.backText}>Back</Text>
-            </Pressable>
-            <Pressable
-              onPress={handleNewConversation}
-              disabled={messages.length === 0 && !isSending}
-              style={({ pressed }) => [styles.newChatButton, (messages.length === 0 && !isSending) && { opacity: 0.4 }, pressed && { opacity: 0.6 }]}
-              accessibilityLabel="Start a new conversation"
-            >
-              <Ionicons name="add" size={16} color={ACCENT} />
-              <Text style={styles.newChatText}>New conversation</Text>
-            </Pressable>
-          </View>
+      <Pressable onPress={() => navigation.goBack()} style={styles.backButton} hitSlop={12} accessibilityRole="button" accessibilityLabel="Back">
+        <Ionicons name="arrow-back" size={22} color={T.textMuted} />
+        <Text style={styles.backText}>Back</Text>
+      </Pressable>
+      <View style={styles.empty}>
+        <ProdAIBrain size={28} />
+        <Text style={styles.emptyTitle}>Prod AI is available on the web app</Text>
+        <Text style={styles.emptySubtitle}>Open ProdPulse in a browser and sign in with an admin account to use it.</Text>
+      </View>
+    </SafeAreaView>
+  );
+}
 
-          <View style={styles.header}>
-            <View style={styles.headerTitleRow}>
-              <View style={styles.headerIconBadge}>
-                <Ionicons name="sparkles" size={18} color={ACCENT} />
-              </View>
-              <Text style={styles.headerTitle}>ProdPulse AI</Text>
-            </View>
-            <Text style={styles.headerGreeting}>
-              Answers questions from your live production records — production, targets, rejections and downtime. Figures come straight
-              from the database; the AI explains them.
-            </Text>
-          </View>
-
-          <ScrollView ref={scrollRef} contentContainerStyle={styles.chatArea} keyboardShouldPersistTaps="handled">
-            {messages.length === 0 ? (
-              <View style={styles.chatEmpty}>
-                <View style={styles.chatEmptyIconBadge}>
-                  <Ionicons name="chatbubble-ellipses-outline" size={30} color={ACCENT} />
-                </View>
-                <Text style={styles.chatEmptyTitle}>Ask about your production data</Text>
-                <Text style={styles.chatEmptySubtitle}>Pick a suggestion or type your own question.</Text>
-                <View style={styles.suggestGrid}>
-                  {SUGGESTIONS.map((s) => (
-                    <View key={s.group} style={[styles.suggestGroup, { width: contentWidth > 700 ? '48%' : '100%' }]}>
-                      <View style={styles.suggestGroupHead}>
-                        <Ionicons name={s.icon} size={14} color={ACCENT} />
-                        <Text style={styles.suggestGroupTitle}>{s.group}</Text>
-                      </View>
-                      {s.prompts.map((p) => (
-                        <Pressable key={p} onPress={() => handleSend(p)} disabled={isSending} style={({ pressed }) => [styles.exampleChip, pressed && { opacity: 0.6 }]}>
-                          <Text style={styles.exampleChipText}>{p}</Text>
-                          <Ionicons name="arrow-forward" size={13} color="#5C6670" />
-                        </Pressable>
-                      ))}
-                    </View>
-                  ))}
-                </View>
-              </View>
-            ) : (
-              messages.map((m) =>
-                m.role === 'user' ? (
-                  <View key={m.id} style={[styles.messageRow, styles.messageRowUser]}>
-                    <View style={[styles.messageBubble, styles.messageBubbleUser]}>
-                      <Text style={[styles.messageText, styles.messageTextUser]}>{m.text}</Text>
-                    </View>
-                  </View>
-                ) : m.error ? (
-                  <View key={m.id} style={[styles.messageRow, styles.messageRowAssistant]}>
-                    <View style={styles.avatarBadge}>
-                      <Ionicons name="alert" size={13} color="#D64545" />
-                    </View>
-                    <View style={[styles.messageBubble, styles.messageBubbleAssistant, styles.messageBubbleError]}>
-                      <Text style={styles.messageText}>{m.error.message}</Text>
-                      <Text style={styles.errorCode}>Error code: {m.error.category}{m.error.reason ? ` · ${m.error.reason}` : ''}</Text>
-                      {m.error.retryable && (
-                        <Pressable
-                          onPress={() => handleRetry(m.id, m.error!.question)}
-                          disabled={isSending}
-                          style={({ pressed }) => [styles.retryButton, pressed && { opacity: 0.6 }]}
-                          hitSlop={8}
-                        >
-                          <Ionicons name="refresh" size={13} color={ACCENT} />
-                          <Text style={styles.retryButtonText}>Retry</Text>
-                        </Pressable>
-                      )}
-                    </View>
-                  </View>
-                ) : (
-                  <View key={m.id} style={styles.answerBlock}>
-                    {(m.response?.results ?? []).map((b) => (
-                      <ResultCard key={b.id} block={b} generatedAt={m.response!.generatedAt} chartWidth={chartWidth} />
-                    ))}
-                    {(m.response?.toolErrors ?? []).length > 0 && (
-                      <View style={styles.toolErrorBox}>
-                        <Ionicons name="warning-outline" size={14} color="#D64545" />
-                        <Text style={[styles.noteText, { flex: 1, color: '#E8A0A0' }]}>
-                          Some data could not be retrieved: {m.response!.toolErrors.map((t) => t.message).join(' ')}
-                        </Text>
-                      </View>
-                    )}
-                    <View style={styles.summaryBubble}>
-                      <View style={styles.summaryHead}>
-                        <Ionicons name="sparkles" size={12} color={ACCENT} />
-                        <Text style={styles.summaryHeadText}>AI summary</Text>
-                        {!m.response?.dataRetrieved && <Text style={styles.noDataTag}>No database results in this answer</Text>}
-                      </View>
-                      <SummaryText text={m.text} />
-                    </View>
-                  </View>
-                )
-              )
-            )}
-
-            {isSending && (
-              <View style={[styles.messageRow, styles.messageRowAssistant]}>
-                <View style={styles.avatarBadge}>
-                  <Ionicons name="sparkles" size={13} color={ACCENT} />
-                </View>
-                <View style={[styles.messageBubble, styles.messageBubbleAssistant, styles.typingBubble]}>
-                  <ActivityIndicator size="small" color={ACCENT} />
-                  <Text style={styles.typingText}>Querying production data…</Text>
-                </View>
-              </View>
-            )}
-          </ScrollView>
-
-          <View style={styles.inputRow}>
-            <TextInput
-              style={styles.input}
-              value={input}
-              onChangeText={setInput}
-              onKeyPress={handleKeyPress}
-              placeholder="Ask about production, targets, rejections, downtime…"
-              placeholderTextColor="#5C6670"
-              multiline
-              maxLength={AI_LIMITS.maxQuestionChars}
-              editable={!isSending}
-            />
-            <Pressable
-              onPress={() => handleSend()}
-              disabled={!input.trim() || isSending}
-              style={[styles.sendButton, (!input.trim() || isSending) && styles.sendButtonDisabled]}
-              accessibilityLabel="Send"
-            >
-              {isSending ? <ActivityIndicator size="small" color="#14181C" /> : <Ionicons name="arrow-up" size={20} color="#14181C" />}
-            </Pressable>
-          </View>
-          <Text style={styles.composerHint}>Enter to send · Shift+Enter for a new line · Read-only: ProdPulse AI never changes data</Text>
+export default function AIAssistantScreen() {
+  const navigation = useNavigation<any>();
+  if (!isProdPulseAIAvailable(Platform.OS)) return <NativeNotice />;
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+        <View style={styles.screenColumn}>
+          <ProdAIChat mode="screen" onClose={() => (navigation.canGoBack() ? navigation.goBack() : navigation.navigate('Home'))} />
         </View>
       </KeyboardAvoidingView>
     </SafeAreaView>
@@ -553,150 +526,103 @@ function AIChat() {
 }
 
 const styles = StyleSheet.create({
-  safeArea: { flex: 1, backgroundColor: '#14181C' },
-  column: { flex: 1, width: '100%', alignSelf: 'center' },
-  topBar: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, marginTop: 12 },
-  backButton: { flexDirection: 'row', alignItems: 'center', gap: 4, paddingHorizontal: 20, marginTop: 12 },
-  backButtonInline: { flexDirection: 'row', alignItems: 'center', gap: 4 },
-  backText: { color: '#8A96A3', fontSize: 15 },
-  newChatButton: {
-    flexDirection: 'row', alignItems: 'center', gap: 4, paddingHorizontal: 12, paddingVertical: 7,
-    borderRadius: 14, borderWidth: 1, borderColor: '#8A5CF555', backgroundColor: '#8A5CF51A',
-  },
-  newChatText: { color: ACCENT, fontSize: 13, fontWeight: '600' },
+  safeArea: { flex: 1, backgroundColor: T.bg },
+  screenColumn: { flex: 1, width: '100%', maxWidth: 860, alignSelf: 'center' },
+  backButton: { flexDirection: 'row', alignItems: 'center', gap: 4, paddingHorizontal: 16, marginTop: 12 },
+  backText: { color: T.textMuted, fontSize: 15 },
 
-  header: { paddingHorizontal: 16, paddingTop: 10, paddingBottom: 10 },
-  headerTitleRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  headerIconBadge: {
-    width: 32, height: 32, borderRadius: 10, backgroundColor: '#8A5CF522',
-    borderWidth: 1, borderColor: '#8A5CF555', alignItems: 'center', justifyContent: 'center',
-  },
-  headerTitle: { color: '#ECEFF2', fontSize: 20, fontWeight: '800' },
-  headerGreeting: { color: '#8A96A3', fontSize: 13, marginTop: 6, lineHeight: 18 },
-
-  chatArea: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 8, paddingBottom: 16 },
-
-  chatEmpty: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 6, paddingVertical: 24, paddingHorizontal: 10 },
-  chatEmptyIconBadge: {
-    width: 56, height: 56, borderRadius: 28, backgroundColor: '#8A5CF522',
-    borderWidth: 1, borderColor: '#8A5CF555', alignItems: 'center', justifyContent: 'center', marginBottom: 8,
-  },
-  chatEmptyTitle: { color: '#ECEFF2', fontSize: 15.5, fontWeight: '700', textAlign: 'center' },
-  chatEmptySubtitle: { color: '#5C6670', fontSize: 12.5, textAlign: 'center', marginTop: 2, marginBottom: 16 },
-
-  suggestGrid: { width: '100%', flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', gap: 12 },
-  suggestGroup: { gap: 6 },
-  suggestGroupHead: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 2 },
-  suggestGroupTitle: { color: '#8A96A3', fontSize: 12, fontWeight: '700', textTransform: 'uppercase', letterSpacing: 0.5 },
-  exampleChip: {
+  chat: { flex: 1, backgroundColor: T.bg },
+  header: {
     flexDirection: 'row', alignItems: 'center', gap: 8,
-    backgroundColor: '#1D2329', borderWidth: 1, borderColor: '#2C343C', borderRadius: 12,
-    paddingHorizontal: 14, paddingVertical: 11,
+    paddingHorizontal: 12, paddingVertical: 10, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: T.border,
   },
-  exampleChipText: { color: '#ECEFF2', fontSize: 13.5, flex: 1, lineHeight: 18 },
+  headerTitle: { color: T.text, fontSize: 15, fontWeight: '600', letterSpacing: 0.2 },
+  iconButton: { width: 36, height: 36, borderRadius: 8, alignItems: 'center', justifyContent: 'center' },
 
-  messageRow: { flexDirection: 'row', alignItems: 'flex-end', gap: 8, marginBottom: 14, maxWidth: '100%' },
+  chatArea: { flexGrow: 1, paddingHorizontal: 14, paddingTop: 12, paddingBottom: 12 },
+
+  empty: { flex: 1, justifyContent: 'center', gap: 6, paddingVertical: 16 },
+  emptyTitle: { color: T.text, fontSize: 15, fontWeight: '600' },
+  emptySubtitle: { color: T.textMuted, fontSize: 12.5, lineHeight: 18, marginBottom: 10 },
+  suggestions: { gap: 6 },
+  suggestion: {
+    flexDirection: 'row', alignItems: 'center', gap: 8, minHeight: 40,
+    backgroundColor: T.surface, borderWidth: 1, borderColor: T.border, borderRadius: 10,
+    paddingHorizontal: 12, paddingVertical: 9,
+  },
+  suggestionText: { color: T.text, fontSize: 13, flex: 1, lineHeight: 18 },
+
+  messageRow: { flexDirection: 'row', marginBottom: 12, maxWidth: '100%' },
   messageRowUser: { justifyContent: 'flex-end', alignSelf: 'flex-end' },
   messageRowAssistant: { justifyContent: 'flex-start', alignSelf: 'flex-start' },
-  avatarBadge: {
-    width: 26, height: 26, borderRadius: 13, backgroundColor: '#8A5CF522',
-    borderWidth: 1, borderColor: '#8A5CF555', alignItems: 'center', justifyContent: 'center', marginBottom: 2,
-  },
-  messageBubble: { maxWidth: '82%', borderRadius: 20, paddingHorizontal: 16, paddingVertical: 12 },
-  messageBubbleUser: { backgroundColor: ACCENT, borderBottomRightRadius: 6 },
-  messageBubbleAssistant: { backgroundColor: '#1D2329', borderWidth: 1, borderColor: '#2C343C', borderBottomLeftRadius: 6 },
-  messageBubbleError: { borderColor: '#D6454577' },
-  messageText: { color: '#ECEFF2', fontSize: 14.5, lineHeight: 21 },
-  messageTextUser: { color: '#FFFFFF' },
+  userBubble: { maxWidth: '85%', backgroundColor: T.surface2, borderRadius: 14, borderBottomRightRadius: 4, paddingHorizontal: 13, paddingVertical: 9 },
+  messageText: { color: T.text, fontSize: 14, lineHeight: 20 },
   bulletRow: { flexDirection: 'row', gap: 6, alignItems: 'flex-start' },
 
-  answerBlock: { marginBottom: 18, gap: 10, width: '100%' },
-  summaryBubble: { backgroundColor: '#1D2329', borderWidth: 1, borderColor: '#2C343C', borderRadius: 16, padding: 14 },
-  summaryHead: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 8, flexWrap: 'wrap' },
-  summaryHeadText: { color: ACCENT, fontSize: 11.5, fontWeight: '700', textTransform: 'uppercase', letterSpacing: 0.5 },
+  answerBlock: { marginBottom: 16, gap: 8, width: '100%' },
+  summary: { paddingVertical: 2 },
+  summaryHead: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 6, flexWrap: 'wrap' },
+  summaryHeadText: { color: T.textMuted, fontSize: 11, fontWeight: '600', textTransform: 'uppercase', letterSpacing: 0.6 },
   noDataTag: {
-    color: '#F2A93B', fontSize: 11, borderWidth: 1, borderColor: '#F2A93B55', borderRadius: 8,
+    color: T.textMuted, fontSize: 11, borderWidth: 1, borderColor: T.border, borderRadius: 6,
     paddingHorizontal: 6, paddingVertical: 1, marginLeft: 4,
   },
 
-  resultCard: { backgroundColor: '#181D22', borderWidth: 1, borderColor: '#2C343C', borderRadius: 16, padding: 14, gap: 8 },
+  resultCard: { backgroundColor: T.surface, borderWidth: 1, borderColor: T.border, borderRadius: 12, padding: 12, gap: 8 },
   resultHeader: { flexDirection: 'row', gap: 6, flexWrap: 'wrap' },
-  dbBadge: {
-    flexDirection: 'row', alignItems: 'center', gap: 4, borderRadius: 8, paddingHorizontal: 7, paddingVertical: 2,
-    backgroundColor: '#4C9A6A1F', borderWidth: 1, borderColor: '#4C9A6A55',
+  tag: {
+    flexDirection: 'row', alignItems: 'center', gap: 4, borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2,
+    borderWidth: 1, borderColor: T.border,
   },
-  dbBadgeText: { color: '#4C9A6A', fontSize: 11, fontWeight: '700' },
-  warnBadge: {
-    flexDirection: 'row', alignItems: 'center', gap: 4, borderRadius: 8, paddingHorizontal: 7, paddingVertical: 2,
-    backgroundColor: '#F2A93B1A', borderWidth: 1, borderColor: '#F2A93B55',
-  },
-  warnBadgeText: { color: '#F2A93B', fontSize: 11, fontWeight: '700' },
-  resultTitle: { color: '#ECEFF2', fontSize: 15, fontWeight: '700' },
-  resultMeta: { color: '#8A96A3', fontSize: 12 },
+  tagText: { color: T.textMuted, fontSize: 11, fontWeight: '600' },
+  resultTitle: { color: T.text, fontSize: 14, fontWeight: '600' },
+  resultMeta: { color: T.textMuted, fontSize: 12 },
   chipRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
-  filterChip: { backgroundColor: '#232A31', borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3 },
-  filterChipText: { color: '#C3CBD3', fontSize: 11.5 },
+  filterChip: { backgroundColor: T.surface2, borderRadius: 6, paddingHorizontal: 7, paddingVertical: 2 },
+  filterChipText: { color: T.textMuted, fontSize: 11.5 },
 
-  metricGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 4 },
-  metricCard: { backgroundColor: '#1D2329', borderWidth: 1, borderColor: '#2C343C', borderRadius: 12, paddingHorizontal: 12, paddingVertical: 9, minWidth: 130, flexGrow: 1 },
-  metricValue: { color: '#ECEFF2', fontSize: 17, fontWeight: '800' },
-  metricLabel: { color: '#8A96A3', fontSize: 11.5, marginTop: 2 },
+  metricGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 2 },
+  metricCard: { backgroundColor: T.surface2, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 8, minWidth: 110, flexGrow: 1 },
+  metricValue: { color: T.text, fontSize: 16, fontWeight: '700' },
+  metricLabel: { color: T.textMuted, fontSize: 11, marginTop: 2 },
 
-  chartWrap: { marginTop: 4, gap: 6 },
-  sectionLabel: { color: '#8A96A3', fontSize: 11.5, fontWeight: '700', textTransform: 'uppercase', letterSpacing: 0.5 },
+  chartWrap: { marginTop: 2, gap: 6 },
+  sectionLabel: { color: T.textMuted, fontSize: 11, fontWeight: '600', textTransform: 'uppercase', letterSpacing: 0.5 },
 
-  tableScroll: { marginTop: 4, borderWidth: 1, borderColor: '#2C343C', borderRadius: 10 },
+  tableScroll: { marginTop: 2, borderWidth: 1, borderColor: T.border, borderRadius: 8 },
   tr: { flexDirection: 'row' },
-  trHead: { backgroundColor: '#232A31' },
-  trAlt: { backgroundColor: '#1B2026' },
-  th: { color: '#C3CBD3', fontSize: 12, fontWeight: '700', paddingHorizontal: 10, paddingVertical: 8, width: 128 },
-  td: { color: '#ECEFF2', fontSize: 12.5, paddingHorizontal: 10, paddingVertical: 7, width: 128 },
+  trHead: { backgroundColor: T.surface2 },
+  trAlt: { backgroundColor: '#121212' },
+  th: { color: T.textMuted, fontSize: 11.5, fontWeight: '600', paddingHorizontal: 10, paddingVertical: 7, width: 120 },
+  td: { color: T.text, fontSize: 12.5, paddingHorizontal: 10, paddingVertical: 6, width: 120 },
   cellNum: { textAlign: 'right' },
-  emptyTable: { color: '#8A96A3', fontSize: 12.5, padding: 12 },
+  emptyTable: { color: T.textMuted, fontSize: 12.5, padding: 12 },
 
-  notesBox: { gap: 4, marginTop: 2 },
-  noteText: { color: '#C9B48A', fontSize: 12, lineHeight: 17 },
-  toolErrorBox: {
-    flexDirection: 'row', gap: 6, alignItems: 'flex-start', padding: 10, borderRadius: 12,
-    backgroundColor: '#D645451A', borderWidth: 1, borderColor: '#D6454555',
+  notesBox: { gap: 4 },
+  noteText: { color: T.textMuted, fontSize: 12, lineHeight: 17 },
+
+  cardActions: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 2, flexWrap: 'wrap', gap: 8 },
+  linkButton: { flexDirection: 'row', alignItems: 'center', gap: 4, borderRadius: 6, paddingHorizontal: 4, paddingVertical: 4 },
+  linkButtonText: { color: T.textMuted, fontSize: 12.5 },
+  ghostButton: {
+    flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8,
+    borderWidth: 1, borderColor: T.border, minHeight: 32,
   },
+  ghostButtonText: { color: T.text, fontSize: 12.5, fontWeight: '500' },
+  detailsBox: { backgroundColor: T.surface2, borderRadius: 8, padding: 10, gap: 4 },
+  detailText: { color: T.textMuted, fontSize: 12, lineHeight: 17 },
 
-  cardActions: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 4, flexWrap: 'wrap', gap: 8 },
-  linkButton: { flexDirection: 'row', alignItems: 'center', gap: 4 },
-  linkButtonText: { color: '#8A96A3', fontSize: 12.5 },
-  exportButton: {
-    flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 10,
-    backgroundColor: '#4C9A6A1A', borderWidth: 1, borderColor: '#4C9A6A55',
-  },
-  exportButtonText: { color: '#4C9A6A', fontSize: 12.5, fontWeight: '600' },
-  detailsBox: { backgroundColor: '#1D2329', borderRadius: 10, padding: 10, gap: 4 },
-  detailText: { color: '#8A96A3', fontSize: 12, lineHeight: 17 },
+  errorBox: { borderWidth: 1, borderColor: T.border, backgroundColor: T.surface, borderRadius: 12, padding: 12, maxWidth: '92%' },
+  errorCode: { color: '#6B6B6B', fontSize: 11, marginTop: 6 },
 
-  retryButton: {
-    flexDirection: 'row', alignItems: 'center', gap: 5,
-    marginTop: 8, alignSelf: 'flex-start',
-    paddingHorizontal: 10, paddingVertical: 6, borderRadius: 12,
-    backgroundColor: '#8A5CF522', borderWidth: 1, borderColor: '#8A5CF555',
-  },
-  retryButtonText: { color: ACCENT, fontSize: 12.5, fontWeight: '600' },
-  errorCode: { color: '#5C6670', fontSize: 11, marginTop: 6 },
-
-  typingBubble: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  typingText: { color: '#8A96A3', fontSize: 13.5, lineHeight: 18 },
-
-  inputRow: {
-    flexDirection: 'row', alignItems: 'flex-end', gap: 10,
-    paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, borderTopWidth: 1, borderTopColor: '#2C343C',
-  },
+  composer: { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: T.border, paddingHorizontal: 12, paddingTop: 10, paddingBottom: 8 },
+  inputRow: { flexDirection: 'row', alignItems: 'flex-end', gap: 8 },
   input: {
-    flex: 1, backgroundColor: '#1D2329', borderWidth: 1, borderColor: '#2C343C',
-    borderRadius: 20, paddingHorizontal: 16, paddingVertical: 12, color: '#ECEFF2', fontSize: 14.5,
-    maxHeight: 140,
+    flex: 1, backgroundColor: T.surface, borderWidth: 1, borderColor: T.border,
+    borderRadius: 12, paddingHorizontal: 12, paddingVertical: 9, color: T.text, fontSize: 14,
+    minHeight: 40, maxHeight: 120,
   },
-  sendButton: {
-    width: 42, height: 42, borderRadius: 21, backgroundColor: ACCENT,
-    alignItems: 'center', justifyContent: 'center',
-  },
-  sendButtonDisabled: { opacity: 0.35 },
-  composerHint: { color: '#5C6670', fontSize: 11, textAlign: 'center', paddingBottom: 10, paddingHorizontal: 16 },
+  sendButton: { width: 40, height: 40, borderRadius: 20, backgroundColor: T.text, alignItems: 'center', justifyContent: 'center' },
+  sendButtonDisabled: { backgroundColor: T.surface2 },
+  composerHint: { color: '#6B6B6B', fontSize: 10.5, textAlign: 'center', marginTop: 6 },
 });

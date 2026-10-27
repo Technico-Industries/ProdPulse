@@ -94,18 +94,18 @@ export function toHttpsError(e: unknown): HttpsError {
       : fail('failed-precondition', 'AI_CONFIGURATION_ERROR', 'The AI service key is not configured. Ask the developer to set GEMINI_API_KEY.', 'KEY_MISSING');
   }
   if (e instanceof AssistantError) {
-    if (e.kind === 'timeout') return fail('deadline-exceeded', 'TIMEOUT', 'ProdPulse AI took too long to answer. Try a narrower question or a shorter date range.', 'TIMEOUT');
-    return fail('internal', 'INVALID_RESPONSE', 'ProdPulse AI returned an unexpected answer. Please try again.', 'INVALID_RESPONSE');
+    if (e.kind === 'timeout') return fail('deadline-exceeded', 'TIMEOUT', 'Prod AI took too long to answer. Try a narrower question or a shorter date range.', 'TIMEOUT');
+    return fail('internal', 'INVALID_RESPONSE', 'Prod AI returned an unexpected answer. Please try again.', 'INVALID_RESPONSE');
   }
   const status = typeof (e as { status?: unknown })?.status === 'number' ? (e as { status: number }).status : null;
   const name = (e as { name?: string })?.name ?? '';
   const text = providerDetail(e).toLowerCase();
   const google = googleErrorInfo(e);
   if (name === 'AbortError' || name === 'TimeoutError') {
-    return fail('deadline-exceeded', 'TIMEOUT', 'ProdPulse AI took too long to answer. Please try again.', 'TIMEOUT');
+    return fail('deadline-exceeded', 'TIMEOUT', 'Prod AI took too long to answer. Please try again.', 'TIMEOUT');
   }
   if ((status === 400 || status === 403 || status === 429) && /billing|outstanding balance|prepayment|credits|free tier is not available/.test(text)) {
-    return fail('failed-precondition', 'AI_CONFIGURATION_ERROR', 'The Gemini account behind ProdPulse AI has a billing problem. Ask the developer to check billing in Google AI Studio.', 'NO_CREDITS');
+    return fail('failed-precondition', 'AI_CONFIGURATION_ERROR', 'The Gemini account behind Prod AI has a billing problem. Ask the developer to check billing in Google AI Studio.', 'NO_CREDITS');
   }
   if (status === 429) return fail('resource-exhausted', 'AI_API_ERROR', 'The Gemini rate limit or quota was reached. Try again in a few minutes.', 'RATE_LIMITED');
   if (status === 404 || ((status === 400 || status === 403) && /model/.test(text) && /not found|not supported|does not exist|not available/.test(text))) {
@@ -159,7 +159,7 @@ export async function handleProdPulseAI(
   deps: HandlerDeps
 ): Promise<ProdPulseAIResponse> {
   const uid = request.auth?.uid;
-  if (!uid) throw fail('unauthenticated', 'AUTH_REQUIRED', 'Sign in to use ProdPulse AI.');
+  if (!uid) throw fail('unauthenticated', 'AUTH_REQUIRED', 'Sign in to use Prod AI.');
 
   let profile: Record<string, any> | null;
   try {
@@ -168,7 +168,7 @@ export async function handleProdPulseAI(
     deps.log?.('profile read failed', { level: 'error', category: 'FIRESTORE_QUERY_ERROR', detail: providerDetail(e) });
     throw fail('unavailable', 'FIRESTORE_QUERY_ERROR', 'Could not verify your account. Please try again.');
   }
-  if (!isActiveAdmin(profile)) throw fail('permission-denied', 'ADMIN_FORBIDDEN', 'ProdPulse AI is available to active admin accounts only.');
+  if (!isActiveAdmin(profile)) throw fail('permission-denied', 'ADMIN_FORBIDDEN', 'Prod AI is available to active admin accounts only.');
 
   const check = validateAIRequest(request.data);
   if (!check.ok) throw fail('invalid-argument', 'INVALID_REQUEST', check.error);

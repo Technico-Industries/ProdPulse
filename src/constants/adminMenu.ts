@@ -29,6 +29,8 @@ export function visibleMenuItems<T extends { webOnly?: boolean }>(items: T[], pl
   return items.filter((i) => !i.webOnly || platformOS === 'web');
 }
 
+// Prod AI is not in this list: it opens from the floating button on the
+// admin Production overview (components/ProdAIButton).
 export const ADMIN_MENU_ITEMS: AdminMenuItem[] = [
   {
     key: 'register-line',
@@ -93,14 +95,5 @@ export const ADMIN_MENU_ITEMS: AdminMenuItem[] = [
     icon: 'shield-checkmark',
     accent: '#4C9A6A',
     route: 'QualityAnalysis',
-  },
-  {
-    key: 'prodpulse-ai',
-    title: 'ProdPulse AI',
-    subtitle: 'AI assistant for production insights and database queries',
-    icon: 'sparkles',
-    accent: '#8A5CF5',
-    route: 'AIAssistant',
-    webOnly: true,
   },
 ];

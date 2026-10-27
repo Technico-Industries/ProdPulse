@@ -44,6 +44,7 @@ import {
   type RejectionCategory,
   type RejectionType,
 } from '../constants/rejectionTypes';
+import { initialRejectionDate, isValidDateKey } from '../utils/rejectionDate';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -72,9 +73,10 @@ type Shift = (typeof SHIFTS)[number];
 
 // ─── Saved form ───────────────────────────────────────────────────────────
 //
-// Date, shift, location, line and remarks survive a page reload / app
-// restart and a save, so the inspector lands back on the form as they left
-// it. Part and the rejection quantities are deliberately not kept. Same
+// Shift, location, line and remarks survive a page reload / app restart and
+// a save, so the inspector lands back on the form as they left it. The date
+// stays for the rest of the visit (after a save too) but a new visit opens
+// on today. Part and the rejection quantities are deliberately not kept. Same
 // AsyncStorage approach (localStorage on web) as AdminOverviewScreen.
 
 const PREFS_KEY = 'prodpulse.recordRejection.form.v1';
@@ -94,12 +96,6 @@ function isAssemblyWorkshop(w: string | null) {
   return !!w && w.toLowerCase().includes('assembly');
 }
 
-function todayKey(): string {
-  const d = new Date();
-  const p2 = (n: number) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
-}
-
 // Alert.alert is a no-op on react-native-web, so the web build falls back to
 // window.alert (same approach as ManageLinesScreen / RecordProductionScreen).
 function notify(title: string, message: string) {
@@ -111,12 +107,6 @@ function emptyEntryQty(): Record<string, number> {
   const m: Record<string, number> = {};
   for (const t of REJECTION_TYPES) m[t.name] = 0;
   return m;
-}
-
-function isValidDateKey(s: string): boolean {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
-  const d = new Date(`${s}T00:00:00`);
-  return !Number.isNaN(d.getTime());
 }
 
 // ─── Reusable picker box — same visual language as Record Production ──────
@@ -272,7 +262,9 @@ export default function RecordRejectionScreen() {
   const selectedLine = allLines.find((l) => l.id === selectedLineId) ?? null;
 
   // ── Rejection-specific fields
-  const [date, setDate] = useState(todayKey());
+  // Every new entry opens on today's local date (this screen only creates
+  // records — there is no existing record whose date to keep).
+  const [date, setDate] = useState(() => initialRejectionDate(null, Date.now()));
   const [shift, setShift] = useState<Shift | null>(null);
   // Quantity being entered NOW per type (not the historical total), and the
   // Visual/Process pick for types without an automatic category (FOULING),
@@ -294,7 +286,8 @@ export default function RecordRejectionScreen() {
         const raw = await AsyncStorage.getItem(PREFS_KEY);
         if (!cancelled && raw) {
           const saved: Partial<SavedForm> = JSON.parse(raw);
-          if (typeof saved.date === 'string' && isValidDateKey(saved.date)) setDate(saved.date);
+          // The date is deliberately NOT restored: a new entry opens on
+          // today (initialRejectionDate), never on the last day used.
           if (saved.shift && SHIFTS.includes(saved.shift)) setShift(saved.shift);
           if (saved.plant && PLANTS.includes(saved.plant)) setPlant(saved.plant);
           if (saved.workshop && WORKSHOPS.includes(saved.workshop)) setWorkshop(saved.workshop);

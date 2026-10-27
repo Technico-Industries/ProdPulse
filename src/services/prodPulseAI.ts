@@ -86,7 +86,7 @@ export async function askProdPulseAI(question: string, history: AIHistoryMessage
     throw e;
   }
   if (!data || typeof data.reply !== 'string' || !Array.isArray(data.results)) {
-    const e = new ProdPulseAIError('ProdPulse AI returned an unexpected answer. Please try again.', true, 'INVALID_RESPONSE');
+    const e = new ProdPulseAIError('Prod AI returned an unexpected answer. Please try again.', true, 'INVALID_RESPONSE');
     logFailure(e, 'response shape');
     throw e;
   }

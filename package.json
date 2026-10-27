@@ -52,6 +52,11 @@
     "test:shift-b-overnight": "tsx scripts/testShiftBOvernight.ts",
     "test:end-production": "tsx scripts/testEndProduction.ts",
     "test:model-part": "tsx scripts/testModelPartProduction.ts",
+    "test:slot-recovery": "tsx scripts/testSlotRecovery.ts",
+    "test:recording-inputs": "tsx scripts/testRecordingInputs.ts",
+    "test:done-production": "tsx scripts/testDoneProduction.ts",
+    "test:report-downtime": "tsx scripts/testReportDowntime.ts",
+    "test:prod-ai-panel": "tsx scripts/testProdAIPanel.ts",
     "test:ai": "tsx functions/test/prodPulseAI.test.ts",
     "test:cors": "tsx functions/test/cors.test.ts",
     "build": "expo export --platform web"

@@ -61,6 +61,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { db } from '../services/firebase';
 import { useAuthStore } from '../stores/authStore';
 import {
+  DeletedSlotBackup,
   DraftScope,
   ProductionSlotIdentity,
   RestoreRecord,
@@ -127,6 +128,9 @@ import {
   stopEventsForWindow,
   stopIdOf,
 } from '../utils/downtime';
+import { deleteSlotWithBackup, restorableSlots, restoreDeletedSlot } from '../utils/slotRecovery';
+import { parseRejectionCount, rejectionFieldText, stepRejectionCount } from '../utils/rejectionCount';
+import { FinalizeGuard, createFinalizeGuard } from '../utils/finalizeGuard';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -217,6 +221,9 @@ interface ActiveSessionDoc {
   revision?: number;             // bumped by one on every sync (in a transaction)
   syncConflicts?: Record<string, SyncConflict | null>; // values not kept in a merge (null = dismissed)
   updatedBy?: { uid: string | null; deviceId: string | null };
+  // Values of deleted hourly cards, for Restore (utils/slotRecovery).
+  // Optional — older session docs don't have it.
+  deletedSlotBackups?: Record<string, DeletedSlotBackup | null>;
 }
 
 // Thrown inside a sync transaction when the session doc is gone (finalized
@@ -746,6 +753,66 @@ function isAssemblyWorkshop(w: string | null) {
   return !!w && w.toLowerCase().includes('assembly');
 }
 
+// Rejection counter of one card: − / + steppers around a numeric field.
+// Typing, − and + all set the same stored count (rejectionsBySlot), so the
+// three always agree. Only whole numbers ≥ 0 are accepted (utils/
+// rejectionCount); a keystroke that would make the text invalid is ignored,
+// and an empty field counts as 0 (shown as 0 again when the field is left).
+function RejectionCounter({
+  value,
+  disabled,
+  onChange,
+  onBlur,
+}: {
+  value: number;
+  disabled: boolean;
+  onChange: (next: number) => void;
+  onBlur?: () => void;
+}) {
+  // The typed text while the field is focused; null when not editing.
+  const [typed, setTyped] = useState<string | null>(null);
+  return (
+    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 4 }}>
+      <Pressable
+        onPress={() => { setTyped(null); onChange(stepRejectionCount(value, -1)); }}
+        style={[styles.smallBtn, (disabled || value <= 0) && styles.disabledBtn]}
+        disabled={disabled || value <= 0}
+        accessibilityRole="button"
+        accessibilityLabel="Decrease rejections"
+      >
+        <Text style={styles.smallBtnText}>−</Text>
+      </Pressable>
+      <TextInput
+        style={[styles.input, styles.rejectInput, disabled && styles.disabledInput]}
+        value={rejectionFieldText(value, typed)}
+        onChangeText={(t) => {
+          const n = parseRejectionCount(t);
+          if (n === null) return; // not a whole number ≥ 0 — keep the previous text
+          setTyped(t);
+          if (n !== value) onChange(n);
+        }}
+        onFocus={() => setTyped(String(value))}
+        onBlur={() => { setTyped(null); onBlur?.(); }}
+        keyboardType="number-pad"
+        inputMode="numeric"
+        maxLength={5}
+        selectTextOnFocus
+        editable={!disabled}
+        accessibilityLabel="Rejections"
+      />
+      <Pressable
+        onPress={() => { setTyped(null); onChange(stepRejectionCount(value, 1)); }}
+        style={[styles.smallBtn, disabled && styles.disabledBtn]}
+        disabled={disabled}
+        accessibilityRole="button"
+        accessibilityLabel="Increase rejections"
+      >
+        <Text style={styles.smallBtnText}>+</Text>
+      </Pressable>
+    </View>
+  );
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export default function RecordProductionScreen() {
@@ -878,6 +945,11 @@ export default function RecordProductionScreen() {
     setRemoteEnded(null);
     syncConflictsRef.current = {};
     setSyncConflicts({});
+    deletedSlotBackupsRef.current = {};
+    setDeletedSlotBackups({});
+    if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
+    undoTimerRef.current = null;
+    setUndoDelete(null);
     setLastSyncedAtMs(null);
   };
 
@@ -1043,6 +1115,13 @@ export default function RecordProductionScreen() {
   const [remoteEnded, setRemoteEnded] = useState<'finalized' | 'replaced' | 'ended' | null>(null);
   const [syncConflicts, setSyncConflicts] = useState<Record<string, SyncConflict | null>>({});
   const syncConflictsRef = useRef<Record<string, SyncConflict | null>>({});
+  // What each deleted hourly card held, so it can be restored. Synced with
+  // the session like everything above (see utils/slotRecovery).
+  const [deletedSlotBackups, setDeletedSlotBackups] = useState<Record<string, DeletedSlotBackup | null>>({});
+  const deletedSlotBackupsRef = useRef<Record<string, DeletedSlotBackup | null>>({});
+  // The card just deleted on this device — offered as "Undo" for a few seconds.
+  const [undoDelete, setUndoDelete] = useState<{ slotIndex: number; label: string } | null>(null);
+  const undoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   syncConflictsRef.current = syncConflicts;
 
   // ── Derived
@@ -1688,6 +1767,7 @@ export default function RecordProductionScreen() {
       otHours: typeof d.otHours === 'number' ? d.otHours : 0,
       operators: Array.isArray(d.operators) ? d.operators : [],
       syncConflicts: { ...(d.syncConflicts ?? {}) },
+      deletedSlotBackups: { ...(d.deletedSlotBackups ?? {}) },
     };
   }
 
@@ -1720,6 +1800,7 @@ export default function RecordProductionScreen() {
     lossReasonBySlotRef.current = reasons;
     stopsBySlotRef.current = stops;
     syncConflictsRef.current = { ...s.syncConflicts };
+    deletedSlotBackupsRef.current = { ...(s.deletedSlotBackups ?? {}) };
 
     setProducedBySlot(produced);
     setProducedSegment({ ...s.producedSegment });
@@ -1732,6 +1813,7 @@ export default function RecordProductionScreen() {
     setOtHours(s.otHours);
     setOperators(operatorsNext);
     setSyncConflicts({ ...s.syncConflicts });
+    setDeletedSlotBackups({ ...(s.deletedSlotBackups ?? {}) });
     syncAfterRestoreRef.current = syncAfter;
     setRestoreToken((t) => t + 1);
   }
@@ -1781,6 +1863,7 @@ export default function RecordProductionScreen() {
       otHours: L.otHours,
       operators: L.operators.map((o) => ({ id: o.id, name: o.name, code: o.code })),
       syncConflicts: { ...syncConflictsRef.current },
+      deletedSlotBackups: { ...deletedSlotBackupsRef.current },
     };
   }
 
@@ -1858,6 +1941,7 @@ export default function RecordProductionScreen() {
       lossReasonBySlot: s.lossReasonBySlot,
       savedSlotIndices: s.savedSlotIndices,
       syncConflicts: s.syncConflicts,
+      deletedSlotBackups: s.deletedSlotBackups ?? {},
       lineStopped: isAnyStopRunning(s.stopsBySlot),
       revision,
       clientUpdatedAtMs: Date.now(),
@@ -2110,7 +2194,7 @@ export default function RecordProductionScreen() {
       persistSession();
     }, SESSION_SAVE_DEBOUNCE_MS);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase, sessionLineId, restoreToken, producedBySlot, producedSegment, rejectionsBySlot, lossReasonBySlot, storedChangeovers, deletedSlotIndices, otHours, operators, syncConflicts]);
+  }, [phase, sessionLineId, restoreToken, producedBySlot, producedSegment, rejectionsBySlot, lossReasonBySlot, storedChangeovers, deletedSlotIndices, deletedSlotBackups, otHours, operators, syncConflicts]);
 
   // Live updates from other devices. A newer revision is put on screen
   // straight away when this device has nothing pending or in flight;
@@ -2236,7 +2320,7 @@ export default function RecordProductionScreen() {
         if (Array.isArray(v) && v.length) setOperators(v);
         break;
       default:
-        return; // stops: informational only
+        return; // stops, deleted-card backups: informational only
     }
     dismissConflict(c.id);
   }
@@ -2250,6 +2334,7 @@ export default function RecordProductionScreen() {
   const CONFLICT_FIELD_LABELS: Record<SyncConflict['field'], string> = {
     producedBySlot: 'Produced', producedSegment: 'Produced', rejectionsBySlot: 'Rejections',
     lossReasonBySlot: 'Loss reason', changeovers: 'Changeover', stopsBySlot: 'Line stop', otHours: 'OT hours', operators: 'Operators',
+    deletedSlotBackups: 'Deleted card',
   };
 
   function describeConflict(c: SyncConflict): string {
@@ -2740,17 +2825,29 @@ export default function RecordProductionScreen() {
     }
   }
 
-  const handleFinalizeSession = async () => {
+  // Finalize & End and Done Production both run handleFinalizeSession. It is
+  // busy from the first tap until the confirm dialog is cancelled or the
+  // finalize finishes, so a second tap (either button) does nothing — see
+  // utils/finalizeGuard.
+  const [finalizeBusy, setFinalizeBusy] = useState(false);
+  const finalizeGuardRef = useRef<FinalizeGuard | null>(null);
+  finalizeGuardRef.current ??= createFinalizeGuard(setFinalizeBusy);
+
+  const handleFinalizeSession = () => finalizeGuardRef.current!.run(runFinalizeSession);
+
+  // Resolves true once the confirm dialog is showing (its buttons, then the
+  // finalize, call `release`), false if it stopped before that.
+  const runFinalizeSession = async (release: () => void): Promise<boolean> => {
     // Finalize writes this device's view of the session into
     // productionRecords, so it must first be in sync with every other
     // device's changes.
     if (remoteEndedRef.current) {
       notify('Session already ended', 'This session was finalized or replaced on another device.');
-      return;
+      return false;
     }
     if (savingSlotsRef.current.size > 0) {
       notify('Slot still saving', 'Wait for the slot save to finish, then tap Finalize & End again.');
-      return;
+      return false;
     }
     clearSaveTimers();
     const synced = await persistSession();
@@ -2761,11 +2858,11 @@ export default function RecordProductionScreen() {
           'This device could not sync with the server (offline?), so changes made on other devices may be missing. Your entries are kept on this device. Try again once connected.'
         );
       }
-      return;
+      return false;
     }
     if (lastSyncMergedRemoteRef.current) {
       notify('Updated from another device', 'Changes from another device were just merged in. Review them, then tap Finalize & End again.');
-      return;
+      return false;
     }
     console.log('[handleFinalizeSession] START — about to show the confirm dialog');
     console.log('[handleFinalizeSession] state check', { sessionLineId, selectedLineId, platform: Platform.OS });
@@ -2847,8 +2944,10 @@ export default function RecordProductionScreen() {
       // Finalized: the session doc is gone, so there is nothing left to
       // save — just reset. Failed: leave the same way as Back (saves the
       // current entries to the still-existing session, keeps the draft).
-      if (finalized) resetSessionState();
-      else await goBackToProduction();
+      if (finalized) {
+        resetSessionState();
+        notify('Production done', 'All slots were saved and the session for this line was closed. Its records stay available in the reports.');
+      } else await goBackToProduction();
       console.log('[handleFinalizeSession] END — confirm callback completed');
     };
 
@@ -2868,19 +2967,22 @@ export default function RecordProductionScreen() {
         console.log('[handleFinalizeSession] window.confirm result (web)', confirmed);
         if (!confirmed) {
           console.log('[handleFinalizeSession] Cancel pressed (web)');
-          return;
+          return false;
         }
-        proceedWithFinalize();
+        proceedWithFinalize().finally(release);
+        return true;
       } else {
         Alert.alert(
           'Finalize & End Session',
           'This will save any unsaved slots, record the final shift plan and OT, and remove the active session for this line. This action cannot be undone.',
           [
-            { text: 'Cancel', style: 'cancel', onPress: () => console.log('[handleFinalizeSession] Cancel pressed') },
-            { text: 'Finalize & End', style: 'destructive', onPress: proceedWithFinalize },
-          ]
+            { text: 'Cancel', style: 'cancel', onPress: () => { console.log('[handleFinalizeSession] Cancel pressed'); release(); } },
+            { text: 'Finalize & End', style: 'destructive', onPress: () => { proceedWithFinalize().finally(release); } },
+          ],
+          { cancelable: true, onDismiss: release }
         );
         console.log('[handleFinalizeSession] Alert.alert(...) call returned');
+        return true;
       }
     } catch (e) {
       console.error('[handleFinalizeSession] EXCEPTION setting up the confirm dialog', e);
@@ -2890,6 +2992,7 @@ export default function RecordProductionScreen() {
         Alert.alert('Error', String(e));
       }
     }
+    return false;
   };
 
   // NOTE: automatic submission at the 6:30 AM production-day cutover has
@@ -3389,42 +3492,18 @@ export default function RecordProductionScreen() {
       const proceedWithDelete = () => {
         console.log('[handleDeleteSlot] CONFIRM (Delete) CALLBACK FIRED', { slotIndex });
         try {
-          console.log('[handleDeleteSlot] calling setDeletedSlotIndices');
-          setDeletedSlotIndices((prev) => {
-            const next = new Set(prev);
-            next.add(slotIndex);
-            return next;
-          });
-          console.log('[handleDeleteSlot] calling setProducedBySlot (clear)');
-          setProducedBySlot((p) => { const c = { ...p }; delete c[slotIndex]; return c; });
-          console.log('[handleDeleteSlot] calling setRejectionsBySlot (clear)');
-          setRejectionsBySlot((p) => {
-            const c = { ...p };
-            delete c[String(slotIndex)];
-            delete c[`${slotIndex}:before`];
-            delete c[`${slotIndex}:after`];
-            return c;
-          });
-          console.log('[handleDeleteSlot] calling setStopsBySlot (clear)');
-          setStopsBySlot((p) => { const c = { ...p }; delete c[slotIndex]; return c; });
-          console.log('[handleDeleteSlot] calling setChangeovers (clear)');
-          setChangeovers((p) => { const c = { ...p }; delete c[slotIndex]; return c; });
-          console.log('[handleDeleteSlot] calling setProducedSegment (clear)');
-          setProducedSegment((p) => {
-            const c = { ...p };
-            delete c[`${slotIndex}:before`];
-            delete c[`${slotIndex}:after`];
-            return c;
-          });
-          console.log('[handleDeleteSlot] calling setLossReasonBySlot (clear)');
-          setLossReasonBySlot((p) => {
-            const c = { ...p };
-            delete c[String(slotIndex)];
-            delete c[`${slotIndex}:before`];
-            delete c[`${slotIndex}:after`];
-            return c;
-          });
-          // Saved by the autosave effect (deletedSlotIndices changed).
+          // Clears exactly what the delete always cleared (produced,
+          // rejections, stops, changeover, segment values, loss reasons) and
+          // keeps a copy of it in deletedSlotBackups so the card can be
+          // restored — see utils/slotRecovery. Saved by the autosave effect.
+          const next = deleteSlotWithBackup(
+            currentSyncState(),
+            slotIndex,
+            { label: slot?.label ?? null, startMinutesAbs: slot?.startMinutesAbs ?? null, endMinutesAbs: slot?.endMinutesAbs ?? null },
+            Date.now()
+          );
+          applySyncStateToScreen(next, true);
+          showUndoDelete(slotIndex, slot?.label ?? `Slot ${slotIndex + 1}`);
           console.log('[handleDeleteSlot] END — confirm callback completed');
         } catch (e) {
           console.error('[handleDeleteSlot] EXCEPTION inside confirm callback', e);
@@ -3446,7 +3525,7 @@ export default function RecordProductionScreen() {
       // support multi-button callbacks.
       if (Platform.OS === 'web') {
         const confirmed = window.confirm(
-          `Delete this hour?\n\nThis removes the ${slot?.label ?? 'selected'} card and reduces the shift's planned production by its target. This cannot be undone.`
+          `Delete this hour?\n\nThis removes the ${slot?.label ?? 'selected'} card and reduces the shift's planned production by its target. You can restore it afterwards from Deleted cards.`
         );
         console.log('[handleDeleteSlot] window.confirm result (web)', confirmed);
         if (!confirmed) {
@@ -3457,7 +3536,7 @@ export default function RecordProductionScreen() {
       } else {
         Alert.alert(
           'Delete this hour?',
-          `This removes the ${slot?.label ?? 'selected'} card and reduces the shift's planned production by its target. This cannot be undone.`,
+          `This removes the ${slot?.label ?? 'selected'} card and reduces the shift's planned production by its target. You can restore it afterwards from Deleted cards.`,
           [
             { text: 'Cancel', style: 'cancel', onPress: () => console.log('[handleDeleteSlot] Cancel pressed') },
             { text: 'Delete', style: 'destructive', onPress: proceedWithDelete },
@@ -3472,6 +3551,41 @@ export default function RecordProductionScreen() {
       } else {
         Alert.alert('Error', String(e));
       }
+    }
+  }
+
+  // "Undo" for the card just deleted on this device, for a few seconds.
+  function showUndoDelete(slotIndex: number, label: string) {
+    if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
+    setUndoDelete({ slotIndex, label });
+    undoTimerRef.current = setTimeout(() => {
+      undoTimerRef.current = null;
+      setUndoDelete(null);
+    }, 10000);
+  }
+
+  // Brings a deleted card back from its backup (Undo, or Restore under
+  // Deleted cards): same slot index, so the same time range, position and
+  // productionRecords id as before, with the values it held. Values entered
+  // for that card since the delete (e.g. on another device) are kept.
+  function handleRestoreSlot(slotIndex: number) {
+    if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
+    undoTimerRef.current = null;
+    setUndoDelete(null);
+    if (remoteEndedRef.current) {
+      notify('Session already ended', 'This session was finalized or replaced on another device.');
+      return;
+    }
+    const result = restoreDeletedSlot(currentSyncState(), slotIndex);
+    if (!result.restored) {
+      notify('Cannot restore', 'This card is no longer deleted, or its saved values are not available.');
+      return;
+    }
+    // Restored stops are written with the rest of the session by the
+    // autosave below (it reads the stops ref when the write starts).
+    applySyncStateToScreen(result.state, true);
+    if (result.keptCurrent.length) {
+      notify('Card restored', 'Some values were entered for this card after it was deleted — those newer values were kept.');
     }
   }
 
@@ -3974,7 +4088,7 @@ export default function RecordProductionScreen() {
                   {describeConflict(c)}: kept {formatConflictValue(c.keptValue)} (newer); not kept {formatConflictValue(c.otherValue)}
                 </Text>
                 <View style={{ flexDirection: 'row', gap: 12, marginTop: 4 }}>
-                  {c.field !== 'stopsBySlot' && (
+                  {c.field !== 'stopsBySlot' && c.field !== 'deletedSlotBackups' && (
                     <Pressable onPress={() => applyConflictValue(c)} hitSlop={6}>
                       <Text style={{ color: '#F2A93B', fontWeight: '700', fontSize: 12 }}>Use {formatConflictValue(c.otherValue)}</Text>
                     </Pressable>
@@ -4012,7 +4126,12 @@ export default function RecordProductionScreen() {
           </Pressable>
 
           {/* Finalize & End Session */}
-          <Pressable onPress={handleFinalizeSession} style={styles.stopProductionBtn}>
+          <Pressable
+            onPress={handleFinalizeSession}
+            disabled={finalizeBusy}
+            style={[styles.stopProductionBtn, finalizeBusy && styles.disabledBtn]}
+            accessibilityState={{ disabled: finalizeBusy, busy: finalizeBusy }}
+          >
             <Ionicons name="stop-circle" size={18} color="#D64545" />
             <Text style={styles.stopProductionText}>Finalize & End</Text>
           </Pressable>
@@ -4081,6 +4200,41 @@ export default function RecordProductionScreen() {
         </View>
 
         <Text style={styles.sectionLabel}>HOURLY SLOTS</Text>
+
+        {/* Deleted cards that can be brought back (utils/slotRecovery) —
+            only those whose values were kept when they were deleted. */}
+        {(() => {
+          const restorable = restorableSlots({ deletedSlotIndices: Array.from(deletedSlotIndices), deletedSlotBackups })
+            .filter((b) => slots.some((s) => s.index === b.slotIndex));
+          if (!restorable.length) return null;
+          return (
+            <View style={styles.deletedBox}>
+              <Text style={styles.deletedHeading}>Deleted cards ({restorable.length})</Text>
+              {restorable.map((b) => {
+                const slot = slots.find((s) => s.index === b.slotIndex);
+                return (
+                  <View key={b.slotIndex} style={styles.deletedRow}>
+                    <Text style={styles.deletedLabel} numberOfLines={1}>
+                      {slot?.label ?? b.label ?? `Slot ${b.slotIndex + 1}`}
+                      {b.produced != null ? ` · ${b.produced} produced` : ''}
+                    </Text>
+                    <Pressable
+                      onPress={() => handleRestoreSlot(b.slotIndex)}
+                      disabled={isLineStopped}
+                      style={[styles.restoreBtn, isLineStopped && styles.disabledBtn]}
+                      hitSlop={6}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Restore deleted card ${slot?.label ?? b.label ?? ''}`}
+                    >
+                      <Ionicons name="arrow-undo" size={14} color="#3E7CB1" />
+                      <Text style={styles.restoreBtnText}>Restore</Text>
+                    </Pressable>
+                  </View>
+                );
+              })}
+            </View>
+          );
+        })()}
 
         {/* Slot cards */}
         {(() => {
@@ -4165,11 +4319,15 @@ export default function RecordProductionScreen() {
                     />
                     <View style={{ marginTop: 8 }}>
                       <Text style={styles.labelSmall}>Rejections</Text>
-                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 4 }}>
-                        <Pressable onPress={() => { setRejectionsBySlot((p) => ({ ...p, [rejectKey]: Math.max(0, (p[rejectKey] ?? 0) - 1) })); queueRejectionSync(rejectKey); }} style={[styles.smallBtn, disabled && styles.disabledBtn]} disabled={disabled}><Text style={styles.smallBtnText}>−</Text></Pressable>
-                        <Text style={{ color: '#ECEFF2', fontWeight: '700', minWidth: 36, textAlign: 'center' }}>{rejectionsBySlot[rejectKey] ?? 0}</Text>
-                        <Pressable onPress={() => { setRejectionsBySlot((p) => ({ ...p, [rejectKey]: (p[rejectKey] ?? 0) + 1 })); queueRejectionSync(rejectKey); }} style={[styles.smallBtn, disabled && styles.disabledBtn]} disabled={disabled}><Text style={styles.smallBtnText}>+</Text></Pressable>
-                      </View>
+                      <RejectionCounter
+                        value={rejectionsBySlot[rejectKey] ?? 0}
+                        disabled={disabled}
+                        onChange={(n) => {
+                          setRejectionsBySlot((p) => ({ ...p, [rejectKey]: n }));
+                          queueRejectionSync(rejectKey);
+                        }}
+                        onBlur={flushIfPending}
+                      />
                     </View>
                   </View>
 
@@ -4376,8 +4534,51 @@ export default function RecordProductionScreen() {
           return cards;
         })()}
 
-        <View style={{ height: 40 }} />
+        {/* Done Production — directly under the last rendered card (OT
+            slots included). Runs the same Finalize & End workflow: confirm,
+            save unsaved slots + the shift summary, then close the session.
+            Saved records stay in productionRecords for history/reports. */}
+        <Pressable
+          onPress={handleFinalizeSession}
+          disabled={finalizeBusy || !!remoteEnded}
+          style={({ pressed }) => [
+            styles.doneProductionBtn,
+            (finalizeBusy || !!remoteEnded) && styles.disabledBtn,
+            pressed && { opacity: 0.85 },
+          ]}
+          accessibilityRole="button"
+          accessibilityLabel="Done Production"
+          accessibilityHint="Saves unsaved slots and ends this production session"
+          accessibilityState={{ disabled: finalizeBusy || !!remoteEnded, busy: finalizeBusy }}
+        >
+          {finalizeBusy ? (
+            <ActivityIndicator color="#14181C" />
+          ) : (
+            <>
+              <Ionicons name="checkmark-done-circle" size={22} color="#14181C" />
+              <Text style={styles.doneProductionText}>Done Production</Text>
+            </>
+          )}
+        </Pressable>
+
+        <View style={{ height: undoDelete ? 90 : 40 }} />
       </ScrollView>
+
+      {/* Undo for the card just deleted */}
+      {undoDelete && (
+        <View style={styles.undoBar} accessibilityLiveRegion="polite">
+          <Text style={styles.undoText} numberOfLines={2}>Deleted {undoDelete.label}</Text>
+          <Pressable
+            onPress={() => handleRestoreSlot(undoDelete.slotIndex)}
+            style={styles.undoBtn}
+            hitSlop={8}
+            accessibilityRole="button"
+            accessibilityLabel={`Undo delete of ${undoDelete.label}`}
+          >
+            <Text style={styles.undoBtnText}>UNDO</Text>
+          </Pressable>
+        </View>
+      )}
 
       {/* ── Changeover modal */}
       <Modal visible={changeModalVisible} animationType="slide" transparent>
@@ -4584,6 +4785,25 @@ const styles = StyleSheet.create({
   controlBlock: { alignItems: 'center', gap: 4 },
   smallBtn: { width: 34, height: 34, borderRadius: 8, borderWidth: 1, borderColor: '#2C343C', alignItems: 'center', justifyContent: 'center', backgroundColor: '#0F1417' },
   smallBtnText: { color: '#ECEFF2', fontSize: 18, fontWeight: '800' },
+  deletedBox: { borderWidth: 1, borderColor: '#2C343C', borderRadius: 10, padding: 10, marginBottom: 12, gap: 6, backgroundColor: '#1A1F25' },
+  deletedHeading: { color: '#8A96A3', fontSize: 12, fontWeight: '800' },
+  deletedRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  deletedLabel: { color: '#ECEFF2', fontSize: 12.5, flex: 1 },
+  restoreBtn: { flexDirection: 'row', alignItems: 'center', gap: 4, borderWidth: 1, borderColor: '#3E7CB1', borderRadius: 8, paddingHorizontal: 10, paddingVertical: 6, minHeight: 32 },
+  restoreBtnText: { color: '#3E7CB1', fontSize: 12, fontWeight: '800' },
+  doneProductionBtn: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8,
+    backgroundColor: '#4C9A6A', borderRadius: 12, minHeight: 52, marginTop: 4, paddingHorizontal: 16,
+  },
+  doneProductionText: { color: '#14181C', fontSize: 16, fontWeight: '900', letterSpacing: 0.3 },
+  undoBar: {
+    position: 'absolute', left: 16, right: 16, bottom: 20, flexDirection: 'row', alignItems: 'center', gap: 12,
+    backgroundColor: '#242B32', borderWidth: 1, borderColor: '#3A434C', borderRadius: 12, paddingHorizontal: 14, paddingVertical: 10,
+  },
+  undoText: { color: '#ECEFF2', fontSize: 13, flex: 1 },
+  undoBtn: { paddingHorizontal: 8, paddingVertical: 6 },
+  undoBtnText: { color: '#F2A93B', fontSize: 13, fontWeight: '900', letterSpacing: 0.8 },
+  rejectInput: { width: 64, height: 34, paddingVertical: 0, paddingHorizontal: 6, textAlign: 'center', fontWeight: '700' },
   smallBox: { width: 100, minHeight: 38, borderRadius: 8, borderWidth: 1, borderColor: '#2C343C', alignItems: 'center', justifyContent: 'center', backgroundColor: '#171B20', padding: 4 },
   stopBtn: { borderWidth: 1, borderColor: '#F2A93B', borderRadius: 8, paddingHorizontal: 10, paddingVertical: 8, alignItems: 'center' },
   resumeBtn: { backgroundColor: '#4C9A6A', borderRadius: 8, paddingHorizontal: 10, paddingVertical: 8, alignItems: 'center' },

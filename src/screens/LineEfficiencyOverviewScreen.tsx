@@ -66,6 +66,7 @@ import {
   summarize,
 } from '../utils/lineEfficiency';
 import { useAuthStore } from '../stores/authStore';
+import { DowntimeStop, LineDowntimeSummary, formatDowntimeMinutes, lineDowntimeSummary } from '../utils/downtime';
 import { adminEndProductionSession } from '../services/endProductionSession';
 import { EndProductionTarget, confirmAndEndProduction, sessionInstanceOf } from '../utils/endProduction';
 
@@ -157,11 +158,14 @@ function LineTile({
   width,
   ending,
   onEnd,
+  downtime,
 }: {
   card: LineCard;
   width: string;
   ending: boolean;
   onEnd: ((card: LineCard) => void) | null;
+  // The session's downtime so far (null for a line that isn't running).
+  downtime: LineDowntimeSummary | null;
 }) {
   const badgeColor =
     card.status === 'running' ? '#4C9A6A' : card.status === 'stopped' ? '#D64545' : INACTIVE_COLOR;
@@ -182,6 +186,13 @@ function LineTile({
   }
 
   const meta = card.status !== 'not_running' && card.session ? `Shift ${card.session.shift ?? '—'}` : null;
+  // Kept after the line resumes, and added to by every later stop of the
+  // same session — not just the stop in progress.
+  const currentStopText =
+    card.status === 'stopped' && downtime?.currentStopMinutes != null
+      ? `Current stop ${formatDowntimeMinutes(downtime.currentStopMinutes)}`
+      : null;
+  const totalDowntimeText = downtime ? `Shift downtime ${formatDowntimeMinutes(downtime.totalMinutes)}` : null;
   const figures = productionFigures(card);
 
   return (
@@ -191,7 +202,7 @@ function LineTile({
         accessible
         accessibilityLabel={`${card.lineName}: ${figures === '— / —' ? '' : `${figures.replace(' / ', ' of ')} parts, `}${card.badge}${
           card.status !== 'not_running' && card.efficiency != null ? `, efficiency ${card.efficiency.toFixed(1)} percent` : ''
-        }${detail ? `, ${detail}` : ''}`}
+        }${detail ? `, ${detail}` : ''}${currentStopText ? `, ${currentStopText}` : ''}${totalDowntimeText ? `, ${totalDowntimeText}` : ''}`}
       >
         <EfficiencyRing card={card} />
         <Text style={styles.tileName} numberOfLines={2}>
@@ -214,6 +225,20 @@ function LineTile({
         {detail ? (
           <Text style={styles.tileDetail} numberOfLines={2}>
             {detail}
+          </Text>
+        ) : null}
+        {currentStopText ? (
+          <Text style={[styles.tileDowntime, { color: '#D64545' }]} numberOfLines={1} adjustsFontSizeToFit>
+            {currentStopText}
+          </Text>
+        ) : null}
+        {totalDowntimeText ? (
+          <Text
+            style={[styles.tileDowntime, { color: (downtime?.totalMinutes ?? 0) > 0 ? '#F2A93B' : '#8A96A3' }]}
+            numberOfLines={1}
+            adjustsFontSizeToFit
+          >
+            {totalDowntimeText}
           </Text>
         ) : null}
         {meta ? (
@@ -515,6 +540,25 @@ export default function LineEfficiencyOverviewScreen() {
   // Client-side over the same data — changing a filter never re-queries.
   const cards = useMemo(() => filterLineCards(allCards, { plant, workshop }), [allCards, plant, workshop]);
   const counts = useMemo(() => summarize(cards), [cards]);
+
+  // ── Downtime per running line, from its activeSessions stopsBySlot (the
+  // persisted stop intervals) — so it survives refreshes and is the same on
+  // every device. The clock ticks only while a line is stopped.
+  const anyStopped = useMemo(() => sessions.some((s) => s.lineStopped), [sessions]);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    setNowMs(Date.now());
+    if (!anyStopped) return;
+    const id = setInterval(() => setNowMs(Date.now()), 15000);
+    return () => clearInterval(id);
+  }, [anyStopped, sessions]);
+  const downtimeByLine = useMemo(() => {
+    const map = new Map<string, LineDowntimeSummary>();
+    sessions.forEach((s) =>
+      map.set(s.lineId, lineDowntimeSummary(s.stopsBySlot as Record<string, DowntimeStop[]> | null, nowMs))
+    );
+    return map;
+  }, [sessions, nowMs]);
   const activeFilterCount = [plant, workshop].filter(Boolean).length;
 
   // ── End Production (admin) — see utils/endProduction. The UI check below
@@ -733,6 +777,7 @@ export default function LineEfficiencyOverviewScreen() {
                     width={tileWidth}
                     ending={endingLines.has(card.lineId)}
                     onEnd={isAdmin ? endProduction : null}
+                    downtime={card.status !== 'not_running' ? downtimeByLine.get(card.lineId) ?? null : null}
                   />
                 ))}
               </View>
@@ -919,6 +964,7 @@ const styles = StyleSheet.create({
   figuresLabel: { color: '#5C6670', fontSize: 8.5, fontWeight: '700', letterSpacing: 0.4, marginTop: 1 },
   tileDetail: { color: '#8A96A3', fontSize: 10, fontWeight: '600', textAlign: 'center', width: '100%' },
   tileMeta: { color: '#8A96A3', fontSize: 9.5, fontWeight: '600', textAlign: 'center', width: '100%' },
+  tileDowntime: { fontSize: 9.5, fontWeight: '700', textAlign: 'center', width: '100%', fontVariant: ['tabular-nums'] },
 
   // Plant / Workshop filter — same look as the Production page's.
   filterBlock: { gap: 8 },

@@ -151,6 +151,44 @@ export function sessionDowntimeMinutes(stopsBySlot: Record<string | number, Down
   return round2(total);
 }
 
+// A line's downtime for its current session (one line + production date +
+// shift), as the admin Lines overview shows it: the running total of every
+// stop so far — completed ones kept after the line resumes, a running one
+// counted up to nowMs — plus the running stop's own duration while the
+// line is stopped. Same counting as sessionDowntimeMinutes (each interval
+// once, by stable id), so a retried Stop/Resume write or several devices
+// listening to the same session doc never add a stop twice.
+export type LineDowntimeSummary = {
+  totalMinutes: number;
+  currentStopMinutes: number | null; // null while the line is running
+  currentStopStartMs: number | null;
+  stopCount: number;
+};
+
+export function lineDowntimeSummary(
+  stopsBySlot: Record<string | number, DowntimeStop[] | null | undefined> | null | undefined,
+  nowMs: number
+): LineDowntimeSummary {
+  const seen = new Set<string>();
+  let current: DowntimeStop | null = null;
+  Object.values(stopsBySlot ?? {}).forEach((arr) => {
+    (Array.isArray(arr) ? arr : []).forEach((se) => {
+      if (!se || typeof se.startAbs !== 'number') return;
+      const id = stopIdOf(se);
+      if (seen.has(id)) return;
+      seen.add(id);
+      if (se.running && (!current || se.startAbs > current.startAbs)) current = se;
+    });
+  });
+  const running = current as DowntimeStop | null;
+  return {
+    totalMinutes: sessionDowntimeMinutes(stopsBySlot as Record<string, DowntimeStop[]>, nowMs),
+    currentStopMinutes: running ? stopDurationMinutes(running.startAbs, nowMs) : null,
+    currentStopStartMs: running ? running.startAbs : null,
+    stopCount: seen.size,
+  };
+}
+
 // Downtime across saved productionRecords AND still-active sessions, each
 // interval counted once. A session that is still running is the authority
 // for its own line + production date + shift — its stopsBySlot holds every
@@ -177,14 +215,172 @@ export function combinedDowntimeMinutes(
   activeSessions: DowntimeSessionLike[],
   nowMs: number
 ): number {
-  const live = new Set(activeSessions.map((s) => sessionKey(s.lineId, s.productionDate, s.shift)));
-  let total = 0;
-  records.forEach((r) => {
-    if (live.has(sessionKey(r.lineId, r.productionDate, r.shift))) return;
-    (r.stopEvents ?? []).forEach((se) => { total += se?.durationMinutes ?? 0; });
+  return totalDowntimeMinutes(collectDowntimeIntervals({ records, activeSessions }, nowMs));
+}
+
+// ─── Downtime for reports and overviews ──────────────────────────────────────
+// The one rule every downtime total (Admin Overview, Generate Report) uses.
+// A stop is persisted in full in three places, and in shares in a fourth:
+//   activeSessions/{lineId}.stopsBySlot   live session — every stop so far,
+//                                          a running one up to now;
+//   endedSessions/{id}.stopsBySlot        a session an admin ended (archive);
+//   shiftSummaries/{line_date_shift}      written at Finalize & End: every
+//     .downtimeIntervals                  stop of the session, whole;
+//   productionRecords.stopEvents          only the part of a stop inside a
+//                                          SAVED slot's window, as it was
+//                                          when that slot was saved.
+// Records alone miss every stop on a slot that was never saved, every stop
+// after its slot was saved, and every stop of a line still running — which
+// is why a report built from them showed 0 for a day with hours of
+// downtime. So per session (line + production date + shift), each stop is
+// counted ONCE, in full, from the first full source that has it (live
+// session, then ended archive, then shift summary), keyed by its stable id.
+// Record shares are counted only for stops no full source has (e.g. an
+// earlier session of the same line/date/shift whose summary a later
+// Finalize replaced) — summed per stop across that session's records, whose
+// windows never overlap. Record events with no id at all (saved before stop
+// ids existed) count only for a session with no full source, as before.
+// A stop belongs to its session's production date, so a Shift B stop after
+// midnight stays on the night the shift started.
+
+export type DowntimeRecordStopLike = {
+  stopId?: string | null;
+  reason?: string | null;
+  startAbs?: number | null;
+  durationMinutes?: number | null;
+};
+export type DowntimeSummaryLike = {
+  lineId: string | null;
+  productionDate: string | null;
+  shift: string | null;
+  downtimeIntervals:
+    | { stopId?: string | null; reason?: string | null; startAbs?: number | null; endAbs?: number | null; durationMinutes?: number | null }[]
+    | null
+    | undefined;
+};
+export type DowntimeInterval = {
+  // `${lineId}|${productionDate}|${shift}`
+  sessionKey: string;
+  lineId: string | null;
+  productionDate: string | null;
+  shift: string | null;
+  stopId: string | null;
+  reason: string;
+  minutes: number;
+  running: boolean;
+  source: 'session' | 'ended' | 'summary' | 'records';
+};
+export type DowntimeSourcesInput = {
+  records: (Omit<DowntimeRecordLike, 'stopEvents'> & { stopEvents: DowntimeRecordStopLike[] | null })[];
+  activeSessions?: DowntimeSessionLike[];
+  endedSessions?: DowntimeSessionLike[];
+  shiftSummaries?: DowntimeSummaryLike[];
+};
+
+export function downtimeSessionKey(lineId: string | null, productionDate: string | null, shift: string | null): string {
+  return sessionKey(lineId, productionDate, shift);
+}
+
+const recordStopId = (se: DowntimeRecordStopLike): string | null =>
+  se.stopId ? String(se.stopId) : typeof se.startAbs === 'number' ? stopIdOf({ startAbs: se.startAbs }) : null;
+
+export function collectDowntimeIntervals(input: DowntimeSourcesInput, nowMs: number): DowntimeInterval[] {
+  const out: DowntimeInterval[] = [];
+  // sessionKey → stop ids already counted from a full source
+  const fullIds = new Map<string, Set<string>>();
+  const idsOf = (key: string) => {
+    let s = fullIds.get(key);
+    if (!s) fullIds.set(key, (s = new Set()));
+    return s;
+  };
+  const meta = (lineId: string | null, productionDate: string | null, shift: string | null) => ({
+    sessionKey: sessionKey(lineId, productionDate, shift), lineId, productionDate, shift,
   });
-  activeSessions.forEach((s) => { total += sessionDowntimeMinutes(s.stopsBySlot, nowMs); });
-  return round2(total);
+
+  const addSessionStops = (sessions: DowntimeSessionLike[] | undefined, source: 'session' | 'ended') => {
+    (sessions ?? []).forEach((s) => {
+      const m = meta(s.lineId, s.productionDate, s.shift);
+      const ids = idsOf(m.sessionKey);
+      Object.values(s.stopsBySlot ?? {}).forEach((arr) => {
+        (Array.isArray(arr) ? arr : []).forEach((se) => {
+          if (!se || typeof se.startAbs !== 'number') return;
+          const id = stopIdOf(se);
+          if (ids.has(id)) return;
+          let minutes: number | null = null;
+          if (se.running) minutes = stopDurationMinutes(se.startAbs, nowMs);
+          else if (typeof se.durationMinutes === 'number') minutes = Math.max(0, se.durationMinutes);
+          else if (typeof se.endAbs === 'number') minutes = stopDurationMinutes(se.startAbs, se.endAbs);
+          if (minutes == null) return;
+          ids.add(id);
+          out.push({ ...m, stopId: id, reason: se.reason || 'Unspecified', minutes, running: !!se.running, source });
+        });
+      });
+    });
+  };
+  addSessionStops(input.activeSessions, 'session');
+  addSessionStops(input.endedSessions, 'ended');
+
+  (input.shiftSummaries ?? []).forEach((sum) => {
+    const m = meta(sum.lineId, sum.productionDate, sum.shift);
+    const ids = idsOf(m.sessionKey);
+    (Array.isArray(sum.downtimeIntervals) ? sum.downtimeIntervals : []).forEach((iv) => {
+      if (!iv) return;
+      const id = iv.stopId ? String(iv.stopId) : typeof iv.startAbs === 'number' ? stopIdOf({ startAbs: iv.startAbs }) : null;
+      if (!id || ids.has(id)) return;
+      const minutes =
+        typeof iv.durationMinutes === 'number' ? Math.max(0, iv.durationMinutes)
+        : typeof iv.startAbs === 'number' && typeof iv.endAbs === 'number' ? stopDurationMinutes(iv.startAbs, iv.endAbs)
+        : null;
+      if (minutes == null) return;
+      ids.add(id);
+      out.push({ ...m, stopId: id, reason: iv.reason || 'Unspecified', minutes, running: false, source: 'summary' });
+    });
+  });
+
+  // Record shares of stops no full source has, summed per stop.
+  const shares = new Map<string, DowntimeInterval>();
+  input.records.forEach((r) => {
+    const m = meta(r.lineId, r.productionDate, r.shift);
+    const full = fullIds.get(m.sessionKey);
+    (r.stopEvents ?? []).forEach((se, i) => {
+      const minutes = typeof se?.durationMinutes === 'number' ? Math.max(0, se.durationMinutes) : 0;
+      if (!se || minutes <= 0) return;
+      const id = recordStopId(se);
+      if (id === null) {
+        if (full && full.size > 0) return; // can't be told apart from a stop already counted
+        out.push({ ...m, stopId: null, reason: se.reason || 'Unspecified', minutes, running: false, source: 'records' });
+        return;
+      }
+      if (full?.has(id)) return;
+      const k = `${m.sessionKey}#${id}`;
+      const prev = shares.get(k);
+      if (prev) prev.minutes += minutes;
+      else shares.set(k, { ...m, stopId: id, reason: se.reason || 'Unspecified', minutes, running: false, source: 'records' });
+    });
+  });
+  shares.forEach((iv) => out.push(iv));
+
+  return out.map((iv) => ({ ...iv, minutes: round2(iv.minutes) }));
+}
+
+export function totalDowntimeMinutes(intervals: DowntimeInterval[]): number {
+  return round2(intervals.reduce((s, iv) => s + iv.minutes, 0));
+}
+
+// Session key → minutes (for per line/date/shift breakdowns).
+export function downtimeBySession(intervals: DowntimeInterval[]): Map<string, number> {
+  const map = new Map<string, number>();
+  intervals.forEach((iv) => map.set(iv.sessionKey, round2((map.get(iv.sessionKey) ?? 0) + iv.minutes)));
+  return map;
+}
+
+// Reason → minutes, largest first.
+export function downtimeByReason(intervals: DowntimeInterval[]): { reason: string; minutes: number }[] {
+  const map = new Map<string, number>();
+  intervals.forEach((iv) => map.set(iv.reason, (map.get(iv.reason) ?? 0) + iv.minutes));
+  return Array.from(map.entries())
+    .map(([reason, minutes]) => ({ reason, minutes: round2(minutes) }))
+    .sort((a, b) => b.minutes - a.minutes);
 }
 
 // Downtime minutes for KPI display. Rounding policy: under an hour, one
@@ -209,4 +405,57 @@ export function formatElapsedSince(startMs: number, nowMs: number): string {
   const s = total % 60;
   const mmss = `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
   return h > 0 ? `${h}:${mmss}` : mmss;
+}
+
+// ─── Firestore docs → downtime sources ───────────────────────────────────────
+// Location fields ride along so screens can apply their plant / workshop /
+// division / line filters. Anything missing or malformed is read safely
+// (legacy docs): no production date → the doc can't be placed on a day and
+// is skipped.
+
+export type DowntimeSourceLocation = {
+  lineName: string | null;
+  plant: string | null;
+  workshop: string | null;
+  division: string | null;
+};
+export type DowntimeSessionSource = DowntimeSessionLike & DowntimeSourceLocation;
+export type DowntimeSummarySource = DowntimeSummaryLike & DowntimeSourceLocation;
+
+const strOrNull = (v: unknown) => (typeof v === 'string' && v ? v : null);
+const location = (d: any): DowntimeSourceLocation => ({
+  lineName: strOrNull(d?.lineName),
+  plant: strOrNull(d?.plant),
+  workshop: strOrNull(d?.workshop),
+  division: strOrNull(d?.division),
+});
+
+// activeSessions/{lineId} (doc id = line id) or an endedSessions archive
+// (a copy of that doc).
+export function sessionSourceFromDoc(docId: string, d: any): DowntimeSessionSource | null {
+  if (!d || typeof d !== 'object' || !strOrNull(d.productionDate)) return null;
+  return {
+    lineId: strOrNull(d.lineId) ?? docId,
+    productionDate: d.productionDate,
+    shift: d.shift === 'B' ? 'B' : 'A',
+    stopsBySlot: d.stopsBySlot && typeof d.stopsBySlot === 'object' ? d.stopsBySlot : {},
+    ...location(d),
+  };
+}
+
+export function summarySourceFromDoc(d: any): DowntimeSummarySource | null {
+  if (!d || typeof d !== 'object' || !strOrNull(d.productionDate) || !strOrNull(d.lineId)) return null;
+  return {
+    lineId: d.lineId,
+    productionDate: d.productionDate,
+    shift: d.shift === 'B' ? 'B' : 'A',
+    downtimeIntervals: Array.isArray(d.downtimeIntervals) ? d.downtimeIntervals : [],
+    ...location(d),
+  };
+}
+
+// Whether a source's production date is inside [fromKey, toKey] (both
+// inclusive, "YYYY-MM-DD" — compared as strings, like the Firestore query).
+export function inProductionRange(productionDate: string | null | undefined, fromKey: string, toKey: string): boolean {
+  return typeof productionDate === 'string' && productionDate >= fromKey && productionDate <= toKey;
 }

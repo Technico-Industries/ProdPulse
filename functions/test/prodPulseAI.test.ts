@@ -36,7 +36,7 @@ import { productionRecordId } from '../../src/utils/productionDraft';
 import { buildReport, EMPTY_FILTERS, mapProductionRecord } from '../../src/utils/modelPartProduction';
 import { efficiencyOf } from '../../src/utils/lineEfficiency';
 import { ADMIN_MENU_ITEMS, visibleMenuItems } from '../../src/constants/adminMenu';
-import { buildResultExportTables, classifyCallableError, isStatusZeroError, isProdPulseAIAvailable, validateAIRequest, AI_LIMITS, ResultBlock } from '../../src/utils/prodPulseAI';
+import { buildResultExportTables, canOpenProdAI, classifyCallableError, isStatusZeroError, isProdPulseAIAvailable, validateAIRequest, AI_LIMITS, ResultBlock } from '../../src/utils/prodPulseAI';
 
 let passed = 0;
 let failed = 0;
@@ -197,16 +197,23 @@ async function main() {
   console.log('ProdPulse AI');
 
   // ── 1. Web only ─────────────────────────────────────────────────────────────
-  await test('1. available on web, hidden on Android / iOS (screen gate + menu)', () => {
+  await test('1. available on web, hidden on Android / iOS (screen gate + floating button); not in the burger menu', () => {
     assert.equal(isProdPulseAIAvailable('web'), true);
     assert.equal(isProdPulseAIAvailable('android'), false);
     assert.equal(isProdPulseAIAvailable('ios'), false);
+    // The burger menu no longer has a Prod AI entry on any platform.
     const routes = (os: string) => visibleMenuItems(ADMIN_MENU_ITEMS, os).map((i) => i.route);
-    assert.ok(routes('web').includes('AIAssistant'));
-    assert.ok(!routes('android').includes('AIAssistant'));
-    assert.ok(!routes('ios').includes('AIAssistant'));
+    for (const os of ['web', 'android', 'ios']) assert.ok(!routes(os).includes('AIAssistant'), os);
+    assert.ok(!ADMIN_MENU_ITEMS.some((i) => /ai/i.test(i.key) || /Prod(Pulse)? AI/.test(i.title)));
     // Every other entry is unaffected.
-    assert.equal(routes('android').length, ADMIN_MENU_ITEMS.length - 1);
+    assert.equal(routes('android').length, ADMIN_MENU_ITEMS.length);
+    // Floating button: admins only, and only where the assistant runs.
+    assert.equal(canOpenProdAI('admin', 'web'), true);
+    assert.equal(canOpenProdAI('supervisor', 'web'), false);
+    assert.equal(canOpenProdAI(null, 'web'), false);
+    assert.equal(canOpenProdAI(undefined, 'web'), false);
+    assert.equal(canOpenProdAI('admin', 'android'), false);
+    assert.equal(canOpenProdAI('admin', 'ios'), false);
   });
 
   // ── 2–5. Auth, admin, validation ────────────────────────────────────────────
@@ -625,7 +632,7 @@ async function main() {
       assert.equal(r.key, 'test-gemini-key-not-real', 'key sent in the x-goog-api-key header');
       assert.ok(!r.url.includes('test-gemini-key-not-real'), 'key not in the URL');
       assert.deepEqual(r.body.tools[0].functionDeclarations.map((d: any) => d.name).sort(), [...TOOL_NAMES].sort());
-      assert.match(JSON.stringify(r.body.systemInstruction ?? r.body.system_instruction), /ProdPulse AI/);
+      assert.match(JSON.stringify(r.body.systemInstruction ?? r.body.system_instruction), /You are Prod AI,/);
     }
     assert.deepEqual(sent[0].body.contents.map((c: any) => c.role), ['user', 'model', 'user']);
     // Round 2 replays the model turn with its thought signature, then the real tool result.

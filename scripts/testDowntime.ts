@@ -14,6 +14,7 @@ import {
   formatElapsedSince,
   freezeRunningStops,
   isAnyStopRunning,
+  lineDowntimeSummary,
   sessionDowntimeMinutes,
   stopDurationMinutes,
   stopEventsForWindow,
@@ -252,6 +253,72 @@ test('admin: saving the slot does not double count; finished sessions still coun
   const otherShift = { lineId: 'L1', productionDate: PD, shift: 'B', stopEvents: [{ durationMinutes: 7 }] };
   assert.equal(combinedDowntimeMinutes([savedRecord, otherLine, otherShift], [session], at(11)), 21.2);
   assert.equal(combinedDowntimeMinutes([], [], at(11)), 0);
+});
+
+// ── Admin Lines overview: cumulative downtime per line ────────────────────
+// The stops below are written the way Stop / Resume write them
+// (completeRunningStops on the persisted startAbs), on whatever card the
+// supervisor pressed — the line's total must keep growing across
+// stop → start → stop → start and never fall back to 0 on Resume.
+test('line downtime accumulates across stop → start → stop → start', () => {
+  const s1: DowntimeStop = { id: stopIdOf({ startAbs: at(9, 10) }), reason: 'material', startAbs: at(9, 10), running: true };
+  let stops: Record<number, DowntimeStop[]> = { 2: [s1] };
+  // 1st stop running: total and current stop both 5 min.
+  let sum = lineDowntimeSummary(stops, at(9, 15));
+  assert.equal(sum.totalMinutes, 5);
+  assert.equal(sum.currentStopMinutes, 5);
+  assert.equal(sum.currentStopStartMs, at(9, 10));
+  // Start (Resume) at 9:22 — the 12 min stay; no current stop.
+  stops = { 2: completeRunningStops(stops[2], at(9, 22)) };
+  sum = lineDowntimeSummary(stops, at(9, 40));
+  assert.equal(sum.totalMinutes, 12);
+  assert.equal(sum.currentStopMinutes, null);
+  assert.equal(sum.currentStopStartMs, null);
+  // 2nd stop at 10:05 (another card), running: 12 + 3 so far.
+  const s2: DowntimeStop = { id: stopIdOf({ startAbs: at(10, 5) }), reason: 'maintenance', startAbs: at(10, 5), running: true };
+  stops = { ...stops, 3: [s2] };
+  sum = lineDowntimeSummary(stops, at(10, 8));
+  assert.equal(sum.totalMinutes, 15);
+  assert.equal(sum.currentStopMinutes, 3);
+  assert.equal(sum.stopCount, 2);
+  // Start again at 10:15 — 12 + 10, still kept after the line runs.
+  stops = { ...stops, 3: completeRunningStops(stops[3], at(10, 15)) };
+  sum = lineDowntimeSummary(stops, at(13));
+  assert.equal(sum.totalMinutes, 22);
+  assert.equal(sum.currentStopMinutes, null);
+  assert.equal(sum.stopCount, 2);
+});
+
+test('line downtime never double-counts retried writes or copies of one stop', () => {
+  const start = at(11);
+  const running: DowntimeStop = { id: stopIdOf({ startAbs: start }), reason: 'quality', startAbs: start, running: true };
+  // Resume tapped twice / retried after a failed save: closing again is a no-op.
+  const closedOnce = completeRunningStops([running], at(11, 6));
+  const closedTwice = completeRunningStops(closedOnce, at(11, 30));
+  assert.deepEqual(closedTwice, closedOnce);
+  // The same interval present twice (a merge between two devices, or a
+  // legacy stop without an id next to its id'd copy) counts once.
+  const legacyCopy: DowntimeStop = { reason: 'quality', startAbs: start, endAbs: at(11, 6), durationMinutes: 6 };
+  const sum = lineDowntimeSummary({ 4: closedTwice, 5: [legacyCopy] }, at(12));
+  assert.equal(sum.totalMinutes, 6);
+  assert.equal(sum.stopCount, 1);
+  // Two listeners reading the same session doc compute the same figure.
+  const copy = JSON.parse(JSON.stringify({ 4: closedTwice }));
+  assert.deepEqual(lineDowntimeSummary({ 4: closedTwice }, at(12)), lineDowntimeSummary(copy, at(12)));
+});
+
+test('line downtime handles missing and legacy data safely', () => {
+  const none = { totalMinutes: 0, currentStopMinutes: null, currentStopStartMs: null, stopCount: 0 };
+  assert.deepEqual(lineDowntimeSummary(null, at(9)), none);
+  assert.deepEqual(lineDowntimeSummary(undefined, at(9)), none);
+  const junk: any = { 1: null, 2: 'x', 3: [null, { reason: 'x' }, { reason: 'old', startAbs: at(8), endAbs: at(8, 4) }] };
+  const sum = lineDowntimeSummary(junk, at(9));
+  // Only the usable legacy stop (no id, no stored duration) counts: 4 min.
+  assert.equal(sum.totalMinutes, 4);
+  assert.equal(sum.stopCount, 1);
+  // A Shift B stop across midnight keeps counting on the same session.
+  const night: DowntimeStop = { reason: 'material', startAbs: at(23, 50), running: true };
+  assert.equal(lineDowntimeSummary({ 9: [night] }, at(24, 20)).currentStopMinutes, 30);
 });
 
 console.log(`\n${passed} downtime checks passed`);

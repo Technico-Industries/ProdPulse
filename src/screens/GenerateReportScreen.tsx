@@ -4,6 +4,12 @@
 // (written by RecordProductionScreen) by plant / workshop / division / line /
 // shift / date range, then shows:
 //   1. Summary stat cards (produced, expected, efficiency, rejections, downtime)
+//      Downtime is NOT a sum of the records' stopEvents: those only hold the
+//      part of a stop inside a slot that was saved, as it was when saved,
+//      so a running line or stops on unsaved slots showed 0m. It is every
+//      stop of the matching sessions, counted once and in full — the same
+//      rule (utils/downtime collectDowntimeIntervals) and sources as the
+//      Admin Overview. Time Loss stays separate (loss parts x cycle time).
 //   2. A per-line/per-day breakdown table, including manpower — Operator
 //      Count and Operator Names for that line + productionDate + shift,
 //      read straight off each productionRecords doc's `operators` array
@@ -38,6 +44,15 @@ import { collection, getDocs } from 'firebase/firestore';
 import { db } from '../services/firebase';
 import { fetchProductionRecordsForDateRange } from '../services/productionRecordQueries';
 import { recordProductionDayKey } from '../utils/productionDay';
+import { DowntimeSources, fetchDowntimeSourcesForDateRange } from '../services/downtimeSources';
+import {
+  collectDowntimeIntervals,
+  downtimeByReason as groupDowntimeByReason,
+  downtimeBySession,
+  downtimeSessionKey,
+  formatDowntimeMinutes,
+  totalDowntimeMinutes,
+} from '../utils/downtime';
 import { PLANTS, WORKSHOPS, DIVISIONS } from '../constants/lineOptions';
 // npm install react-native-gifted-charts react-native-svg
 import { BarChart, LineChart, PieChart } from 'react-native-gifted-charts';
@@ -338,6 +353,12 @@ export default function GenerateReportScreen() {
   const [hasGenerated, setHasGenerated] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [records, setRecords] = useState<ProductionRecord[]>([]);
+  // Full stop intervals of the report's sessions (see the header note), as
+  // loaded for the last generate, already through the same filters as
+  // `records`. With a Part filter the full sources are left out: downtime
+  // isn't recorded per part, so only the part's own slot shares count.
+  const [downtimeSources, setDowntimeSources] = useState<DowntimeSources | null>(null);
+  const [downtimeAtMs, setDowntimeAtMs] = useState(() => Date.now());
   const [exportingExcel, setExportingExcel] = useState(false);
 
   // ── Per-line "View Slot Records" (lazy-loaded, one Firestore query per
@@ -493,7 +514,10 @@ export default function GenerateReportScreen() {
       const t0 = Date.now();
       console.log('[GenerateReport] 1 before getDocs');
 
-      const docs = await fetchProductionRecordsForDateRange(fromDate, toDate);
+      const [docs, sources] = await Promise.all([
+        fetchProductionRecordsForDateRange(fromDate, toDate),
+        fetchDowntimeSourcesForDateRange(fromDate, toDate),
+      ]);
 
       // TEMPORARY DEBUG LOGGING — see note above.
       console.log('[GenerateReport] DOCUMENT COUNT:', docs.length);
@@ -563,6 +587,29 @@ export default function GenerateReportScreen() {
         if (shiftFilter !== 'All' && r.shift !== shiftFilter) return false;
         return true;
       });
+
+      // Same filters for the downtime sources (location resolved from
+      // productionLines first, as for records).
+      const keepSource = (src: { lineId: string | null; shift: string | null; plant: string | null; workshop: string | null; division: string | null }) => {
+        const line = src.lineId ? lineById.get(src.lineId) : undefined;
+        if (plant && !sameValue(line?.plant ?? src.plant, plant)) return false;
+        if (workshop && !sameValue(line?.workshop ?? src.workshop, workshop)) return false;
+        if (division && !sameValue(line?.division ?? src.division, division)) return false;
+        if (selectedLineId && src.lineId !== selectedLineId) return false;
+        if (shiftFilter !== 'All' && src.shift !== shiftFilter) return false;
+        return true;
+      };
+      setDowntimeSources(
+        partFilter
+          ? { activeSessions: [], endedSessions: [], shiftSummaries: [], failed: sources.failed }
+          : {
+              activeSessions: sources.activeSessions.filter(keepSource),
+              endedSessions: sources.endedSessions.filter(keepSource),
+              shiftSummaries: sources.shiftSummaries.filter(keepSource),
+              failed: sources.failed,
+            }
+      );
+      setDowntimeAtMs(Date.now());
 
       // ── Timing point 4: after client-side filter
       console.log(`[GenerateReport] 4 after filter — ${Date.now() - t0}ms — ${filtered.length} records after filters`);
@@ -710,6 +757,27 @@ export default function GenerateReportScreen() {
   // AGGREGATES
   // ─────────────────────────────────────────────────────────────────────────────
 
+  // Every stop of the report's sessions, once each (see the header note).
+  // A stop still running counts up to the moment the report was generated.
+  const downtimeIntervals = useMemo(
+    () =>
+      collectDowntimeIntervals(
+        {
+          records: records.map((r) => ({
+            lineId: r.lineId,
+            productionDate: recordProductionDayKey(r),
+            shift: r.shift,
+            stopEvents: r.stopEvents,
+          })),
+          activeSessions: downtimeSources?.activeSessions ?? [],
+          endedSessions: downtimeSources?.endedSessions ?? [],
+          shiftSummaries: downtimeSources?.shiftSummaries ?? [],
+        },
+        downtimeAtMs
+      ),
+    [records, downtimeSources, downtimeAtMs]
+  );
+
   const summary = useMemo(() => {
     // Every saved slot or split is an independent record — Total Produced
     // and Total Expected are just plain sums, no "last cumulative wins" or
@@ -726,8 +794,8 @@ export default function GenerateReportScreen() {
       lossParts += r.lossParts ?? Math.max(0, (r.expectedParts ?? 0) - (r.producedThisSlot ?? 0));
       lossTimeMinutes += r.lossTimeMinutes ?? 0;
       rejections += r.rejections ?? 0;
-      (r.stopEvents ?? []).forEach((se) => { downtimeMinutes += se.durationMinutes ?? 0; });
     });
+    downtimeMinutes = totalDowntimeMinutes(downtimeIntervals);
 
     const efficiency = totalExpected > 0 ? Math.round((totalProduction / totalExpected) * 1000) / 10 : 0;
     return {
@@ -740,7 +808,7 @@ export default function GenerateReportScreen() {
       efficiency,
       count: records.length,
     };
-  }, [records]);
+  }, [records, downtimeIntervals]);
 
   const byLine = useMemo<LineDayBreakdown[]>(() => {
     // operatorSet is tracked alongside each group but not part of the public
@@ -753,7 +821,6 @@ export default function GenerateReportScreen() {
       // key treats all of them as one group for the "BY LINE" rollup.
       const pd = recordProductionDayKey(r) ?? 'unknown';
       const key = `${r.lineId ?? 'unknown'}__${pd}__${r.shift}`;
-      const downtime = (r.stopEvents ?? []).reduce((sum, se) => sum + (se.durationMinutes ?? 0), 0);
       const produced = r.producedThisSlot ?? 0;
       const expected = r.expectedParts ?? 0;
       const loss = r.lossParts ?? Math.max(0, expected - produced);
@@ -765,7 +832,6 @@ export default function GenerateReportScreen() {
         existing.lossParts += loss;
         existing.lossTimeMinutes += r.lossTimeMinutes ?? 0;
         existing.rejections += r.rejections ?? 0;
-        existing.downtimeMinutes += downtime;
         (r.operators ?? []).forEach((o) => { if (o.name) existing.operatorSet.add(o.name); });
       } else {
         const operatorSet = new Set<string>();
@@ -782,12 +848,51 @@ export default function GenerateReportScreen() {
           lossParts: loss,
           lossTimeMinutes: r.lossTimeMinutes ?? 0,
           rejections: r.rejections ?? 0,
-          downtimeMinutes: downtime,
+          downtimeMinutes: 0, // filled from downtimeIntervals below
           operatorNames: [],
           operatorCount: 0,
           operatorSet,
         });
       }
+    });
+    // Downtime per line + date + shift from the same intervals as the total.
+    // A session with downtime but no saved slot yet still gets its own row,
+    // so the rows always add up to the summary's Downtime.
+    const lineNameById = new Map(allLines.map((l) => [l.id, l.lineName]));
+    const sourceNames = new Map<string, string>();
+    [...(downtimeSources?.activeSessions ?? []), ...(downtimeSources?.endedSessions ?? []), ...(downtimeSources?.shiftSummaries ?? [])]
+      .forEach((src) => { if (src.lineId && src.lineName) sourceNames.set(src.lineId, src.lineName); });
+    // Groups say 'unknown' where the record had no line / date; the
+    // interval keys carry those as empty.
+    const known = (v: string | null | undefined) => (v && v !== 'unknown' ? v : null);
+    const byKey = new Map(
+      Array.from(map.values()).map((g) => [downtimeSessionKey(known(g.lineId), known(g.key.split('__')[1]), g.shift), g])
+    );
+    downtimeBySession(downtimeIntervals).forEach((minutes, key) => {
+      const existing = byKey.get(key);
+      if (existing) {
+        existing.downtimeMinutes = minutes;
+        return;
+      }
+      const [lineId, pd, shift] = key.split('|');
+      const groupKey = `${lineId || 'unknown'}__${pd || 'unknown'}__${shift}`;
+      map.set(groupKey, {
+        key: groupKey,
+        lineId: lineId || 'unknown',
+        lineName: lineNameById.get(lineId) ?? sourceNames.get(lineId) ?? 'Unknown line',
+        shift: shift === 'A' || shift === 'B' ? shift : null,
+        dateLabel: formatProductionDayLabel(pd || 'unknown'),
+        records: 0,
+        totalProduction: 0,
+        totalExpected: 0,
+        lossParts: 0,
+        lossTimeMinutes: 0,
+        rejections: 0,
+        downtimeMinutes: minutes,
+        operatorNames: [],
+        operatorCount: 0,
+        operatorSet: new Set<string>(),
+      });
     });
     return Array.from(map.values())
       .map(({ operatorSet, ...rest }) => {
@@ -795,7 +900,7 @@ export default function GenerateReportScreen() {
         return { ...rest, operatorNames, operatorCount: operatorNames.length };
       })
       .sort((a, b) => (a.lineName + a.dateLabel).localeCompare(b.lineName + b.dateLabel));
-  }, [records]);
+  }, [records, downtimeIntervals, downtimeSources, allLines]);
 
   // ── Chart data: Production vs Planned, one pair per line ───────────────
   // Collapses byLine (which is grouped by line + date + shift) down to a
@@ -976,20 +1081,11 @@ export default function GenerateReportScreen() {
   const totalLossParts = useMemo(() => lossByReason.reduce((s, l) => s + l.parts, 0), [lossByReason]);
 
   // ── Chart data: Downtime Analysis ───────────────────────────────────────
-  // Sums every stop event's durationMinutes by its reason, across every
-  // matching record.
-  const downtimeByReason = useMemo(() => {
-    const map = new Map<string, number>();
-    records.forEach((r) => {
-      (r.stopEvents ?? []).forEach((se) => {
-        const reason = se.reason || 'Unspecified';
-        map.set(reason, (map.get(reason) ?? 0) + (se.durationMinutes ?? 0));
-      });
-    });
-    return Array.from(map.entries())
-      .map(([reason, minutes]) => ({ reason, minutes: Math.round(minutes) }))
-      .sort((a, b) => b.minutes - a.minutes);
-  }, [records]);
+  // The same stop intervals as the Downtime total, by reason.
+  const downtimeByReason = useMemo(
+    () => groupDowntimeByReason(downtimeIntervals).map((d) => ({ reason: d.reason, minutes: Math.round(d.minutes) })),
+    [downtimeIntervals]
+  );
 
   const downtimeBarData = useMemo(
     () =>
@@ -1101,7 +1197,7 @@ export default function GenerateReportScreen() {
       `Total Produced: ${summary.totalProduction} / Planned: ${summary.plannedTotal}`,
       `Efficiency: ${summary.efficiency}% | Loss Parts: ${summary.lossParts} | Time Loss: ${summary.lossTimeMinutes} min`,
       `Rejections: ${summary.rejections}`,
-      `Downtime: ${summary.downtimeMinutes} min`,
+      `Downtime: ${formatDowntimeMinutes(summary.downtimeMinutes)}`,
       `Slots recorded: ${summary.count}`,
       '',
       ...byLine.map((b) => {
@@ -1538,7 +1634,7 @@ export default function GenerateReportScreen() {
                   </View>
                   {/* Downtime */}
                   <View style={styles.statCard}>
-                    <Text style={styles.statValue}>{summary.downtimeMinutes}m</Text>
+                    <Text style={styles.statValue}>{formatDowntimeMinutes(summary.downtimeMinutes)}</Text>
                     <Text style={styles.statLabel}>Downtime</Text>
                   </View>
                 </View>

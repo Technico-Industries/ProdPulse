@@ -96,9 +96,28 @@ export interface SessionSlotData {
   savedSlotIndices: number[];
 }
 
+// What a deleted hourly card held when it was deleted, kept in the session
+// so the card can be restored (see utils/slotRecovery). Keyed by slot index.
+export interface DeletedSlotBackup {
+  slotIndex: number;
+  deletedAtMs: number;
+  label: string | null;
+  startMinutesAbs: number | null;
+  endMinutesAbs: number | null;
+  produced: number | null;
+  // Same keys as the session maps: '<slot>', '<slot>:before', '<slot>:after'.
+  producedSegment: Record<string, number | null>;
+  rejections: Record<string, number>;
+  lossReasons: Record<string, StoredLossReason>;
+  changeover: Record<string, unknown> | null;
+  stops: StopLike[];
+}
+
 // Everything a device syncs through activeSessions.
 export interface SyncState extends SessionSlotData {
   stopsBySlot: Record<string, StopLike[]>;
+  // Optional on stored sessions/drafts (added later) — read as {}.
+  deletedSlotBackups: Record<string, DeletedSlotBackup | null>;
   otHours: number;
   operators: { id?: string; name: string; code: string }[];
   // id → conflict, or null once dismissed (null wins, so a dismissal syncs).
@@ -107,12 +126,13 @@ export interface SyncState extends SessionSlotData {
 
 export type SyncField =
   | 'producedBySlot' | 'producedSegment' | 'rejectionsBySlot' | 'lossReasonBySlot' | 'changeovers'
-  | 'stopsBySlot' | 'otHours' | 'operators';
+  | 'stopsBySlot' | 'otHours' | 'operators' | 'deletedSlotBackups';
 
 export function emptySyncState(): SyncState {
   return {
     producedBySlot: {}, producedSegment: {}, rejectionsBySlot: {}, lossReasonBySlot: {}, changeovers: {},
     deletedSlotIndices: [], savedSlotIndices: [], stopsBySlot: {}, otHours: 0, operators: [], syncConflicts: {},
+    deletedSlotBackups: {},
   };
 }
 
@@ -287,6 +307,7 @@ export function threeWayMerge(base: SyncState, local: SyncState, remote: SyncSta
           return undefined;
         })
     ),
+    deletedSlotBackups: mergeMap('deletedSlotBackups', base.deletedSlotBackups ?? {}, local.deletedSlotBackups ?? {}, remote.deletedSlotBackups ?? {}, opts, conflicts),
     otHours: scalar('otHours', base.otHours, local.otHours, remote.otHours) ?? 0,
     operators: scalar('operators', base.operators, local.operators, remote.operators) ?? [],
     // Conflict entries: union; a dismissal (null) on either side wins.
@@ -421,6 +442,41 @@ function cleanStops(v: unknown): Record<string, StopLike[]> | null {
   return out;
 }
 
+// Backups are a recovery aid, never slot structure: a damaged entry is
+// dropped instead of rejecting the whole draft.
+export function cleanDeletedSlotBackups(v: unknown): Record<string, DeletedSlotBackup | null> {
+  if (!isPlainObject(v)) return {};
+  const out: Record<string, DeletedSlotBackup | null> = {};
+  for (const [k, b] of Object.entries(v)) {
+    if (b === null) { out[k] = null; continue; }
+    if (
+      !isPlainObject(b) || !Number.isInteger(b.slotIndex) || String(b.slotIndex) !== k ||
+      typeof b.deletedAtMs !== 'number'
+    ) continue;
+    const quantities = cleanQuantities(b.producedSegment ?? {});
+    const rejections = cleanQuantities(b.rejections ?? {});
+    const stops = cleanStops({ s: b.stops ?? [] });
+    if (!quantities || !rejections || !stops) continue;
+    if (b.changeover != null && cleanChangeovers({ c: b.changeover }) === null) continue;
+    const rej: Record<string, number> = {};
+    for (const [rk, n] of Object.entries(rejections)) if (n != null) rej[rk] = n;
+    out[k] = {
+      slotIndex: b.slotIndex as number,
+      deletedAtMs: b.deletedAtMs,
+      label: typeof b.label === 'string' ? b.label : null,
+      startMinutesAbs: typeof b.startMinutesAbs === 'number' ? b.startMinutesAbs : null,
+      endMinutesAbs: typeof b.endMinutesAbs === 'number' ? b.endMinutesAbs : null,
+      produced: isCount(b.produced) ? b.produced : null,
+      producedSegment: quantities,
+      rejections: rej,
+      lossReasons: serializeLossReasons(isPlainObject(b.lossReasons) ? (b.lossReasons as any) : {}),
+      changeover: (b.changeover as Record<string, unknown> | null | undefined) ?? null,
+      stops: stops.s,
+    };
+  }
+  return out;
+}
+
 // Validates a stored SyncState; null if anything is off.
 export function cleanSyncState(v: unknown): SyncState | null {
   if (!isPlainObject(v)) return null;
@@ -445,6 +501,7 @@ export function cleanSyncState(v: unknown): SyncState | null {
     otHours: (v.otHours as number) ?? 0,
     operators: (v.operators as SyncState['operators']) ?? [],
     syncConflicts: (v.syncConflicts as SyncState['syncConflicts']) ?? {},
+    deletedSlotBackups: cleanDeletedSlotBackups(v.deletedSlotBackups),
   };
 }
 

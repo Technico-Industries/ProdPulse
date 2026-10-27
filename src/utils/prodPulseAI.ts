@@ -20,6 +20,13 @@ export function isProdPulseAIAvailable(platformOS: string): boolean {
   return platformOS === 'web';
 }
 
+// Who gets the floating Prod AI button: an admin, on a platform where the
+// assistant runs. A UI gate only — the backend re-checks the caller's admin
+// profile on every request.
+export function canOpenProdAI(role: string | null | undefined, platformOS: string): boolean {
+  return role === 'admin' && isProdPulseAIAvailable(platformOS);
+}
+
 // ─── Request ─────────────────────────────────────────────────────────────────
 
 export const AI_LIMITS = {
@@ -223,24 +230,24 @@ export function classifyCallableError(err: unknown, offline: boolean, reachable:
   const unreachable = offline
     ? classified('NETWORK_ERROR', 'You appear to be offline. Check your connection and try again.')
     : reachable === false
-      ? classified('NETWORK_ERROR', "Couldn't connect to the ProdPulse AI server. Check your network (or firewall) and try again.")
+      ? classified('NETWORK_ERROR', "Couldn't connect to the Prod AI server. Check your network (or firewall) and try again.")
       : reachable === true
-        ? classified('BACKEND_UNAVAILABLE', 'The ProdPulse AI server responded but refused the request — the prodPulseAI function is most likely not deployed. Contact the developer.')
-        : classified('BACKEND_UNAVAILABLE', "Couldn't reach the ProdPulse AI service — it may not be deployed, or the request was blocked. If this keeps happening, contact the developer.");
+        ? classified('BACKEND_UNAVAILABLE', 'The Prod AI server responded but refused the request — the prodPulseAI function is most likely not deployed. Contact the developer.')
+        : classified('BACKEND_UNAVAILABLE', "Couldn't reach the Prod AI service — it may not be deployed, or the request was blocked. If this keeps happening, contact the developer.");
   switch (code) {
     case 'functions/unauthenticated':
-      return classified('AUTH_REQUIRED', 'Your session has expired. Sign in again to use ProdPulse AI.');
+      return classified('AUTH_REQUIRED', 'Your session has expired. Sign in again to use Prod AI.');
     case 'functions/permission-denied':
-      return classified('ADMIN_FORBIDDEN', 'ProdPulse AI is available to active admin accounts only.');
+      return classified('ADMIN_FORBIDDEN', 'Prod AI is available to active admin accounts only.');
     case 'functions/deadline-exceeded':
-      return classified('TIMEOUT', 'ProdPulse AI took too long to answer. Please try again.');
+      return classified('TIMEOUT', 'Prod AI took too long to answer. Please try again.');
     case 'functions/not-found':
     case 'functions/unimplemented':
-      return classified('BACKEND_UNAVAILABLE', 'The ProdPulse AI service is not deployed. Ask the developer to deploy the prodPulseAI function.');
+      return classified('BACKEND_UNAVAILABLE', 'The Prod AI service is not deployed. Ask the developer to deploy the prodPulseAI function.');
     case 'functions/unavailable':
-      return classified('BACKEND_UNAVAILABLE', 'The ProdPulse AI service is temporarily unavailable. Please try again.');
+      return classified('BACKEND_UNAVAILABLE', 'The Prod AI service is temporarily unavailable. Please try again.');
     case 'functions/internal':
-      return message === 'internal' ? unreachable : classified('INVALID_RESPONSE', 'ProdPulse AI returned an unexpected answer. Please try again.');
+      return message === 'internal' ? unreachable : classified('INVALID_RESPONSE', 'Prod AI returned an unexpected answer. Please try again.');
   }
   return unreachable;
 }
