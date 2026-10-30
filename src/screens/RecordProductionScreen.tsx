@@ -39,8 +39,9 @@ import {
   AppState,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
-import { useNavigation, useFocusEffect } from '@react-navigation/native';
+import { useNavigation, useFocusEffect, useRoute } from '@react-navigation/native';
 import {
+  arrayUnion,
   collection,
   getDocs,
   serverTimestamp,
@@ -87,6 +88,7 @@ import {
   threeWayMerge,
   withTimeout,
 } from '../utils/productionDraft';
+import { slotSaveButtonState } from '../utils/slotSaveButton';
 import {
   millisToProductionDayMinute,
   productionDayKeyFor,
@@ -131,6 +133,7 @@ import {
 import { deleteSlotWithBackup, restorableSlots, restoreDeletedSlot } from '../utils/slotRecovery';
 import { parseRejectionCount, rejectionFieldText, stepRejectionCount } from '../utils/rejectionCount';
 import { FinalizeGuard, createFinalizeGuard } from '../utils/finalizeGuard';
+import { Person, isHandover, recorderIdentity, sessionNowAbs, slotEntryStatuses, splitCreateOnlyFields, syncAttributionFields } from '../utils/supervisorHandover';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -220,7 +223,10 @@ interface ActiveSessionDoc {
   // Multi-device sync (all optional — older session docs don't have them):
   revision?: number;             // bumped by one on every sync (in a transaction)
   syncConflicts?: Record<string, SyncConflict | null>; // values not kept in a merge (null = dismissed)
-  updatedBy?: { uid: string | null; deviceId: string | null };
+  updatedBy?: { uid: string | null; deviceId: string | null; name?: string | null };
+  // Supervisor handover (utils/supervisorHandover). Optional — older docs
+  // don't have it. supervisorName/Code/Uid above stay the session STARTER's.
+  contributorUids?: string[];
   // Values of deleted hourly cards, for Restore (utils/slotRecovery).
   // Optional — older session docs don't have it.
   deletedSlotBackups?: Record<string, DeletedSlotBackup | null>;
@@ -337,7 +343,9 @@ async function upsertProductionRecord(
   resolved: Map<string, string>,
   options: { keepExistingWhenNull?: string[] } = {}
 ) {
-  const { createdAt: _createdAt, ...fields } = data;
+  // createdBy, like createdAt, is only written when the record is created —
+  // a later save by another supervisor keeps who first recorded the slot.
+  const { fields, createOnly } = splitCreateOnlyFields(data);
   const updateFields = fieldsForRecordUpdate(fields, options.keepExistingWhenNull);
   const key = productionRecordId(id);
   const cachedDocId = resolved.get(key);
@@ -349,7 +357,7 @@ async function upsertProductionRecord(
   if (exists) {
     await setDoc(ref, { ...updateFields, updatedAt: serverTimestamp() }, { merge: true });
   } else {
-    await setDoc(ref, { ...fields, createdAt: serverTimestamp(), updatedAt: serverTimestamp() });
+    await setDoc(ref, { ...fields, ...createOnly, createdAt: serverTimestamp(), updatedAt: serverTimestamp() });
   }
   resolved.set(key, ref.id);
 }
@@ -817,6 +825,7 @@ function RejectionCounter({
 
 export default function RecordProductionScreen() {
   const navigation = useNavigation<any>();
+  const route = useRoute<any>();
   const user = useAuthStore((s) => s.user);
 
   // ── Screen phase: 'loading' | 'setup' | 'active'
@@ -851,6 +860,14 @@ export default function RecordProductionScreen() {
   const [supervisorName, setSupervisorName] = useState(user?.name ?? '');
   const [supervisorCode, setSupervisorCode] = useState('');
   const [profileLoading, setProfileLoading] = useState(true);
+  // The signed-in user's own profile name/code. supervisorName/Code above
+  // show the session's STARTER once a session is open (restoreSession); this
+  // is what goes back into the setup form afterwards, and what a supervisor
+  // continuing someone else's session is recorded under.
+  const profileRef = useRef<{ name: string; code: string }>({ name: user?.name ?? '', code: '' });
+  // Who started the session on screen (activeSessions.supervisorUid/Name/
+  // Code), or null outside a session.
+  const [sessionStarter, setSessionStarter] = useState<Person | null>(null);
 
   // ── Setup form state
   const [plant, setPlant] = useState<string | null>(null);
@@ -951,6 +968,11 @@ export default function RecordProductionScreen() {
     undoTimerRef.current = null;
     setUndoDelete(null);
     setLastSyncedAtMs(null);
+    // The form goes back to this user's own name, not the starter of the
+    // session just left (which may have been another supervisor's).
+    setSessionStarter(null);
+    setSupervisorName(profileRef.current.name);
+    setSupervisorCode(profileRef.current.code);
   };
 
   // Leaving an active session first pushes any unsaved change to the server
@@ -1058,9 +1080,11 @@ export default function RecordProductionScreen() {
   const pendingResumeRef = useRef<{ slotIndex: number; stopId: string; endMs: number } | null>(null);
 
   // ── Saving
-  const [saving, setSaving] = useState(false);
-  // Synchronous guard against overlapping writes from rapid taps — `saving`
-  // only disables the button after the next render.
+  // Slots whose Save/Update is in flight — per slot, so saving one slot
+  // never changes another slot's button.
+  const [savingSlotIndices, setSavingSlotIndices] = useState<Set<number>>(new Set());
+  // Synchronous guard against overlapping writes from rapid taps —
+  // `savingSlotIndices` only disables the button after the next render.
   const savingSlotsRef = useRef<Set<number>>(new Set());
   // Slot identity → productionRecords doc ID it resolved to (see
   // upsertProductionRecord).
@@ -1307,15 +1331,50 @@ export default function RecordProductionScreen() {
   // Everything a session write reads, refreshed every render. Session writes
   // run from timers, the write queue and lifecycle listeners — reading this
   // ref (never a render's closure) is what keeps them from writing stale data.
+  // Who is actually entering data on this device — the session's starter
+  // keeps the name they entered at Start Production; a supervisor
+  // continuing someone else's session is recorded under their own profile
+  // (utils/supervisorHandover recorderIdentity).
+  const recorder = recorderIdentity(
+    { startedBy: sessionStarter ?? { uid: user?.uid ?? null, name: null }, supervisorName, supervisorCode },
+    { uid: user?.uid ?? null, profileName: profileRef.current.name || user?.name || null, profileCode: profileRef.current.code || null }
+  );
+  const continuingHandover = phase === 'active' && isHandover(sessionStarter?.uid, user?.uid);
+
+  // Which hourly slots are saved and which have ended without an entry —
+  // measured on the session's OWN production day (Shift B after midnight
+  // keeps counting past 24:00), refreshed every minute while a session is
+  // open.
+  const [clockMs, setClockMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (phase !== 'active') return;
+    setClockMs(Date.now());
+    const id = setInterval(() => setClockMs(Date.now()), 60000);
+    return () => clearInterval(id);
+  }, [phase]);
+  const slotEntry = useMemo(() => slotEntryStatuses(
+    {
+      shift: selectedShift,
+      otHours,
+      productionStartAbs: sessionStartAbs,
+      changeovers: (Object.values(allChangeovers).filter(Boolean) as ChangeoverInfo[]).map((co) => ({
+        slotIndex: co.slotIndex, startAbs: co.startAbs ?? co.atAbs, endAbs: co.endAbs ?? co.atAbs, newPartIndex: co.newPartIndex,
+      })),
+      savedSlotIndices: Array.from(savedSlotIndices),
+      deletedSlotIndices: Array.from(deletedSlotIndices),
+    },
+    sessionNowAbs(productionDate, clockMs)
+  ), [selectedShift, otHours, sessionStartAbs, allChangeovers, savedSlotIndices, deletedSlotIndices, productionDate, clockMs]);
+
   const latestRef = useRef({
     phase, sessionLineId, selectedLineId, selectedLine, plant, workshop, division, selectedShift, otHours,
     selectedPartIndex, supervisorName, supervisorCode, operators, producedBySlot, rejectionsBySlot, producedSegment,
-    allChangeovers, deletedSlotIndices, productionDate, shiftPlannedTotal, uid: user?.uid ?? null,
+    allChangeovers, deletedSlotIndices, productionDate, shiftPlannedTotal, uid: user?.uid ?? null, recorder,
   });
   latestRef.current = {
     phase, sessionLineId, selectedLineId, selectedLine, plant, workshop, division, selectedShift, otHours,
     selectedPartIndex, supervisorName, supervisorCode, operators, producedBySlot, rejectionsBySlot, producedSegment,
-    allChangeovers, deletedSlotIndices, productionDate, shiftPlannedTotal, uid: user?.uid ?? null,
+    allChangeovers, deletedSlotIndices, productionDate, shiftPlannedTotal, uid: user?.uid ?? null, recorder,
   };
 
   const filteredLines = useMemo(() => {
@@ -1435,9 +1494,12 @@ export default function RecordProductionScreen() {
     setLoadingActiveSessions(true);
     try {
       const snap = await getDocs(collection(db, 'activeSessions'));
+      // Sessions this supervisor started, plus ones they have continued
+      // for another supervisor (contributorUids). Any other running line is
+      // on the Running Lines page.
       const mine = snap.docs
         .map((d) => ({ docId: d.id, data: d.data() as ActiveSessionDoc }))
-        .filter((s) => s.data.supervisorUid === user.uid);
+        .filter((s) => s.data.supervisorUid === user.uid || (s.data.contributorUids ?? []).includes(user.uid));
       setActiveSessionsList(mine);
     } catch (e) {
       console.error('[loadActiveSessions]', e);
@@ -1455,8 +1517,12 @@ export default function RecordProductionScreen() {
           const snap = await getDoc(doc(db, 'users', user.uid));
           if (mounted && snap.exists()) {
             const d: any = snap.data();
-            setSupervisorName(d.name ?? user?.email ?? '');
-            setSupervisorCode(d.employeeCode ?? '');
+            profileRef.current = { name: d.name ?? user?.email ?? '', code: d.employeeCode ?? '' };
+            // Not over a session restoreSession already put on screen.
+            if (latestRef.current.phase !== 'active') {
+              setSupervisorName(profileRef.current.name);
+              setSupervisorCode(profileRef.current.code);
+            }
             if (d.plant) setPlant(d.plant);
           }
         }
@@ -1545,6 +1611,43 @@ export default function RecordProductionScreen() {
       Alert.alert('Could not open session', 'The latest session data could not be loaded. Check your connection and try again.');
     }
   };
+
+  // Opened from the Running Lines page with { lineId, requestedAt }: open
+  // that line's CURRENT session doc — whoever started it — through the same
+  // openSession path as "Continue" (device draft + saved records merged, no
+  // writes). Opening never starts, resumes or re-creates anything: a line
+  // whose session has since been finalized is only pre-selected, so the
+  // supervisor can start a new one through the normal setup.
+  const routeOpen = (route.params ?? {}) as { lineId?: string; requestedAt?: number };
+  const handledRouteOpenRef = useRef<string | null>(null);
+  useEffect(() => {
+    const lineId = routeOpen.lineId;
+    if (!lineId || phase === 'loading' || loadingLines) return;
+    const key = `${lineId}:${routeOpen.requestedAt ?? ''}`;
+    if (handledRouteOpenRef.current === key) return;
+    handledRouteOpenRef.current = key;
+    if (phase === 'active') {
+      if (latestRef.current.sessionLineId !== lineId) {
+        notify('Another session is open', 'Go back from the session on screen first, then open the other line.');
+      }
+      return;
+    }
+    (async () => {
+      try {
+        const snap = await getDoc(doc(db, 'activeSessions', lineId));
+        if (snap.exists()) {
+          await openSession(snap.data() as ActiveSessionDoc, snap.id);
+          return;
+        }
+        if (allLines.some((l) => l.id === lineId)) setSelectedLineId(lineId);
+        notify('No active session', 'This line has no running production session — it may have just been finalized. Choose the shift and operators to start a new one.');
+      } catch (e) {
+        console.error('[open from Running Lines]', e);
+        notify('Could not open line', 'The latest session data could not be loaded. Check your connection and try again.');
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [routeOpen.lineId, routeOpen.requestedAt, phase, loadingLines]);
 
   // The production date a stored session belongs to (same rule restoreSession
   // pins): its stored productionDate, else derived from its startedAt.
@@ -1692,8 +1795,11 @@ export default function RecordProductionScreen() {
     setSelectedShift(sd.shift);
     setSelectedLineId(sd.lineId);
     setSelectedPartIndex(sd.selectedPartIndex);
+    // The STARTER's details, as stored — shown in the header and never
+    // replaced by whoever continues the session (see sessionPayload).
     setSupervisorName(sd.supervisorName);
     setSupervisorCode(sd.supervisorCode);
+    setSessionStarter({ uid: sd.supervisorUid ?? null, name: sd.supervisorName ?? null, code: sd.supervisorCode ?? null });
 
     // Slot values, stops, OT, operators: the merged plan when there is one,
     // else the doc as stored. A running stop comes back with its original
@@ -1928,9 +2034,9 @@ export default function RecordProductionScreen() {
       shift: L.selectedShift,
       otHours: s.otHours,
       selectedPartIndex: L.selectedPartIndex,
-      supervisorName: L.supervisorName,
-      supervisorCode: L.supervisorCode,
-      supervisorUid: L.uid,
+      // supervisorName/Code/Uid are the session STARTER's and are not part
+      // of a sync: a supervisor continuing another's session must not take
+      // it over. Start Production (and the create branch below) write them.
       operators: s.operators,
       producedBySlot: s.producedBySlot,
       rejectionsBySlot: s.rejectionsBySlot,
@@ -1945,7 +2051,8 @@ export default function RecordProductionScreen() {
       lineStopped: isAnyStopRunning(s.stopsBySlot),
       revision,
       clientUpdatedAtMs: Date.now(),
-      updatedBy: { uid: L.uid, deviceId: deviceIdRef.current },
+      // Who made this change (and, via contributorUids, everyone who has).
+      ...syncAttributionFields({ uid: L.uid, name: L.recorder.name, deviceId: deviceIdRef.current }, arrayUnion),
       updatedAt: serverTimestamp(),
 
       // new structured summaries. productionDate is deliberately NOT part
@@ -1985,7 +2092,15 @@ export default function RecordProductionScreen() {
         // this is a genuinely new session, so its production day is pinned
         // here, from now.
         const pd = L.productionDate ?? productionDayKeyFor(Date.now());
-        await withTimeout(setDoc(docRef, { ...sessionPayload(local, 1), productionDate: pd, startedAt: serverTimestamp() }), SESSION_WRITE_TIMEOUT_MS, 'session save');
+        await withTimeout(setDoc(docRef, {
+          ...sessionPayload(local, 1),
+          supervisorName: L.supervisorName,
+          supervisorCode: L.supervisorCode,
+          supervisorUid: L.uid,
+          contributorUids: L.uid ? [L.uid] : [],
+          productionDate: pd,
+          startedAt: serverTimestamp(),
+        }), SESSION_WRITE_TIMEOUT_MS, 'session save');
         setSessionLineId(L.selectedLineId);
         setProductionDate(pd);
         sessionStartedAtMsRef.current = Date.now();
@@ -2442,12 +2557,14 @@ export default function RecordProductionScreen() {
         sessionInstanceId,
         revision: 1,
         syncConflicts: {},
-        updatedBy: { uid: user?.uid ?? null, deviceId: deviceIdRef.current },
+        updatedBy: { uid: user?.uid ?? null, deviceId: deviceIdRef.current, name: supervisorName || null },
+        contributorUids: user?.uid ? [user.uid] : [],
         clientUpdatedAtMs: Date.now(),
         startedAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
       setSessionLineId(lineId);
+      setSessionStarter({ uid: user?.uid ?? null, name: supervisorName || null, code: supervisorCode || null });
       // Pinned for the lifetime of this session — every record it writes,
       // including Finalize after midnight/the cutover, uses this date.
       setProductionDate(pd);
@@ -2647,7 +2764,8 @@ export default function RecordProductionScreen() {
           partPlannedTotals,
           downtimeIntervals,
           totalDowntimeMinutes,
-          supervisor: { name: supervisorName, code: supervisorCode, uid: user?.uid ?? null },
+          supervisor: { name: recorder.name, code: recorder.code, uid: recorder.uid },
+          sessionSupervisor: { name: sessionStarter?.name ?? null, code: sessionStarter?.code ?? null, uid: sessionStarter?.uid ?? null },
           finalizedAt: serverTimestamp(),
         },
         { merge: true }
@@ -2691,7 +2809,12 @@ export default function RecordProductionScreen() {
       lineId,
       lineName: selectedLine.lineName ?? null,
       operators: operators.map((o) => ({ name: o.name, code: o.code })),
-      supervisor: { name: supervisorName, code: supervisorCode, uid: user?.uid ?? null },
+      // The supervisor actually saving the slot (recorderIdentity); the
+      // session's starter rides along as sessionSupervisor, and createdBy is
+      // kept from the first save only (upsertProductionRecord).
+      supervisor: { name: recorder.name, code: recorder.code, uid: recorder.uid },
+      sessionSupervisor: { name: sessionStarter?.name ?? null, code: sessionStarter?.code ?? null, uid: sessionStarter?.uid ?? null },
+      createdBy: { name: recorder.name, uid: recorder.uid },
       productionDate: prodDate,
       createdAt: serverTimestamp(),
     };
@@ -3422,7 +3545,12 @@ export default function RecordProductionScreen() {
     shift: selectedShift, plant: selectedLine?.plant ?? plant ?? null, workshop: selectedLine?.workshop ?? workshop ?? null,
     division: selectedLine?.division ?? division ?? null, lineId: selectedLineId, lineName: selectedLine?.lineName ?? null,
     operators: operators.map((o) => ({ name: o.name, code: o.code })),
-    supervisor: { name: supervisorName, code: supervisorCode, uid: user?.uid ?? null },
+    // The supervisor actually saving the slot (recorderIdentity); the
+    // session's starter rides along as sessionSupervisor, and createdBy is
+    // kept from the first save only (upsertProductionRecord).
+    supervisor: { name: recorder.name, code: recorder.code, uid: recorder.uid },
+    sessionSupervisor: { name: sessionStarter?.name ?? null, code: sessionStarter?.code ?? null, uid: sessionStarter?.uid ?? null },
+    createdBy: { name: recorder.name, uid: recorder.uid },
     productionDate: prodDate,
     createdAt: serverTimestamp(),
   });
@@ -3653,7 +3781,7 @@ export default function RecordProductionScreen() {
       if (error) { Alert.alert('Invalid changeover time', `${error}\n\nRemove this changeover and add it again with valid times.`); return; }
     }
     savingSlotsRef.current.add(slot.index);
-    setSaving(true);
+    setSavingSlotIndices(new Set(savingSlotsRef.current));
     try {
       // The session's original production date (not today's) — the same
       // date Finalize uses, so a slot saved now and the remaining slots
@@ -3784,10 +3912,10 @@ export default function RecordProductionScreen() {
       }
     } catch (err) {
       console.error('saveSlot', err);
-      Alert.alert('Error', 'Could not save slot. Your entries are kept — tap Save Slot to retry.');
+      Alert.alert('Error', `Could not save slot. Your entries are kept — tap ${savedSlotIndicesRef.current.has(slot.index) ? 'Update Slot' : 'Save Slot'} to retry.`);
     } finally {
       savingSlotsRef.current.delete(slot.index);
-      setSaving(savingSlotsRef.current.size > 0);
+      setSavingSlotIndices(new Set(savingSlotsRef.current));
     }
   };
 
@@ -3994,6 +4122,7 @@ export default function RecordProductionScreen() {
                       <Text style={styles.continueCardMeta}>
                         Started {formatSessionStartedAt(startedMs)}
                         {sd.otHours > 0 ? ` · ${sd.otHours}h OT` : ''}
+                        {isHandover(sd.supervisorUid, user?.uid) && sd.supervisorName ? ` · by ${sd.supervisorName}` : ''}
                       </Text>
                     </View>
                     <Ionicons name="play-circle" size={26} color="#4C9A6A" />
@@ -4052,22 +4181,39 @@ export default function RecordProductionScreen() {
       <ScrollView contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled">
         {/* Header */}
         <View style={styles.activeHeader}>
-          <View style={{ flex: 1 }}>
+          <View>
             <Text style={styles.title}>
               {selectedLine?.lineName ?? 'Production'}
             </Text>
-            <Text style={styles.subtitle}>
+            <Text style={[styles.subtitle, styles.headerLine]}>
               {plant ?? ''}{workshop ? ` · ${workshop}` : ''}{division ? ` · ${division}` : ''} · Shift {selectedShift}
             </Text>
-            <Text style={[styles.subtitle, { marginTop: 2, color: '#F2A93B', fontWeight: '700' }]}>
+            <Text style={[styles.subtitle, styles.headerLine, { color: '#F2A93B', fontWeight: '700' }]}>
               Date: {formatProductionDayDisplay(productionDate)}
               {sessionStartAbs != null ? ` · Production start: ${formatAbsMinutes24(sessionStartAbs)}` : ''}
             </Text>
-            <Text style={[styles.subtitle, { marginTop: 2, color: '#4C9A6A', fontWeight: '700' }]}>
+            <Text style={[styles.subtitle, styles.headerLine, { color: '#4C9A6A', fontWeight: '700' }]}>
               Shift Planned Total: {shiftPlannedTotal} parts{otHours > 0 ? ` (incl. ${otHours}h OT)` : ''}
             </Text>
+            <Text style={[styles.subtitle, styles.headerLine, { fontWeight: '700' }]}>
+              Slots: {slotEntry.completed.length} saved
+              {slotEntry.awaiting.length > 0 ? ` · ${slotEntry.awaiting.length} awaiting entry` : ''}
+              {slotEntry.upcoming.length + (slotEntry.current != null ? 1 : 0) > 0
+                ? ` · ${slotEntry.upcoming.length + (slotEntry.current != null ? 1 : 0)} still to come`
+                : ''}
+            </Text>
+            {/* Supervisor handover: same session, different supervisor */}
+            {continuingHandover && (
+              <View style={styles.handoverBanner} accessibilityRole="text">
+                <Ionicons name="swap-horizontal" size={16} color="#3E7CB1" />
+                <Text style={styles.handoverText}>
+                  Continuing the session {sessionStarter?.name ? `started by ${sessionStarter.name}` : 'started by another supervisor'}.
+                  {' '}Their entries are kept; new entries are saved to this same session under {recorder.name || 'your name'}.
+                </Text>
+              </View>
+            )}
             {/* Session save status (see persistSession) */}
-            <Text style={[styles.subtitle, { marginTop: 2, fontWeight: '700', color: remoteEnded || sessionSync === 'error' ? '#D64545' : '#8A96A3' }]}>
+            <Text style={[styles.subtitle, styles.headerLine, { fontWeight: '700', color: remoteEnded || sessionSync === 'error' ? '#D64545' : '#8A96A3' }]}>
               {remoteEnded
                 ? remoteEnded === 'ended'
                   ? 'Production ended by an admin — no longer saving. Go back to continue.'
@@ -4079,7 +4225,7 @@ export default function RecordProductionScreen() {
                 : `All changes synced${lastSyncedAtMs ? ` · ${new Date(lastSyncedAtMs).toLocaleTimeString()}` : ''}`}
             </Text>
             {restoreNotice && (
-              <Text style={[styles.subtitle, { marginTop: 2, color: '#F2A93B' }]}>{restoreNotice}</Text>
+              <Text style={[styles.subtitle, styles.headerLine, { color: '#F2A93B' }]}>{restoreNotice}</Text>
             )}
             {/* Values not kept when edits from two devices clashed */}
             {Object.values(syncConflicts).filter((c): c is SyncConflict => !!c).map((c) => (
@@ -4105,7 +4251,7 @@ export default function RecordProductionScreen() {
                 <Text style={styles.partTargetHeading}>Part Targets</Text>
                 {partTargetSummary.map((p) => (
                   <View key={p.name} style={styles.partTargetRow}>
-                    <Text style={styles.partTargetName}>{p.name}</Text>
+                    <Text style={styles.partTargetName} numberOfLines={2}>{p.name}</Text>
                     <Text style={styles.partTargetValue}>{p.target}</Text>
                   </View>
                 ))}
@@ -4113,28 +4259,32 @@ export default function RecordProductionScreen() {
             )}
           </View>
 
-          {/* Save session (persist only) */}
-          <Pressable
-            onPress={async () => {
-              const ok = await flushSessionNow();
-              if (!ok) notify('Session not saved', 'Could not save to the server. Your entries are kept on this device — check your connection and tap Save Session again.');
-            }}
-            style={[styles.stopProductionBtn, { borderColor: '#F2A93B' }]}
-          >
-            <Ionicons name="save" size={18} color="#F2A93B" />
-            <Text style={[styles.stopProductionText, { color: '#F2A93B' }]}>Save Session</Text>
-          </Pressable>
+          {/* Session actions — their own row under the details, so they
+              never squeeze the details into a narrow column. */}
+          <View style={styles.activeHeaderActions}>
+            {/* Save session (persist only) */}
+            <Pressable
+              onPress={async () => {
+                const ok = await flushSessionNow();
+                if (!ok) notify('Session not saved', 'Could not save to the server. Your entries are kept on this device — check your connection and tap Save Session again.');
+              }}
+              style={[styles.stopProductionBtn, styles.headerActionBtn, { borderColor: '#F2A93B' }]}
+            >
+              <Ionicons name="save" size={18} color="#F2A93B" />
+              <Text style={[styles.stopProductionText, { color: '#F2A93B' }]}>Save Session</Text>
+            </Pressable>
 
-          {/* Finalize & End Session */}
-          <Pressable
-            onPress={handleFinalizeSession}
-            disabled={finalizeBusy}
-            style={[styles.stopProductionBtn, finalizeBusy && styles.disabledBtn]}
-            accessibilityState={{ disabled: finalizeBusy, busy: finalizeBusy }}
-          >
-            <Ionicons name="stop-circle" size={18} color="#D64545" />
-            <Text style={styles.stopProductionText}>Finalize & End</Text>
-          </Pressable>
+            {/* Finalize & End Session */}
+            <Pressable
+              onPress={handleFinalizeSession}
+              disabled={finalizeBusy}
+              style={[styles.stopProductionBtn, styles.headerActionBtn, finalizeBusy && styles.disabledBtn]}
+              accessibilityState={{ disabled: finalizeBusy, busy: finalizeBusy }}
+            >
+              <Ionicons name="stop-circle" size={18} color="#D64545" />
+              <Text style={styles.stopProductionText}>Finalize & End</Text>
+            </Pressable>
+          </View>
         </View>
 
         {/* Line stopped banner */}
@@ -4152,8 +4302,8 @@ export default function RecordProductionScreen() {
             {'  '}·{'  '}
             Operators: {operators.filter((o) => o.name.trim()).map((o) => o.name.trim()).join(', ') || '—'}
           </Text>
-          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
-            <Text style={styles.sessionInfoText}>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+            <Text style={[styles.sessionInfoText, { flexShrink: 1 }]} numberOfLines={2}>
               Part: {selectedLine?.parts?.[currentActivePartIndex]?.name ?? '—'}
             </Text>
             {/* OT editable during active session */}
@@ -4269,6 +4419,12 @@ export default function RecordProductionScreen() {
             } = opts;
             const runningStop = slotHasRunningStop(stopSlotIndex);
             const disabled = isLineStopped;
+            // Both halves of a changeover slot share the hourly slot's state.
+            const saveBtn = slotSaveButtonState({
+              saved: savedSlotIndices.has(stopSlotIndex),
+              saving: savingSlotIndices.has(stopSlotIndex),
+              lineStopped: disabled,
+            });
 
             return (
               <View key={cardKey} style={[styles.slotCard, runningStop && styles.slotCardStopped]}>
@@ -4278,6 +4434,9 @@ export default function RecordProductionScreen() {
                   <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
                     {savedSlotIndices.has(stopSlotIndex) && (
                       <Text style={{ color: '#4C9A6A', fontSize: 11, fontWeight: '700' }}>✓ Saved</Text>
+                    )}
+                    {slotEntry.bySlot[stopSlotIndex] === 'awaiting' && (
+                      <Text style={{ color: '#F2A93B', fontSize: 11, fontWeight: '700' }}>Needs entry</Text>
                     )}
                     <Text style={styles.muted}>{minutesLabel}</Text>
                     <Pressable
@@ -4418,8 +4577,18 @@ export default function RecordProductionScreen() {
                 })()}
 
                 {/* Save button */}
-                <Pressable onPress={onSave} disabled={disabled || saving} style={[styles.updateButton, disabled && styles.updateButtonDisabled]}>
-                  <Text style={styles.updateText}>{saving ? 'Saving…' : 'Save Slot'}</Text>
+                <Pressable
+                  onPress={onSave}
+                  disabled={saveBtn.disabled}
+                  accessibilityRole="button"
+                  accessibilityState={{ disabled: saveBtn.disabled, busy: savingSlotIndices.has(stopSlotIndex) }}
+                  style={[
+                    styles.updateButton,
+                    saveBtn.variant === 'update' && styles.updateButtonSaved,
+                    saveBtn.variant === 'disabled' && styles.updateButtonDisabled,
+                  ]}
+                >
+                  <Text style={styles.updateText}>{saveBtn.label}</Text>
                 </Pressable>
               </View>
             );
@@ -4753,7 +4922,14 @@ const styles = StyleSheet.create({
   continueCardMeta: { color: '#8A96A3', fontSize: 11.5, marginTop: 2 },
 
   // Active phase header
-  activeHeader: { flexDirection: 'row', alignItems: 'flex-start', marginBottom: 10, gap: 8 },
+  // Details stacked full width, actions in a row below — both share the
+  // scroll's horizontal padding with the cards underneath.
+  activeHeader: { marginBottom: 10, gap: 10 },
+  activeHeaderActions: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  headerActionBtn: { marginLeft: 0 },
+  // Even spacing between the stacked header lines (subtitle's own
+  // marginBottom is for the setup screen).
+  headerLine: { marginTop: 2, marginBottom: 0 },
   stopProductionBtn: { flexDirection: 'row', alignItems: 'center', gap: 6, borderWidth: 1, borderColor: '#D64545', borderRadius: 8, paddingHorizontal: 10, paddingVertical: 8, marginLeft: 8 },
   stopProductionText: { color: '#D64545', fontWeight: '700', fontSize: 12 },
   stoppedBanner: {
@@ -4761,6 +4937,11 @@ const styles = StyleSheet.create({
     borderWidth: 1, borderColor: '#D64545', borderRadius: 10, padding: 12, marginBottom: 12,
   },
   stoppedBannerText: { color: '#D64545', fontWeight: '800', fontSize: 12, flex: 1 },
+  handoverBanner: {
+    flexDirection: 'row', alignItems: 'flex-start', gap: 6, marginTop: 6, padding: 8,
+    borderRadius: 8, borderWidth: 1, borderColor: '#3E7CB1', backgroundColor: '#3E7CB122',
+  },
+  handoverText: { color: '#ECEFF2', fontSize: 12, flex: 1 },
   sessionInfo: { backgroundColor: '#1D2329', borderRadius: 10, borderWidth: 1, borderColor: '#2C343C', padding: 10, marginBottom: 14, gap: 2 },
   sessionInfoText: { color: '#8A96A3', fontSize: 12 },
 
@@ -4768,7 +4949,7 @@ const styles = StyleSheet.create({
   partTargetBox: { marginTop: 8, backgroundColor: '#1D2329', borderWidth: 1, borderColor: '#2C343C', borderRadius: 10, padding: 10, gap: 4 },
   partTargetHeading: { color: '#F2A93B', fontSize: 11, fontWeight: '800', letterSpacing: 1.2, marginBottom: 2 },
   partTargetRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 2 },
-  partTargetName: { color: '#ECEFF2', fontSize: 13, fontWeight: '600' },
+  partTargetName: { color: '#ECEFF2', fontSize: 13, fontWeight: '600', flex: 1, marginRight: 8 },
   partTargetValue: { color: '#ECEFF2', fontSize: 13, fontWeight: '800' },
 
   // Slot cards
@@ -4808,6 +4989,7 @@ const styles = StyleSheet.create({
   stopBtn: { borderWidth: 1, borderColor: '#F2A93B', borderRadius: 8, paddingHorizontal: 10, paddingVertical: 8, alignItems: 'center' },
   resumeBtn: { backgroundColor: '#4C9A6A', borderRadius: 8, paddingHorizontal: 10, paddingVertical: 8, alignItems: 'center' },
   updateButton: { marginTop: 10, height: 44, borderRadius: 10, backgroundColor: '#3E7CB1', alignItems: 'center', justifyContent: 'center' },
+  updateButtonSaved: { backgroundColor: '#2E7D4F' },
   updateButtonDisabled: { backgroundColor: '#1D2329', borderWidth: 1, borderColor: '#2C343C', opacity: 0.5 },
   updateText: { color: '#fff', fontWeight: '800', fontSize: 13 },
   stopBadge: { flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 4, paddingVertical: 4, paddingHorizontal: 8, backgroundColor: '#2C343C', borderRadius: 6, alignSelf: 'flex-start' },

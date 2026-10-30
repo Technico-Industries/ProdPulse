@@ -1,8 +1,8 @@
 // src/screens/AIAssistantScreen.tsx
 //
-// Prod AI — admin chat over the production database. Web only: on
-// Android/iOS the floating Prod AI button (components/ProdAIButton) is
-// hidden and this screen shows a notice instead of the chat.
+// Prod AI — admin chat over the production database, on the web app and
+// the Android/iOS app (utils/prodPulseAI isProdPulseAIAvailable; any other
+// platform gets a notice instead of the chat).
 //
 // The chat (ProdAIChat below) is normally opened as a popup over the Admin
 // Overview (components/ProdAIPanel). This route (/ai-assistant) renders the
@@ -131,9 +131,9 @@ function ResultCard({ block, generatedAt, chartWidth }: { block: ResultBlock; ge
   const [showDetails, setShowDetails] = useState(false);
   const [exportState, setExportState] = useState<'idle' | 'done' | 'error'>('idle');
 
-  const handleExport = () => {
+  const handleExport = async () => {
     try {
-      exportResultToExcel(block, generatedAt);
+      await exportResultToExcel(block, generatedAt);
       setExportState('done');
     } catch (e) {
       console.error('[AIAssistantScreen] export failed', e);
@@ -504,8 +504,8 @@ function NativeNotice() {
       </Pressable>
       <View style={styles.empty}>
         <ProdAIBrain size={28} />
-        <Text style={styles.emptyTitle}>Prod AI is available on the web app</Text>
-        <Text style={styles.emptySubtitle}>Open ProdPulse in a browser and sign in with an admin account to use it.</Text>
+        <Text style={styles.emptyTitle}>Prod AI isn't available on this device</Text>
+        <Text style={styles.emptySubtitle}>Use the ProdPulse web app or the Android/iOS app with an admin account.</Text>
       </View>
     </SafeAreaView>
   );

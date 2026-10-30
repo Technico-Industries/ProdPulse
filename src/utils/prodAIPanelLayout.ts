@@ -36,3 +36,8 @@ export function prodAIPanelFrame(
   }
   return { left: 8 + insets.left, right: 8 + insets.right, top: 8 + insets.top, bottom: 8 + insets.bottom, layout: 'fill' };
 }
+
+// Space the admin overview pages leave below their scroll content, so the
+// last row can scroll clear of the floating Prod AI button and the pager's
+// page tabs under it.
+export const PROD_AI_BUTTON_CLEARANCE = 128;

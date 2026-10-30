@@ -1,19 +1,21 @@
 // src/components/ProdAIButton.tsx
 //
-// Floating Prod AI launcher on the admin Production overview — the entry
-// point that replaced the drawer's menu card. It opens Prod AI as a popup
-// over the overview (components/ProdAIPanel) — no navigation, so the
+// Floating Prod AI launcher over the admin dashboard pager (mounted by
+// components/AdminDashboardPager, so it stays on every overview page). It
+// opens Prod AI as a popup (components/ProdAIPanel) — no navigation, so the
 // overview stays mounted and unchanged behind it. The conversation lives in
 // stores/prodAIStore, not here, so closing and reopening keeps it.
 //
-// Rendered only for an admin on a platform where the assistant runs
-// (utils/prodPulseAI canOpenProdAI). That is a UI gate — the backend still
-// checks the caller's admin profile on every request.
+// Rendered for an admin on web, Android and iOS (utils/prodPulseAI
+// canOpenProdAI). That is a UI gate — the backend still checks the caller's
+// admin profile on every request.
 //
-// Sits bottom-right, above the dashboard pager's floating page tabs, inside
-// the screen's safe area (ScreenContainer). 52px, so it clears the 44px
-// minimum touch target. On web, hovering shows an "Open Prod AI" tooltip.
-// Monochrome: white button, black brain icon.
+// Bottom-right, above the pager's floating page tabs. Plain React Native
+// positioning (absolute, inside the screen's safe area — ScreenContainer
+// applies the insets); zIndex keeps it above the pager's ScrollView on web
+// and iOS, elevation on Android. 52px, clear of the 44px minimum touch
+// target. Monochrome: near-black surface, grey border, white brain. On web,
+// hovering shows an "Open Prod AI" tooltip.
 
 import React, { useState } from 'react';
 import { View, Text, Pressable, StyleSheet, Platform } from 'react-native';
@@ -24,9 +26,7 @@ import ProdAIPanel from './ProdAIPanel';
 
 const LABEL = 'Open Prod AI';
 
-// Space the overview's scroll content leaves at the bottom so its last row
-// can scroll clear of this button (and the pager tabs below it).
-export const PROD_AI_BUTTON_CLEARANCE = 128;
+export { PROD_AI_BUTTON_CLEARANCE } from '../utils/prodAIPanelLayout';
 
 export default function ProdAIButton() {
   const role = useAuthStore((s) => s.user?.role ?? null);
@@ -47,6 +47,7 @@ export default function ProdAIButton() {
           onPress={() => setOpen(true)}
           onHoverIn={() => setHovered(true)}
           onHoverOut={() => setHovered(false)}
+          hitSlop={6}
           style={({ pressed, focused }: { pressed: boolean; focused?: boolean }) => [
             styles.fab,
             hovered && styles.fabHovered,
@@ -58,7 +59,7 @@ export default function ProdAIButton() {
           accessibilityHint="Opens the Prod AI production assistant"
           accessibilityState={{ expanded: open }}
         >
-          <ProdAIBrain size={24} color="#000000" />
+          <ProdAIBrain size={24} color="#FFFFFF" />
         </Pressable>
       </View>
       <ProdAIPanel visible={open} onClose={() => { setOpen(false); setHovered(false); }} />
@@ -68,24 +69,33 @@ export default function ProdAIButton() {
 
 const styles = StyleSheet.create({
   // bottom: 56 keeps it above the pager's page tabs (bottom 8, ~36 tall).
-  wrap: { position: 'absolute', right: 16, bottom: 56, flexDirection: 'row', alignItems: 'center', gap: 8 },
+  wrap: {
+    position: 'absolute',
+    right: 16,
+    bottom: 56,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    zIndex: 20,
+    elevation: 20,
+  },
   fab: {
     width: 52,
     height: 52,
     borderRadius: 26,
-    backgroundColor: '#FFFFFF',
+    backgroundColor: '#151515',
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: 1,
-    borderColor: '#2B2B2B',
+    borderColor: '#3A3A3A',
     shadowColor: '#000',
-    shadowOpacity: 0.4,
+    shadowOpacity: 0.5,
     shadowRadius: 8,
     shadowOffset: { width: 0, height: 3 },
-    elevation: 6,
+    elevation: 8,
   },
-  fabHovered: { backgroundColor: '#E5E5E5' },
-  fabPressed: { backgroundColor: '#D4D4D4', transform: [{ scale: 0.96 }] },
+  fabHovered: { backgroundColor: '#242424' },
+  fabPressed: { backgroundColor: '#2E2E2E', transform: [{ scale: 0.96 }] },
   tooltip: {
     backgroundColor: '#151515',
     borderWidth: 1,

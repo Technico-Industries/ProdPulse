@@ -19,9 +19,8 @@ import { collection, getDocs, onSnapshot, query, where, orderBy, Timestamp, doc,
 import { db } from '../services/firebase';
 import { useAuthStore } from '../stores/authStore';
 import { ADMIN_MENU_ITEMS, visibleMenuItems } from '../constants/adminMenu';
-import AdminDashboardPager, { QualityDashboardPager } from '../components/AdminDashboardPager';
+import AdminDashboardPager, { QualityDashboardPager, SupervisorDashboardPager } from '../components/AdminDashboardPager';
 import { SUPERVISOR_MENU_ITEMS } from '../constants/supervisorMenu';
-import SupervisorOverviewScreen from './SupervisorOverviewScreen';
 import { QUALITY_MENU_ITEMS } from '../constants/qualityMenu';
 
 type IconName = keyof typeof Ionicons.glyphMap;
@@ -1092,9 +1091,10 @@ export default function DashboardScreen() {
   // Plain Supervisor (assign 'Supervisor' or unset) gets the digital
   // active-session overview, with its own header + hamburger drawer. The
   // Technician and Restocker branches below are deliberately untouched —
-  // they keep the original header and lists.
+  // they keep the original header and lists. Running Lines (every line
+  // with an active session) is one swipe to the left.
   if (!isTechnician && !isRestocker) {
-    return <SupervisorOverviewScreen />;
+    return <SupervisorDashboardPager />;
   }
 
   return (

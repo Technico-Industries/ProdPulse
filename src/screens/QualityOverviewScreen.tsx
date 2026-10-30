@@ -49,6 +49,7 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import WebRefreshButton from '../components/WebRefreshButton';
+import { PROD_AI_BUTTON_CLEARANCE } from '../utils/prodAIPanelLayout';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useNavigation } from '@react-navigation/native';
 import { collection, getDocs, query, where } from 'firebase/firestore';
@@ -1022,7 +1023,8 @@ const styles = StyleSheet.create({
   rolePillText: { color: '#4C9A6A', fontSize: 10, fontWeight: '900', letterSpacing: 1 },
 
   // Bottom padding clears the dashboard pager's floating page tabs.
-  scroll: { paddingHorizontal: 12, paddingTop: 12, paddingBottom: 72, gap: 11 },
+  // Clears the pager's page tabs and the floating Prod AI button (admin).
+  scroll: { paddingHorizontal: 12, paddingTop: 12, paddingBottom: PROD_AI_BUTTON_CLEARANCE, gap: 11 },
   sectionLabel: { color: '#5C6670', fontSize: 10, fontWeight: '800', letterSpacing: 1.2 },
   block: { gap: 7 },
   blockHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 7 },

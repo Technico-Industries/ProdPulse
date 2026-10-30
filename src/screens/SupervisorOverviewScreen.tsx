@@ -13,7 +13,10 @@
 //   Each doc carries supervisorUid, so "my active lines" is precisely the
 //   set of activeSessions docs whose supervisorUid === the logged-in uid —
 //   the same filter RecordProductionScreen's own loadActiveSessions uses
-//   for its "continue where you left off" list.
+//   for its "continue where you left off" list. Lines this supervisor has
+//   continued for someone else (their uid in contributorUids — see
+//   utils/supervisorHandover) count as theirs too. Every other running
+//   line is on the Running Lines page, one swipe to the left.
 //
 // A supervisor can legitimately run several lines at once (see that
 // screen's header comment: "Removed auto-restore of one session per
@@ -21,9 +24,8 @@
 // dashboard treats every matching doc as one active line of the current
 // session, grouped by the session's shift + productionDate.
 //
-// Lines the supervisor is NOT running have no activeSessions doc with
-// their uid, so they are never fetched and never displayed. Factory-wide
-// lines are not loaded at all.
+// Lines the supervisor is NOT running are not displayed here; factory-wide
+// lines are on the Running Lines page instead.
 //
 // ─── PRODUCTION DATA ─────────────────────────────────────────────────────────
 // The real `productionRecords` collection written by RecordProductionScreen
@@ -73,6 +75,7 @@ import { useAuthStore } from '../stores/authStore';
 import { SUPERVISOR_MENU_ITEMS } from '../constants/supervisorMenu';
 import AppDrawer from '../components/AppDrawer';
 import { DowntimeStop, formatDowntimeMinutes, isAnyStopRunning, sessionDowntimeMinutes } from '../utils/downtime';
+import { isSupervisorsSession } from '../utils/supervisorHandover';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -316,9 +319,12 @@ export default function SupervisorOverviewScreen() {
               startedAtMs: data.startedAt?.toMillis ? data.startedAt.toMillis() : null,
               updatedAtMs: data.updatedAt?.toMillis ? data.updatedAt.toMillis() : null,
               _uid: data.supervisorUid ?? null,
-            } as ActiveSession & { _uid: string | null };
+              _contributors: Array.isArray(data.contributorUids) ? data.contributorUids : [],
+            } as ActiveSession & { _uid: string | null; _contributors: string[] };
           })
-          .filter((s: any) => s._uid === user.uid)
+          // Lines this supervisor started, plus lines they continued for
+          // another supervisor (utils/supervisorHandover).
+          .filter((s: any) => isSupervisorsSession({ startedBy: { uid: s._uid, name: null }, contributorUids: s._contributors }, user.uid))
           .sort((a, b) => (a.lineName ?? '').localeCompare(b.lineName ?? ''));
         setSessions(mine);
         setSessionsLoading(false);
@@ -492,8 +498,10 @@ export default function SupervisorOverviewScreen() {
     [sessions]
   );
   const sessionDateLabel = productionDates.length === 1 ? prettyDate(productionDates[0]) : null;
+  // A continued session's supervisorName is its starter's, so prefer one
+  // this supervisor started.
   const supervisorLabel =
-    sessions[0]?.supervisorName || user?.name || user?.email || 'Supervisor';
+    sessions.find((s: any) => s._uid === user?.uid)?.supervisorName || user?.name || sessions[0]?.supervisorName || user?.email || 'Supervisor';
   const stoppedCount = sessions.filter((s) => s.lineStopped).length;
 
   // ── Responsive: percentage widths in a wrapping row, so nothing can
@@ -732,7 +740,7 @@ export default function SupervisorOverviewScreen() {
                     {byLine.map(({ session: s, totals: t }) => (
                       <Pressable
                         key={s.lineId}
-                        onPress={() => navigation.navigate('RecordProduction')}
+                        onPress={() => navigation.navigate('RecordProduction', { lineId: s.lineId, requestedAt: Date.now() })}
                         style={({ pressed }) => [
                           styles.lineCard,
                           { width: lineCardWidth as any },
@@ -854,7 +862,8 @@ const styles = StyleSheet.create({
   },
   rolePillText: { color: '#F2A93B', fontSize: 10.5, fontWeight: '900', letterSpacing: 1 },
 
-  scroll: { paddingHorizontal: 16, paddingTop: 16, paddingBottom: 40, gap: 16 },
+  // Bottom padding clears the dashboard pager's page tabs.
+  scroll: { paddingHorizontal: 16, paddingTop: 16, paddingBottom: 80, gap: 16 },
   sectionLabel: { color: '#5C6670', fontSize: 10.5, fontWeight: '800', letterSpacing: 1.2 },
 
   // Session banner

@@ -55,13 +55,14 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import WebRefreshButton from '../components/WebRefreshButton';
+import LiveDashboardButton from '../components/LiveDashboardButton';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { collection, getDocs, onSnapshot } from 'firebase/firestore';
 import { db } from '../services/firebase';
 import { fetchProductionRecordsForDateRange } from '../services/productionRecordQueries';
 import { PLANTS, WORKSHOPS, DIVISIONS } from '../constants/lineOptions';
 import AppDrawer from '../components/AppDrawer';
-import ProdAIButton, { PROD_AI_BUTTON_CLEARANCE } from '../components/ProdAIButton';
+import { PROD_AI_BUTTON_CLEARANCE } from '../utils/prodAIPanelLayout';
 import { ADMIN_MENU_ITEMS } from '../constants/adminMenu';
 import { counterQuality } from '../utils/qualityMetrics';
 import {
@@ -779,6 +780,7 @@ export default function AdminOverviewScreen() {
           <Text style={styles.brandSub}>Production Overview</Text>
         </View>
         <WebRefreshButton onRefresh={onRefresh} refreshing={refreshing} />
+        <LiveDashboardButton />
         <View style={styles.rolePill}>
           <Text style={styles.rolePillText}>ADMIN</Text>
         </View>
@@ -1148,9 +1150,6 @@ export default function AdminOverviewScreen() {
           if (next !== selectedDate) setSelectedDate(next);
         }}
       />
-
-      {/* Prod AI — admins only (the component checks), above the pager tabs */}
-      <ProdAIButton />
 
       <AppDrawer
         visible={drawerOpen}

@@ -34,6 +34,7 @@ import PCSPerHourScreen from './src/screens/PCSPerHourScreen';
 import QualityAnalysisScreen from './src/screens/QualityAnalysisScreen';
 import AIAssistantScreen from './src/screens/AIAssistantScreen';
 import ModelPartProductionScreen from './src/screens/ModelPartProductionScreen';
+import LiveDashboardScreen from './src/screens/LiveDashboardScreen';
 
 
 // Unchanged — every existing route name, kept in one place so both
@@ -47,7 +48,9 @@ export type RootStackParamList = {
   RegisterIncharge: undefined;
   ManageIncharge: undefined;
   EditIncharge: { uid: string };
-  RecordProduction: undefined;
+  // lineId: open that line's existing session (Running Lines / overview);
+  // requestedAt makes a repeat tap on the same line open it again.
+  RecordProduction: { lineId?: string; requestedAt?: number } | undefined;
   RecordRejection: undefined;
   MaterialOrder: undefined;
   KPIReport: undefined;
@@ -66,6 +69,8 @@ export type RootStackParamList = {
   QualityAnalysis: undefined;
   AIAssistant: undefined;
   ModelPartProduction: undefined;
+  // Web: opened in a new tab by the admin overview's Live Dashboard button.
+  LiveDashboard: undefined;
 };
 
 const AuthStack = createNativeStackNavigator<RootStackParamList>();
@@ -128,6 +133,7 @@ function AppNavigator() {
       <AppStack.Screen name="QualityAnalysis" component={withScreenContainer(QualityAnalysisScreen)} />
       <AppStack.Screen name="AIAssistant" component={withScreenContainer(AIAssistantScreen)} />
       <AppStack.Screen name="ModelPartProduction" component={withScreenContainer(ModelPartProductionScreen)} />
+      <AppStack.Screen name="LiveDashboard" component={withScreenContainer(LiveDashboardScreen)} />
     </AppStack.Navigator>
   );
 }
@@ -186,6 +192,7 @@ const linking: LinkingOptions<RootStackParamList> = {
       QualityAnalysis: 'quality-analysis',
       AIAssistant: 'ai-assistant',
       ModelPartProduction: 'model-part-production',
+      LiveDashboard: 'live-dashboard',
     },
   },
 };

@@ -3,10 +3,15 @@
 // Excel export of one ProdPulse AI result table. It writes only the rows
 // utils/prodPulseAI buildResultExportTables made from the backend's
 // ResultBlock — the exact rows on screen, never anything the model wrote.
-// Web only (the assistant is web-only): a browser download, same library
-// and header colours as modelPartExcelExport.ts.
+// Web: a browser download. Android/iOS: written to the app's document
+// directory and handed to the share sheet — the same two paths as
+// reportExcelExport.ts. Same library and header colours as
+// modelPartExcelExport.ts.
 
+import { Platform } from 'react-native';
 import * as XLSX from 'xlsx-js-style';
+import * as FileSystem from 'expo-file-system/legacy';
+import * as Sharing from 'expo-sharing';
 import { buildResultExportTables, Cell, ResultBlock } from './prodPulseAI';
 
 const thin = { style: 'thin', color: { rgb: 'B7C4D4' } };
@@ -37,7 +42,7 @@ export function resultExportFileName(block: ResultBlock): string {
   return `ProdPulse_AI_${slug}.xlsx`;
 }
 
-export function exportResultToExcel(block: ResultBlock, generatedAt: string): void {
+export async function exportResultToExcel(block: ResultBlock, generatedAt: string): Promise<void> {
   const { info, table } = buildResultExportTables(block, generatedAt);
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(
@@ -52,5 +57,18 @@ export function exportResultToExcel(block: ResultBlock, generatedAt: string): vo
       'DATA'
     );
   }
-  XLSX.writeFile(wb, resultExportFileName(block), { bookType: 'xlsx' });
+  const fileName = resultExportFileName(block);
+  if (Platform.OS === 'web') {
+    XLSX.writeFile(wb, fileName, { bookType: 'xlsx' });
+    return;
+  }
+  const base64 = XLSX.write(wb, { type: 'base64', bookType: 'xlsx' });
+  const fileUri = `${FileSystem.documentDirectory}${fileName}`;
+  await FileSystem.writeAsStringAsync(fileUri, base64, { encoding: FileSystem.EncodingType.Base64 });
+  if (!(await Sharing.isAvailableAsync())) throw new Error('Sharing is not available on this device.');
+  await Sharing.shareAsync(fileUri, {
+    mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    dialogTitle: 'Export Prod AI result',
+    UTI: 'com.microsoft.excel.xlsx',
+  });
 }

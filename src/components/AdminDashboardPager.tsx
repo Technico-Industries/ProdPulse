@@ -4,6 +4,9 @@
 // one swipe to the left, the live line efficiency overview after it and the
 // live quality lines page last. The Quality In-charge dashboard uses the same
 // pager (QualityDashboardPager below): quality overview → live quality lines.
+// The plain Supervisor dashboard (SupervisorDashboardPager) is the
+// supervisor's own overview → Running Lines (every running line, to continue
+// another supervisor's session).
 // A horizontal paging ScrollView, so it follows the
 // finger on Android/iOS and on mobile web (react-native-web maps
 // pagingEnabled to CSS scroll-snap). Desktop browsers can't drag a scroll
@@ -19,6 +22,10 @@ import AdminOverviewScreen from '../screens/AdminOverviewScreen';
 import QualityOverviewScreen from '../screens/QualityOverviewScreen';
 import LineEfficiencyOverviewScreen from '../screens/LineEfficiencyOverviewScreen';
 import LiveQualityLinesScreen from '../screens/LiveQualityLinesScreen';
+import SupervisorOverviewScreen from '../screens/SupervisorOverviewScreen';
+import RunningLinesScreen from '../screens/RunningLinesScreen';
+import { Ionicons } from '@expo/vector-icons';
+import ProdAIButton from './ProdAIButton';
 
 interface Page {
   key: string;
@@ -42,15 +49,30 @@ const QUALITY_PAGES: Page[] = [
   { key: 'quality-lines', label: 'QC Lines', color: '#E0793C', Component: QualityLiveQualityLines },
 ];
 
+// Supervisor: own overview → every running line (supervisor handover).
+const SUPERVISOR_PAGES: Page[] = [
+  { key: 'overview', label: 'My Lines', color: '#3E7CB1', Component: SupervisorOverviewScreen },
+  { key: 'running-lines', label: 'Running Lines', color: '#4C9A6A', Component: RunningLinesScreen },
+];
+
+// The floating Prod AI launcher sits over the whole admin pager (not inside
+// one page), so it stays put on every page and is never clipped by a page's
+// ScrollView. It renders nothing for non-admins.
 export default function AdminDashboardPager() {
-  return <DashboardPager pages={ADMIN_PAGES} />;
+  return <DashboardPager pages={ADMIN_PAGES} overlay={<ProdAIButton />} />;
 }
 
 export function QualityDashboardPager() {
   return <DashboardPager pages={QUALITY_PAGES} />;
 }
 
-function DashboardPager({ pages: PAGES }: { pages: Page[] }) {
+// Shows a tappable "next page" arrow on the right edge, so the swipe is
+// discoverable; the tabs work as well (desktop web can't swipe).
+export function SupervisorDashboardPager() {
+  return <DashboardPager pages={SUPERVISOR_PAGES} edgeHint />;
+}
+
+function DashboardPager({ pages: PAGES, overlay, edgeHint }: { pages: Page[]; overlay?: React.ReactNode; edgeHint?: boolean }) {
   const scrollRef = useRef<ScrollView>(null);
   const [size, setSize] = useState<{ width: number; height: number } | null>(null);
   const [page, setPage] = useState(0);
@@ -88,6 +110,7 @@ function DashboardPager({ pages: PAGES }: { pages: Page[] }) {
           showsHorizontalScrollIndicator={false}
           onScroll={onScroll}
           scrollEventThrottle={16}
+          directionalLockEnabled
           keyboardShouldPersistTaps="handled"
           style={styles.root}
         >
@@ -120,6 +143,20 @@ function DashboardPager({ pages: PAGES }: { pages: Page[] }) {
           })}
         </View>
       </View>
+
+      {edgeHint && size && page < PAGES.length - 1 ? (
+        <Pressable
+          onPress={() => goTo(page + 1)}
+          hitSlop={8}
+          style={styles.edgeHint}
+          accessibilityRole="button"
+          accessibilityLabel={`Show ${PAGES[page + 1].label}`}
+        >
+          <Ionicons name="chevron-forward" size={18} color="#8A96A3" />
+        </Pressable>
+      ) : null}
+
+      {overlay}
     </View>
   );
 }
@@ -140,4 +177,21 @@ const styles = StyleSheet.create({
   tab: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 6, paddingHorizontal: 10, borderRadius: 999 },
   dot: { width: 6, height: 6, borderRadius: 3 },
   tabText: { color: '#8A96A3', fontSize: 12, fontWeight: '800' },
+  // Small, semi-transparent tab on the right edge, vertically centred.
+  edgeHint: {
+    position: 'absolute',
+    right: 0,
+    top: '50%',
+    marginTop: -22,
+    width: 22,
+    height: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderTopLeftRadius: 10,
+    borderBottomLeftRadius: 10,
+    backgroundColor: '#1C2228CC',
+    borderWidth: 1,
+    borderRightWidth: 0,
+    borderColor: '#2C343C',
+  },
 });

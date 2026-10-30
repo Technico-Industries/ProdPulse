@@ -50,7 +50,10 @@ export default function ProdAIPanel({ visible, onClose }: { visible: boolean; on
         />
         <KeyboardAvoidingView
           style={[styles.frame, position, layout === 'sheet' && { left: position.left ?? 0 }]}
-          behavior={Platform.OS === 'ios' ? 'padding' : Platform.OS === 'android' ? 'height' : undefined}
+          // 'padding' on both native platforms: the frame keeps its insets and
+          // the chat shrinks above the keyboard (Android is edge-to-edge, so
+          // the window itself doesn't resize for the keyboard).
+          behavior={Platform.OS === 'web' ? undefined : 'padding'}
           pointerEvents="box-none"
         >
           <View

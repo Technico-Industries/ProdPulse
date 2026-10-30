@@ -44,6 +44,7 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import WebRefreshButton from '../components/WebRefreshButton';
+import { PROD_AI_BUTTON_CLEARANCE } from '../utils/prodAIPanelLayout';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Svg, { Circle } from 'react-native-svg';
 import { collection, getDocs, onSnapshot, query, where } from 'firebase/firestore';
@@ -854,7 +855,8 @@ const styles = StyleSheet.create({
   rolePillText: { color: '#3E7CB1', fontSize: 10.5, fontWeight: '900', letterSpacing: 1 },
 
   // Bottom padding clears the pager's floating page tabs.
-  scroll: { paddingHorizontal: 16, paddingTop: 16, paddingBottom: 72, gap: 16 },
+  // Clears the pager's page tabs and the floating Prod AI button (admin).
+  scroll: { paddingHorizontal: 16, paddingTop: 16, paddingBottom: PROD_AI_BUTTON_CLEARANCE, gap: 16 },
 
   liveRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
   livePill: {

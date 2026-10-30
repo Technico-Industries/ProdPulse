@@ -50,3 +50,7 @@ export const prodPulseAI = onCall(
       },
     })
 );
+
+// Assembly TV dashboard read model (tvDashboard/assembly…) — additive, see
+// tvDashboard/functions.ts. Does not change prodPulseAI.
+export * from './tvDashboard/functions';

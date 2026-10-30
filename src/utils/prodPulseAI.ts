@@ -14,10 +14,11 @@
 
 // ─── Availability ────────────────────────────────────────────────────────────
 
-// The assistant is web-only. Android/iOS hide the menu entry and the screen
-// shows a notice instead of the chat.
+// Platforms the assistant runs on: the web app and the Android/iOS app (it
+// was web-only until the popup existed — the backend call, auth and admin
+// checks are the same everywhere). Anything else gets the notice screen.
 export function isProdPulseAIAvailable(platformOS: string): boolean {
-  return platformOS === 'web';
+  return platformOS === 'web' || platformOS === 'android' || platformOS === 'ios';
 }
 
 // Who gets the floating Prod AI button: an admin, on a platform where the

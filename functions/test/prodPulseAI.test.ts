@@ -197,10 +197,11 @@ async function main() {
   console.log('ProdPulse AI');
 
   // ── 1. Web only ─────────────────────────────────────────────────────────────
-  await test('1. available on web, hidden on Android / iOS (screen gate + floating button); not in the burger menu', () => {
+  await test('1. available on web, Android and iOS (screen gate + floating button); not in the burger menu', () => {
     assert.equal(isProdPulseAIAvailable('web'), true);
-    assert.equal(isProdPulseAIAvailable('android'), false);
-    assert.equal(isProdPulseAIAvailable('ios'), false);
+    assert.equal(isProdPulseAIAvailable('android'), true);
+    assert.equal(isProdPulseAIAvailable('ios'), true);
+    assert.equal(isProdPulseAIAvailable('windows'), false);
     // The burger menu no longer has a Prod AI entry on any platform.
     const routes = (os: string) => visibleMenuItems(ADMIN_MENU_ITEMS, os).map((i) => i.route);
     for (const os of ['web', 'android', 'ios']) assert.ok(!routes(os).includes('AIAssistant'), os);
@@ -212,8 +213,10 @@ async function main() {
     assert.equal(canOpenProdAI('supervisor', 'web'), false);
     assert.equal(canOpenProdAI(null, 'web'), false);
     assert.equal(canOpenProdAI(undefined, 'web'), false);
-    assert.equal(canOpenProdAI('admin', 'android'), false);
-    assert.equal(canOpenProdAI('admin', 'ios'), false);
+    assert.equal(canOpenProdAI('admin', 'android'), true);
+    assert.equal(canOpenProdAI('admin', 'ios'), true);
+    assert.equal(canOpenProdAI('supervisor', 'android'), false);
+    assert.equal(canOpenProdAI('supervisor', 'ios'), false);
   });
 
   // ── 2–5. Auth, admin, validation ────────────────────────────────────────────
