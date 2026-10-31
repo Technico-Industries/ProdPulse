@@ -6,7 +6,7 @@
 
 import assert from 'node:assert/strict';
 import {
-  buildWeekSummary, dashboardDays, liveLines, mondayOf, reasonLabel, rejectionTypes, stoppedLines, toDashboardRecord, toRunningRecord, DashboardRecord,
+  buildWeekSummary, dashboardDays, daySeries, groupQty, liveLines, mondayOf, productionBreakdown, toRejectionEntry, reasonLabel, rejectionTypes, rejectionsPerDay, stoppedLines, toDashboardRecord, toRunningRecord, DashboardRecord,
 } from '../src/utils/liveDashboard';
 import { counterQuality } from '../src/utils/qualityMetrics';
 import { filledSlotIndices } from '../src/utils/liveDashboard';
@@ -172,6 +172,65 @@ test('rejectionTypes: Σ rejectionQty per defect and per stage, high → low', (
   assert.equal(r.total, 13);
   assert.deepEqual(r.types.map((t) => [t.defect, t.qty, t.count]), [['Bush Miss', 7, 2], ['Plating NG', 5, 1], ['Unspecified', 1, 1]]);
   assert.deepEqual(r.stages, [{ stage: 'Process', qty: 7 }, { stage: 'Visual', qty: 5 }, { stage: 'Unspecified', qty: 1 }]);
+});
+
+test('rejectionsPerDay: Σ rejectionQty per date; later dates fold into today, older ones drop', () => {
+  const days = dashboardDays(TODAY);
+  const r = rejectionsPerDay([
+    { data: { date: TODAY, rejectionQty: 3 } },
+    { data: { date: TODAY, rejectionQty: 2 } },
+    { data: { date: '2026-10-28', rejectionQty: 4 } },
+    { data: { date: '2026-10-31', rejectionQty: 1 } },
+    { data: { date: '2026-10-01', rejectionQty: 9 } },
+    { data: { rejectionQty: 7 } },
+  ], days);
+  assert.equal(r.length, 7);
+  assert.deepEqual(r[6], { date: TODAY, qty: 6, count: 3 });
+  assert.deepEqual(r[4], { date: '2026-10-28', qty: 4, count: 1 });
+  assert.equal(r.reduce((n, d) => n + d.qty, 0), 10);
+});
+
+test('productionBreakdown: per line / per shift with the card formulas; stops-only groups kept', () => {
+  const records = [
+    rec('a', TODAY, 90, 100, { rejections: 2 }),
+    rec('b', TODAY, 60, 50, { lineId: 'L2', shift: 'B' }),
+    rec('c', TODAY, 10, 30, { shift: 'B' }),
+  ];
+  const intervals = [
+    { sessionKey: 'L3|x|A', lineId: 'L3', productionDate: TODAY, shift: 'A', stopId: 's1', reason: 'power', minutes: 12, running: false, source: 'summary' as const },
+  ];
+  const lines = productionBreakdown(records, intervals, 'line');
+  assert.deepEqual(lines.map((r) => [r.key, r.goodProduction, r.plan, r.lossParts]), [['L1', 100, 130, 30], ['L2', 60, 50, 0], ['L3', 0, 0, 0]]);
+  assert.equal(lines[0].achievementPct, 76.9);
+  assert.equal(lines[2].downtimeMinutes, 12);
+  const shifts = productionBreakdown(records, intervals, 'shift');
+  assert.deepEqual(shifts.map((r) => [r.key, r.goodProduction, r.downtimeMinutes]), [['A', 90, 12], ['B', 70, 0]]);
+});
+
+test('daySeries: one line\'s days match buildWeekSummary for that line alone', () => {
+  const records = [rec('a', TODAY, 90, 100), rec('b', '2026-10-28', 40, 50), rec('c', TODAY, 999, 999, { lineId: 'L2' })];
+  const own = records.filter((r) => r.lineId === 'L1');
+  const series = daySeries(dashboardDays(TODAY), TODAY, own, []);
+  const w = buildWeekSummary({ todayKey: TODAY, nowMs: Date.now(), ...empty, records: own });
+  assert.deepEqual(series, w.days);
+  assert.equal(w.records.length, 2);
+});
+
+test('groupQty + toRejectionEntry: Record Rejection entries grouped high → low', () => {
+  const entries = [
+    { defect: ' Bush Miss ', rejectionQty: 3, lineId: 'L1', shift: 'A', reportedBy: { name: 'QI' } },
+    { defect: 'Plating NG', rejectionQty: 5, lineId: 'L2' },
+    { defect: 'Bush Miss', rejectionQty: 4, lineId: 'L1' },
+    { rejectionQty: 'x' },
+  ].map(toRejectionEntry);
+  assert.equal(entries[0].defect, 'Bush Miss');
+  assert.equal(entries[0].reportedBy, 'QI');
+  assert.equal(entries[3].defect, 'Unspecified');
+  assert.equal(entries[3].qty, 0);
+  assert.deepEqual(groupQty(entries, (e) => e.defect, (e) => e.qty), [
+    { key: 'Bush Miss', qty: 7, count: 2 }, { key: 'Plating NG', qty: 5, count: 1 }, { key: 'Unspecified', qty: 0, count: 1 },
+  ]);
+  assert.deepEqual(groupQty(entries, (e) => e.lineId ?? '—', (e) => e.qty).map((r) => r.key), ['L1', 'L2', '—']);
 });
 
 test('liveLines: Running Lines cards + slot output, stop, session downtime', () => {

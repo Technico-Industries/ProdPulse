@@ -22,6 +22,7 @@ import {
   DowntimeRecordStopLike,
   DowntimeSessionLike,
   DowntimeSummaryLike,
+  DowntimeInterval,
   collectDowntimeIntervals,
   downtimeByReason,
   downtimeBySession,
@@ -78,7 +79,11 @@ export interface WeekSummary {
   runningStops: number;             // stops still running now (today's live sessions)
   calendarWeek: CalendarWeek;       // plan vs actual, Monday → Sunday of this week
   downtimeBySession: Map<string, number>; // `${lineId}|${productionDate}|${shift}` → minutes
+  records: DashboardRecord[];       // the week's records (drill-down views)
+  intervals: DowntimeInterval[];    // the week's stops, each once (drill-down views)
 }
+
+export type Figures = Omit<DaySummary, 'productionDate' | 'isToday'>;
 
 const round1 = (n: number) => Math.round(n * 10) / 10;
 const round2 = (n: number) => Math.round(n * 100) / 100;
@@ -108,7 +113,7 @@ export function toDashboardRecord(id: string, data: any, createdAtMs: number | n
   };
 }
 
-function figuresOf(records: DashboardRecord[], downtimeMinutes: number) {
+function figuresOf(records: DashboardRecord[], downtimeMinutes: number): Figures {
   let goodProduction = 0;
   let plan = 0;
   let lossParts = 0;
@@ -156,19 +161,7 @@ export function buildWeekSummary(input: {
     input.nowMs
   );
 
-  const downtimeByDay = new Map<string, number>();
-  intervals.forEach((iv) => {
-    if (iv.productionDate) downtimeByDay.set(iv.productionDate, (downtimeByDay.get(iv.productionDate) ?? 0) + iv.minutes);
-  });
-
-  const byDay = new Map<string, DashboardRecord[]>(days.map((d) => [d, []]));
-  records.forEach((r) => byDay.get(r.productionDate!)!.push(r));
-
-  const daySummaries: DaySummary[] = days.map((d) => ({
-    productionDate: d,
-    isToday: d === input.todayKey,
-    ...figuresOf(byDay.get(d)!, downtimeByDay.get(d) ?? 0),
-  }));
+  const daySummaries = daySeries(days, input.todayKey, records, intervals);
   return {
     days: daySummaries,
     downtimeReasons: downtimeByReason(intervals).map((r) => ({ ...r, label: reasonLabel(r.reason) })),
@@ -176,6 +169,97 @@ export function buildWeekSummary(input: {
     runningStops: intervals.filter((iv) => iv.running).length,
     calendarWeek: calendarWeek(input.todayKey, daySummaries, records),
     downtimeBySession: downtimeBySession(intervals),
+    records,
+    intervals,
+  };
+}
+
+// Per-day figures for `days` (oldest first) from any subset of the week's
+// records and stops — the whole plant, or one line in a drill-down.
+export function daySeries(days: string[], todayKey: string, records: DashboardRecord[], intervals: DowntimeInterval[]): DaySummary[] {
+  const downtimeByDay = new Map<string, number>();
+  intervals.forEach((iv) => {
+    if (iv.productionDate) downtimeByDay.set(iv.productionDate, (downtimeByDay.get(iv.productionDate) ?? 0) + iv.minutes);
+  });
+  const byDay = new Map<string, DashboardRecord[]>(days.map((d) => [d, []]));
+  records.forEach((r) => (r.productionDate ? byDay.get(r.productionDate)?.push(r) : undefined));
+  return days.map((d) => ({
+    productionDate: d,
+    isToday: d === todayKey,
+    ...figuresOf(byDay.get(d)!, downtimeByDay.get(d) ?? 0),
+  }));
+}
+
+// ─── Drill-down breakdowns (card detail views) ───────────────────────────────
+
+export interface BreakdownRow extends Figures { key: string }
+
+// The Admin Overview figures per line or per shift. A group with stops but
+// no saved records still gets a row (its downtime), so no stop is hidden.
+export function productionBreakdown(records: DashboardRecord[], intervals: DowntimeInterval[], by: 'line' | 'shift'): BreakdownRow[] {
+  const keyOf = (v: { lineId: string | null; shift: string | null }) => (by === 'line' ? v.lineId : v.shift) ?? '—';
+  const recs = new Map<string, DashboardRecord[]>();
+  const mins = new Map<string, number>();
+  records.forEach((r) => {
+    const k = keyOf(r);
+    const list = recs.get(k);
+    if (list) list.push(r);
+    else recs.set(k, [r]);
+  });
+  intervals.forEach((iv) => {
+    const k = keyOf(iv);
+    mins.set(k, (mins.get(k) ?? 0) + iv.minutes);
+  });
+  const keys = new Set([...recs.keys(), ...mins.keys()]);
+  const rows = Array.from(keys, (key) => ({ key, ...figuresOf(recs.get(key) ?? [], mins.get(key) ?? 0) }));
+  return by === 'shift'
+    ? rows.sort((a, b) => a.key.localeCompare(b.key))
+    : rows.sort((a, b) => b.goodProduction - a.goodProduction || b.downtimeMinutes - a.downtimeMinutes || a.key.localeCompare(b.key));
+}
+
+export interface QtyRow { key: string; qty: number; count: number }
+
+// Σ qty per key, high → low (ties by key).
+export function groupQty<T>(items: T[], keyOf: (t: T) => string, qtyOf: (t: T) => number): QtyRow[] {
+  const map = new Map<string, QtyRow>();
+  items.forEach((t) => {
+    const key = keyOf(t);
+    const row = map.get(key) ?? { key, qty: 0, count: 0 };
+    row.qty += qtyOf(t);
+    row.count += 1;
+    map.set(key, row);
+  });
+  return Array.from(map.values()).sort((a, b) => b.qty - a.qty || a.key.localeCompare(b.key));
+}
+
+// One Record Rejection entry (rejectionRecords document), as the drill-down uses it.
+export interface RejectionEntry {
+  date: string | null;
+  shift: string | null;
+  lineId: string | null;
+  lineName: string | null;
+  partName: string | null;
+  defect: string;
+  stage: string | null;
+  qty: number;
+  reportedBy: string | null;
+  createdAtMs: number | null;
+}
+
+const text = (v: unknown): string | null => (typeof v === 'string' && v.trim() ? v.trim() : null);
+
+export function toRejectionEntry(data: any): RejectionEntry {
+  return {
+    date: text(data?.date),
+    shift: text(data?.shift),
+    lineId: text(data?.lineId),
+    lineName: text(data?.lineName),
+    partName: text(data?.partName),
+    defect: text(data?.defect) ?? 'Unspecified',
+    stage: text(data?.stage),
+    qty: num(data?.rejectionQty) ?? 0,
+    reportedBy: text(data?.reportedBy?.name),
+    createdAtMs: timestampToMillis(data?.createdAt),
   };
 }
 
@@ -281,8 +365,7 @@ export interface RejectionTypes {
 
 // rejectionRecords grouped like the Quality Report (QualityOverviewScreen
 // aggregateQty): Σ rejectionQty per key, sorted high → low. These are the
-// Record Rejection entries — a separate log from the production counter, so
-// their total can differ from "Rejections per day".
+// Record Rejection entries — a separate log from the production counter.
 export function rejectionTypes(docs: { data: any }[]): RejectionTypes {
   const byDefect = new Map<string, RejectionTypeRow>();
   const byStage = new Map<string, number>();
@@ -304,6 +387,29 @@ export function rejectionTypes(docs: { data: any }[]): RejectionTypes {
     types: Array.from(byDefect.values()).sort((a, b) => b.qty - a.qty || a.defect.localeCompare(b.defect)),
     stages: Array.from(byStage, ([stage, qty]) => ({ stage, qty })).sort((a, b) => b.qty - a.qty),
   };
+}
+
+export interface RejectionDay { date: string; qty: number; count: number }
+
+// "Rejections per day": Σ rejectionQty of the Record Rejection entries
+// (rejectionRecords, logged by the quality incharge) per date, one row per
+// dashboard day, oldest first. rejectionRecords.date is a calendar date; an
+// entry dated after the last day (a new calendar day before the 06:30
+// production-day cutover) is counted on the last day — today.
+export function rejectionsPerDay(docs: { data: any }[], dayKeys: string[]): RejectionDay[] {
+  const out = dayKeys.map((date) => ({ date, qty: 0, count: 0 }));
+  if (!out.length) return out;
+  const index = new Map(dayKeys.map((k, i) => [k, i]));
+  const last = dayKeys[dayKeys.length - 1];
+  docs.forEach(({ data }) => {
+    const date = typeof data?.date === 'string' ? data.date : null;
+    if (!date) return;
+    const i = index.get(date) ?? (date > last ? out.length - 1 : undefined);
+    if (i == null) return;
+    out[i].qty += num(data?.rejectionQty) ?? 0;
+    out[i].count += 1;
+  });
+  return out;
 }
 
 // ─── Running lines page (swipe right on the dashboard) ───────────────────────

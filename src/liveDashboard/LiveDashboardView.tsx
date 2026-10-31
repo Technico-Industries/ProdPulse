@@ -6,12 +6,13 @@
 // Display only: every figure comes from useLiveWeekData / utils/liveDashboard;
 // charts.tsx animates the transitions between live updates.
 
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import type { LiveWeekData } from './useLiveWeekData';
 import {
-  AnimatedNumber, BarChart, DayPoint, Gauge, PlanActualChart, ReasonBars, RejectionTypeBars, RotatingPanel,
-  Sparkline, StoppedLinesBoard, TrendChart, fmtInt, fmtMinutes, fmtPct, useFlash,
+  AnimatedNumber, BarChart, DayPoint, Gauge, LineTrendChart, PlanActualChart, ReasonBars, RejectionTypeBars, RotatingPanel,
+  Sparkline, StoppedLinesBoard, TrendChart, fmtInt, fmtMinutes, fmtPct, openProps, useFlash,
 } from './charts';
+import DetailView, { DetailKey } from './DetailView';
 import { LIVE_DASHBOARD_CSS } from './styles';
 import Pager from './Pager';
 import RunningLinesPage from './RunningLinesPage';
@@ -28,6 +29,10 @@ function dayLabel(key: string, opts: Intl.DateTimeFormatOptions = { weekday: 'sh
   // A production date is a calendar label, not an instant: format in UTC.
   return new Intl.DateTimeFormat('en-IN', { ...opts, timeZone: 'UTC' }).format(new Date(Date.UTC(+m[1], +m[2] - 1, +m[3])));
 }
+
+// Record Rejection qty as a share of that day's parts (good + rejected).
+const rejRate = (rejected: number, good: number) =>
+  good + rejected > 0 ? Math.round((rejected / (good + rejected)) * 1000) / 10 : null;
 
 const clock = (ms: number, seconds = true) =>
   new Intl.DateTimeFormat('en-IN', { hour: '2-digit', minute: '2-digit', ...(seconds ? { second: '2-digit' } : {}), hour12: false, timeZone: TZ }).format(new Date(ms));
@@ -62,13 +67,13 @@ function FullscreenButton() {
   );
 }
 
-function Kpi({ label, value, flashKey, sub, alert, tone, spark, children }: {
+function Kpi({ label, value, flashKey, sub, alert, tone, spark, children, onOpen }: {
   label: string; value?: React.ReactNode; flashKey: unknown; sub?: React.ReactNode; alert?: boolean;
-  tone: 'good' | 'reject' | 'loss'; spark?: number[]; children?: React.ReactNode;
+  tone: 'good' | 'reject' | 'loss'; spark?: number[]; children?: React.ReactNode; onOpen?: () => void;
 }) {
   const flash = useFlash(flashKey);
   return (
-    <section className={`ld-kpi ld-kpi--${tone}${alert ? ' ld-kpi--alert' : ''}${flash ? ' is-updated' : ''}`}>
+    <section className={`ld-kpi ld-kpi--${tone}${alert ? ' ld-kpi--alert' : ''}${flash ? ' is-updated' : ''}${onOpen ? ' is-clickable' : ''}`} {...openProps(onOpen, label)}>
       <h2 className="ld-kpi__label">{label}</h2>
       {value != null ? <div className="ld-kpi__value">{value}</div> : null}
       {children}
@@ -78,15 +83,50 @@ function Kpi({ label, value, flashKey, sub, alert, tone, spark, children }: {
   );
 }
 
-function Panel({ title, legend, meta, children, className = '' }: { title: string; legend?: React.ReactNode; meta?: React.ReactNode; children: React.ReactNode; className?: string }) {
+function Panel({ title, legend, meta, children, className = '', onOpen }: { title: string; legend?: React.ReactNode; meta?: React.ReactNode; children: React.ReactNode; className?: string; onOpen?: () => void }) {
   return (
-    <section className={`ld-panel ${className}`}>
+    <section className={`ld-panel ${className}${onOpen ? ' is-clickable' : ''}`} {...openProps(onOpen, title)}>
       <header className="ld-panel__head">
         <h2 className="ld-panel__title">{title}</h2>
         {legend ?? (meta ? <span className="ld-panel__meta">{meta}</span> : null)}
       </header>
       {children}
     </section>
+  );
+}
+
+// Scrolling strip of the latest live events: lines stopped right now and
+// today's Record Rejection entries, newest first. Pauses on hover.
+function Ticker({ data }: { data: LiveWeekData }) {
+  const items: { key: string; at: number; node: React.ReactNode }[] = [];
+  (data.stopped ?? []).forEach((l) => items.push({
+    key: `s-${l.lineId}`,
+    at: l.sinceMs ?? 0,
+    node: <><i className="ld-ticker__dot ld-ticker__dot--stop" /><b>{l.lineName}</b> stopped · {l.reason ?? 'reason not recorded'}{l.sinceMs ? <time>since {clock(l.sinceMs, false)}</time> : null}</>,
+  }));
+  (data.rejectionEntries ?? [])
+    .filter((e) => e.date === data.rejTodayKey && e.qty > 0)
+    .sort((a, b) => (b.createdAtMs ?? 0) - (a.createdAtMs ?? 0))
+    .slice(0, 12)
+    .forEach((e, i) => items.push({
+      key: `r-${e.createdAtMs ?? 0}-${i}`,
+      at: e.createdAtMs ?? 0,
+      node: <><i className="ld-ticker__dot ld-ticker__dot--reject" /><b>{e.lineName ?? (e.lineId ? data.lineNames[e.lineId] ?? e.lineId : 'Unknown line')}</b>{e.partName ? ` · ${e.partName}` : ''} · {e.defect} <b>{fmtInt(e.qty)} pcs</b>{e.createdAtMs ? <time>{clock(e.createdAtMs, false)}</time> : null}</>,
+    }));
+  items.sort((a, b) => b.at - a.at);
+  return (
+    <div className="ld-ticker" aria-label="Latest events">
+      <span className="ld-ticker__tag"><i aria-hidden="true" />LIVE FEED</span>
+      {items.length ? (
+        <div className="ld-ticker__view">
+          <div className="ld-ticker__track" style={{ animationDuration: `${Math.max(30, items.length * 9)}s` }}>
+            {items.map((it) => <span key={it.key} className="ld-ticker__item">{it.node}</span>)}
+          </div>
+        </div>
+      ) : (
+        <span className="ld-ticker__calm">All live lines running · no rejections logged today</span>
+      )}
+    </div>
   );
 }
 
@@ -103,6 +143,9 @@ function StateScreen({ tone, title, body, spinner }: { tone: 'neutral' | 'critic
 export default function LiveDashboardView({ data, deniedMessage }: { data: LiveWeekData | null; deniedMessage?: string }) {
   const week = data?.week ?? null;
   const [page, setPage] = useState(0);
+  const [detail, setDetail] = useState<DetailKey | null>(null);
+  const closeDetail = useCallback(() => setDetail(null), []);
+  const open = (kind: Exclude<DetailKey['kind'], 'line'>) => () => setDetail({ kind } as DetailKey);
   const paged = !deniedMessage && !!data && data.status === 'ready' && !!week;
   const live = data && data.status === 'ready' && !data.reconnecting;
 
@@ -121,6 +164,7 @@ export default function LiveDashboardView({ data, deniedMessage }: { data: LiveW
     const empty = week.totals.recordCount === 0 && week.totals.downtimeMinutes === 0;
     const cw = week.calendarWeek;
     const rt = data.rejectionTypes;
+    const rd = data.rejectionDays;
     const series = <K extends keyof (typeof week.days)[number]>(k: K) => week.days.map((d) => (typeof d[k] === 'number' ? (d[k] as number) : 0));
 
     body = (
@@ -131,7 +175,7 @@ export default function LiveDashboardView({ data, deniedMessage }: { data: LiveW
             <div className="ld-banner ld-banner--warning"><b>!</b>Downtime / stopped lines may be incomplete — could not read {data.failedSources.filter((n) => n !== 'rejectionRecords').join(', ')}.</div>
           ) : null}
           {data.failedSources.includes('rejectionRecords') ? (
-            <div className="ld-banner ld-banner--warning"><b>!</b>Types of rejection unavailable — could not read rejectionRecords.</div>
+            <div className="ld-banner ld-banner--warning"><b>!</b>Rejections per day / types of rejection unavailable — could not read rejectionRecords.</div>
           ) : null}
           {empty ? <div className="ld-banner ld-banner--info"><b>i</b>No production recorded in the last 7 production days yet. The charts update automatically as soon as data arrives.</div> : null}
         </div>
@@ -139,35 +183,36 @@ export default function LiveDashboardView({ data, deniedMessage }: { data: LiveW
         <Pager
           index={page}
           onIndex={setPage}
+          keyboard={!detail}
           pages={[
             <React.Fragment key="overview">
         <div className="ld-kpis">
           <Kpi
-            tone="good" label="Good production · today" flashKey={today.goodProduction} spark={series('goodProduction')}
+            onOpen={open('good')} tone="good" label="Good production · today" flashKey={today.goodProduction} spark={series('goodProduction')}
             value={<><AnimatedNumber value={today.goodProduction} format={fmtInt} /><small>pcs</small></>}
             sub={<>Plan <b>{fmtInt(today.plan)}</b> pcs</>}
           />
-          <Kpi tone="good" label="Achievement · today" flashKey={today.achievementPct} sub="Good ÷ plan">
+          <Kpi onOpen={open('achievement')} tone="good" label="Achievement · today" flashKey={today.achievementPct} sub="Good ÷ plan">
             <Gauge pct={today.achievementPct} />
           </Kpi>
           <Kpi
-            tone="reject" label="Rejections · today" flashKey={today.rejectedParts} spark={series('rejectedParts')}
+            onOpen={open('rejToday')} tone="reject" label="Rejections · today" flashKey={today.rejectedParts} spark={series('rejectedParts')}
             value={<><AnimatedNumber value={today.rejectedParts} format={fmtInt} /><small>pcs</small></>}
             sub={<>Rate <b>{fmtPct(today.rejectionPct)}</b> · Quality <b>{fmtPct(today.qualityPct)}</b></>}
           />
           <Kpi
-            tone="loss" label="Production loss · today" flashKey={today.lossParts} spark={series('lossParts')}
+            onOpen={open('lossToday')} tone="loss" label="Production loss · today" flashKey={today.lossParts} spark={series('lossParts')}
             value={<><AnimatedNumber value={today.lossParts} format={fmtInt} /><small>pcs</small></>}
             sub="Parts short of plan"
           />
           <Kpi
-            tone="loss" label="Downtime · today" flashKey={Math.round(today.downtimeMinutes)} spark={series('downtimeMinutes')}
+            onOpen={open('downtimeToday')} tone="loss" label="Downtime · today" flashKey={Math.round(today.downtimeMinutes)} spark={series('downtimeMinutes')}
             alert={week.runningStops > 0}
             value={<AnimatedNumber value={today.downtimeMinutes} format={fmtMinutes} />}
             sub={week.runningStops ? <span className="ld-running"><i />{week.runningStops} stop{week.runningStops === 1 ? '' : 's'} running now</span> : 'No line stopped'}
           />
           <Kpi
-            tone="good" label="Last 7 days" flashKey={week.totals.goodProduction} spark={series('achievementPct')}
+            onOpen={open('week')} tone="good" label="Last 7 days" flashKey={week.totals.goodProduction} spark={series('achievementPct')}
             value={<><AnimatedNumber value={week.totals.goodProduction} format={fmtInt} /><small>pcs</small></>}
             sub={<>Achievement <b>{fmtPct(week.totals.achievementPct)}</b> · Rej <b>{fmtInt(week.totals.rejectedParts)}</b></>}
           />
@@ -177,6 +222,7 @@ export default function LiveDashboardView({ data, deniedMessage }: { data: LiveW
           <Panel
             className="ld-span2"
             title="Production trend · last 7 days"
+            onOpen={open('trend')}
             legend={
               <span className="ld-legend">
                 <span><i className="ld-sw ld-sw--good" />Good production</span>
@@ -201,6 +247,7 @@ export default function LiveDashboardView({ data, deniedMessage }: { data: LiveW
 
           <Panel
             title="Plan vs actual · this week"
+            onOpen={open('planActual')}
             legend={
               <span className="ld-legend ld-legend--sm">
                 <span><i className="ld-sw ld-sw--box ld-sw--planbox" />Plan</span>
@@ -224,28 +271,41 @@ export default function LiveDashboardView({ data, deniedMessage }: { data: LiveW
           <Panel
             className={data.stopped?.length ? 'ld-panel--alert' : ''}
             title="Stopped lines · now"
+            onOpen={open('stopped')}
             meta={data.stopped ? <><b className={data.stopped.length ? 'ld-crit' : 'ld-ok'}>{data.stopped.length}</b> of {data.activeLineCount} live</> : undefined}
           >
             {data.stopped ? <StoppedLinesBoard lines={data.stopped} activeCount={data.activeLineCount} /> : <div className="ld-empty">Loading live lines…</div>}
           </Panel>
 
-          <Panel title="Rejections per day" meta="Rejected parts">
-            <BarChart
-              title="Rejected parts"
-              tone="reject"
-              unit="pcs"
-              format={(v) => fmtInt(v)}
-              days={days}
-              values={week.days.map((d) => d.rejectedParts ?? 0)}
-              extra={(i) => [{ label: 'Rejection rate', value: fmtPct(week.days[i].rejectionPct) }, { label: 'Quality', value: fmtPct(week.days[i].qualityPct) }]}
-              rows={[
-                { label: 'Pcs', values: week.days.map((d) => fmtInt(d.rejectedParts)) },
-                { label: 'Rate', values: week.days.map((d) => fmtPct(d.rejectionPct)) },
-              ]}
-            />
+          <Panel onOpen={open('rejPerDay')} title="Rejections per day" meta={rd ? <>Total <b>{fmtInt(rd.reduce((n, d) => n + d.qty, 0))}</b> pcs</> : 'Record Rejection'}>
+            {rd ? (
+              <>
+                <BarChart
+                  title="Rejected parts"
+                  tone="reject"
+                  unit="pcs"
+                  format={(v) => fmtInt(v)}
+                  days={days}
+                  values={rd.map((d) => d.qty)}
+                  extra={(i) => [
+                    { label: 'Entries', value: fmtInt(rd[i].count) },
+                    { label: 'Rejection rate', value: fmtPct(rejRate(rd[i].qty, week.days[i].goodProduction)) },
+                  ]}
+                  rows={[
+                    { label: 'Pcs', values: rd.map((d) => fmtInt(d.qty)) },
+                    { label: 'Rate', values: rd.map((d, i) => fmtPct(rejRate(d.qty, week.days[i].goodProduction))) },
+                  ]}
+                />
+                <div className="ld-note">From Record Rejection entries (quality incharge)</div>
+              </>
+            ) : data.failedSources.includes('rejectionRecords') ? (
+              <div className="ld-empty">Rejections unavailable.</div>
+            ) : (
+              <div className="ld-empty">Loading rejections…</div>
+            )}
           </Panel>
 
-          <Panel title="Types of rejection · 7 days" meta={rt ? <>Total <b>{fmtInt(rt.total)}</b> pcs</> : undefined}>
+          <Panel onOpen={open('rejTypes')} title="Types of rejection · 7 days" meta={rt ? <>Total <b>{fmtInt(rt.total)}</b> pcs</> : undefined}>
             {rt ? (
               <>
                 {rt.stages.length ? (
@@ -265,7 +325,7 @@ export default function LiveDashboardView({ data, deniedMessage }: { data: LiveW
             )}
           </Panel>
 
-          <Panel title="Production loss per day" meta="Parts short of plan">
+          <Panel onOpen={open('lossPerDay')} title="Production loss per day" meta="Parts short of plan">
             <BarChart
               title="Production loss"
               tone="loss"
@@ -279,6 +339,7 @@ export default function LiveDashboardView({ data, deniedMessage }: { data: LiveW
           </Panel>
 
           <RotatingPanel
+            onOpen={open('downtime')}
             views={[
               {
                 title: 'Downtime by reason · 7 days',
@@ -286,10 +347,10 @@ export default function LiveDashboardView({ data, deniedMessage }: { data: LiveW
                 body: <ReasonBars items={week.downtimeReasons} total={week.totals.downtimeMinutes} />,
               },
               {
-                title: 'Downtime per day',
-                meta: 'Minutes lost to stops',
+                title: 'Downtime trend · 7 days',
+                meta: 'Minutes lost to stops per day',
                 body: (
-                  <BarChart
+                  <LineTrendChart
                     title="Downtime"
                     tone="loss"
                     unit="min"
@@ -303,10 +364,12 @@ export default function LiveDashboardView({ data, deniedMessage }: { data: LiveW
             ]}
           />
         </div>
+        <Ticker data={data} />
             </React.Fragment>,
-            <RunningLinesPage key="lines" lines={data.lines} active={page === 1} />,
+            <RunningLinesPage key="lines" lines={data.lines} active={page === 1 && !detail} onOpenLine={(lineId) => setDetail({ kind: 'line', lineId })} />,
           ]}
         />
+        {detail ? <DetailView data={data} detail={detail} days={days} dayLabel={(k) => dayLabel(k)} onClose={closeDetail} /> : null}
       </>
     );
   }

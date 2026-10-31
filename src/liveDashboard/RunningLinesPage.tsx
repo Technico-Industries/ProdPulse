@@ -13,7 +13,7 @@ import React, { useEffect, useState } from 'react';
 import type { LiveLine, LiveSlot } from '../utils/liveDashboard';
 import { RUNNING_STATUS_COLORS, RUNNING_STATUS_LABELS, RunningStatus } from '../utils/supervisorHandover';
 import { BAND_COLORS, efficiencyBand } from '../utils/lineEfficiency';
-import { AnimatedNumber, fmtInt, fmtMinutes, fmtPct, useFlash, useTween } from './charts';
+import { AnimatedNumber, fmtInt, fmtMinutes, fmtPct, openProps, useFlash, useTween } from './charts';
 
 function useSecondTick(active: boolean) {
   const [now, setNow] = useState(() => Date.now());
@@ -108,7 +108,7 @@ function Ring({ pct }: { pct: number | null }) {
   );
 }
 
-function LineTile({ line, now, dense, order }: { line: LiveLine; now: number; dense: boolean; order: number }) {
+function LineTile({ line, now, dense, order, onOpen }: { line: LiveLine; now: number; dense: boolean; order: number; onOpen?: () => void }) {
   const c = line.card;
   // The card itself is only red (stopped) or the running look; "awaiting
   // entry" is marked by its badge, the hour dots and one line of text.
@@ -124,7 +124,8 @@ function LineTile({ line, now, dense, order }: { line: LiveLine; now: number; de
 
   return (
     <article
-      className={`ll-card ll-card--${tone}${dense ? ' ll-card--dense' : ''}${flash ? ' is-updated' : ''}`}
+      className={`ll-card ll-card--${tone}${dense ? ' ll-card--dense' : ''}${flash ? ' is-updated' : ''}${onOpen ? ' is-clickable' : ''}`}
+      {...openProps(onOpen, c.lineName)}
       style={{ ['--st' as any]: color, animationDelay: `${order * 0.06}s` }}
     >
       <div className="ll-card__accent" aria-hidden="true" />
@@ -185,7 +186,7 @@ function Chip({ status, count }: { status: RunningStatus; count: number }) {
   );
 }
 
-export default function RunningLinesPage({ lines, active }: { lines: LiveLine[] | null; active: boolean }) {
+export default function RunningLinesPage({ lines, active, onOpenLine }: { lines: LiveLine[] | null; active: boolean; onOpenLine?: (lineId: string) => void }) {
   const anyStopped = !!lines?.some((l) => l.card.status === 'stopped');
   const now = useSecondTick(anyStopped && active);
 
@@ -213,7 +214,7 @@ export default function RunningLinesPage({ lines, active }: { lines: LiveLine[] 
       {lines.length ? (
         // Re-keyed on activation so the cards animate in each time the page is shown.
         <div key={active ? 'shown' : 'hidden'} className="ll-grid" style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`, gridTemplateRows: `repeat(${rows}, minmax(0, 1fr))` }}>
-          {lines.map((l, i) => <LineTile key={l.card.lineId} line={l} now={now} dense={rows > 2} order={i} />)}
+          {lines.map((l, i) => <LineTile key={l.card.lineId} line={l} now={now} dense={rows > 2} order={i} onOpen={onOpenLine ? () => onOpenLine(l.card.lineId) : undefined} />)}
         </div>
       ) : (
         <div className="ld-empty">No line is in production right now. Lines appear here as soon as a supervisor starts a session.</div>

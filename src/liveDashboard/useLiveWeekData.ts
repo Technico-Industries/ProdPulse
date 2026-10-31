@@ -11,7 +11,8 @@
 //   activeSessions     all (running stops count up to now)
 //   endedSessions      productionDate in [from, to]
 //   shiftSummaries     productionDate in [from, to]
-//   rejectionRecords   date in [from, to] (calendar dates — Record Rejection's own field)
+//   rejectionRecords   date in [from, to] (calendar dates — Record Rejection's own field);
+//                      Types of rejection + Rejections per day
 //   productionLines    read once — part names for each line's current model
 //
 // The two record queries are merged by utils/productionDay
@@ -38,8 +39,8 @@ import {
 } from '../utils/productionDay';
 import { localDateKey } from '../utils/rejectionDate';
 import {
-  DASHBOARD_DAYS, DashboardRecord, LiveLine, RejectionTypes, StoppedLine, WeekSummary,
-  buildWeekSummary, liveLines, rejectionTypes, stoppedLines, toDashboardRecord, toRunningRecord,
+  DASHBOARD_DAYS, DashboardRecord, LiveLine, RejectionDay, RejectionEntry, RejectionTypes, StoppedLine, WeekSummary,
+  buildWeekSummary, dashboardDays, liveLines, rejectionTypes, rejectionsPerDay, stoppedLines, toRejectionEntry, toDashboardRecord, toRunningRecord,
 } from '../utils/liveDashboard';
 import type { LinePartsLookup } from '../utils/supervisorHandover';
 
@@ -65,6 +66,11 @@ export interface LiveWeekData {
   stopped: StoppedLine[] | null;      // lines stopped right now (null until activeSessions loads)
   activeLineCount: number;            // lines with a live session
   rejectionTypes: RejectionTypes | null; // null until rejectionRecords loads
+  rejectionDays: RejectionDay[] | null;  // Record Rejection qty per dashboard day, null until loaded
+  rejectionEntries: RejectionEntry[] | null; // every Record Rejection entry in the window (drill-downs)
+  rejTodayKey: string;                // calendar today — rejectionRecords.date of today's entries
+  rejFromKey: string;                 // first calendar date of "Types of rejection · 7 days"
+  lineNames: Record<string, string>;  // lineId → display name
   lines: LiveLine[] | null;           // every live session with its production details
 }
 
@@ -95,10 +101,14 @@ export function useLiveWeekData(): LiveWeekData {
   const fromKey = addDaysToKey(todayKey, -(DASHBOARD_DAYS - 1));
   const rejTo = localDateKey(nowMs);
   const rejFrom = addDaysToKey(rejTo, -(DASHBOARD_DAYS - 1));
+  // Rejections per day also needs the oldest production day, which before
+  // 06:30 is one calendar day earlier than rejFrom.
+  const rejQueryFrom = fromKey < rejFrom ? fromKey : rejFrom;
 
   const [sources, setSources] = useState<Record<SourceName, SourceState>>(EMPTY);
   const [lastUpdateMs, setLastUpdateMs] = useState<number | null>(null);
   const [partsByLine, setPartsByLine] = useState<LinePartsLookup>({});
+  const [storedLineNames, setStoredLineNames] = useState<Record<string, string>>({});
 
   // Part names per line (the same aliases RunningLinesScreen reads), once.
   useEffect(() => {
@@ -107,8 +117,11 @@ export function useLiveWeekData(): LiveWeekData {
       .then((snap) => {
         if (cancelled) return;
         const map: LinePartsLookup = {};
+        const names: Record<string, string> = {};
         snap.docs.forEach((d) => {
           const data: any = d.data();
+          const name = data.lineName ?? data.name;
+          if (typeof name === 'string' && name.trim()) names[d.id] = name.trim();
           const parts =
             Array.isArray(data.parts) && data.parts.length ? data.parts :
             Array.isArray(data.models) && data.models.length ? data.models :
@@ -116,6 +129,7 @@ export function useLiveWeekData(): LiveWeekData {
           map[d.id] = parts.map((p: any) => ({ name: p?.name ?? p?.partName ?? '' }));
         });
         setPartsByLine(map);
+        setStoredLineNames(names);
       })
       .catch((e) => console.warn('[LiveDashboard] productionLines read failed', e));
     return () => {
@@ -161,13 +175,13 @@ export function useLiveWeekData(): LiveWeekData {
       listen('shiftSummaries', byDate('shiftSummaries')),
       // rejectionRecords.date is a local calendar date (utils/rejectionDate),
       // not a production date: same 7 calendar days, ending today.
-      listen('rejectionRecords', query(collection(db, 'rejectionRecords'), where('date', '>=', rejFrom), where('date', '<=', rejTo))),
+      listen('rejectionRecords', query(collection(db, 'rejectionRecords'), where('date', '>=', rejQueryFrom), where('date', '<=', rejTo))),
     ];
     return () => {
       if (retry) clearTimeout(retry);
       stops.forEach((stop) => stop());
     };
-  }, [fromKey, todayKey, rejFrom, rejTo, attempt]);
+  }, [fromKey, todayKey, rejQueryFrom, rejTo, attempt]);
 
   const records = useMemo<DashboardRecord[] | null>(() => {
     const a = sources.records.snap;
@@ -208,9 +222,29 @@ export function useLiveWeekData(): LiveWeekData {
     [sources.activeSessions.snap]
   );
   const rejections = useMemo(
-    () => (sources.rejectionRecords.snap ? rejectionTypes(sources.rejectionRecords.snap.docs.map((d) => ({ data: d.data() }))) : null),
+    () => (sources.rejectionRecords.snap
+      ? rejectionTypes(sources.rejectionRecords.snap.docs.map((d) => ({ data: d.data() })).filter(({ data }) => !(typeof data.date === 'string' && data.date < rejFrom)))
+      : null),
+    [sources.rejectionRecords.snap, rejFrom]
+  );
+  const rejectionDays = useMemo(
+    () => (sources.rejectionRecords.snap ? rejectionsPerDay(sources.rejectionRecords.snap.docs.map((d) => ({ data: d.data() })), dashboardDays(todayKey)) : null),
+    [sources.rejectionRecords.snap, todayKey]
+  );
+  const rejectionEntries = useMemo(
+    () => (sources.rejectionRecords.snap ? sources.rejectionRecords.snap.docs.map((d) => toRejectionEntry(d.data())) : null),
     [sources.rejectionRecords.snap]
   );
+  // productionLines names, then any name a live session or rejection entry carries.
+  const lineNames = useMemo(() => {
+    const out: Record<string, string> = {};
+    rejectionEntries?.forEach((e) => { if (e.lineId && e.lineName) out[e.lineId] = e.lineName; });
+    sources.activeSessions.snap?.docs.forEach((d) => {
+      const data = d.data();
+      if (typeof data.lineName === 'string' && data.lineName) out[data.lineId ?? d.id] = data.lineName;
+    });
+    return { ...out, ...storedLineNames };
+  }, [rejectionEntries, sources.activeSessions.snap, storedLineNames]);
   const reconnecting = Object.values(sources).some((s) => s.snap?.metadata.fromCache) || !!recordError;
 
   const lines = useMemo<LiveLine[] | null>(() => {
@@ -230,5 +264,10 @@ export function useLiveWeekData(): LiveWeekData {
     stopped: live?.stopped ?? null,
     activeLineCount: live?.activeCount ?? 0,
     rejectionTypes: rejections,
+    rejectionDays,
+    rejectionEntries,
+    rejTodayKey: rejTo,
+    rejFromKey: rejFrom,
+    lineNames,
   };
 }

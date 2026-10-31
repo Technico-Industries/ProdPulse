@@ -24,6 +24,26 @@ export function fmtMinutes(v: number | null | undefined): string {
   return h ? `${h}h ${String(m % 60).padStart(2, '0')}m` : `${m}m`;
 }
 
+// Props that make a card open its detail view: click, Enter or Space.
+// Clicks on a control inside the card (a <button>) are left to that control.
+export function openProps(onOpen: (() => void) | undefined, label: string) {
+  if (!onOpen) return {};
+  return {
+    role: 'button',
+    tabIndex: 0,
+    'aria-label': `${label} — open detailed analysis`,
+    onClick: (e: React.MouseEvent) => {
+      if ((e.target as HTMLElement).closest('button')) return;
+      onOpen();
+    },
+    onKeyDown: (e: React.KeyboardEvent) => {
+      if (e.target !== e.currentTarget || (e.key !== 'Enter' && e.key !== ' ')) return;
+      e.preventDefault();
+      onOpen();
+    },
+  };
+}
+
 // ─── Hooks ────────────────────────────────────────────────────────────────────
 const reducedMotion = () =>
   typeof window !== 'undefined' && !!window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -95,6 +115,112 @@ export function AnimatedNumber({ value, format }: { value: number | null | undef
   const known = typeof value === 'number' && Number.isFinite(value);
   const [v] = useTween([known ? (value as number) : 0], 1100);
   return <>{known ? format(v) : '—'}</>;
+}
+
+// Counts up the one number inside a label ("1,234 pcs", "88.2%", "+120 pcs").
+// Text with no number, or more than one ("1h 05m", "3 of 12"), is shown as is.
+export function AnimatedText({ text }: { text: React.ReactNode }) {
+  const m = typeof text === 'string' ? text.match(/\d[\d,]*(\.\d+)?/g) : null;
+  const one = m && m.length === 1 ? m[0] : null;
+  const target = one ? Number(one.replace(/,/g, '')) : 0;
+  const [v] = useTween([target], 1100);
+  if (!one || typeof text !== 'string') return <>{text}</>;
+  const decimals = one.includes('.') ? one.split('.')[1].length : 0;
+  const shown = new Intl.NumberFormat('en-IN', { minimumFractionDigits: decimals, maximumFractionDigits: decimals }).format(v);
+  return <>{text.replace(one, shown)}</>;
+}
+
+// ─── Donut: shares of a whole, arcs draw in and morph on updates ─────────────
+// Slices are shades of one series colour (largest = full colour); the legend
+// carries the labels and shares, so nothing relies on telling hues apart.
+export function Donut({ items, tone, format, centerLabel, max = 6 }: {
+  items: { key: string; label: string; value: number }[]; tone: 'good' | 'reject' | 'loss';
+  format: (v: number) => string; centerLabel: string; max?: number;
+}) {
+  const list = items.filter((i) => i.value > 0).sort((a, b) => b.value - a.value);
+  const shown = list.length > max ? [...list.slice(0, max - 1), { key: '__other', label: 'Other', value: list.slice(max - 1).reduce((n, i) => n + i.value, 0) }] : list;
+  const total = shown.reduce((n, i) => n + i.value, 0);
+  const v = useTween(shown.map((i) => i.value), 1200);
+  const [hover, setHover] = useState<number | null>(null);
+  if (!total) return <div className="ld-empty ld-empty--good ld-dempty">Nothing recorded.</div>;
+  const R = 42;
+  const C = 2 * Math.PI * R;
+  const opacity = (i: number) => Math.max(0.22, 1 - i * 0.16);
+  let acc = 0;
+  const h = hover != null ? shown[hover] : null;
+  return (
+    <div className={`ld-donut ld-donut--${tone}`}>
+      <svg viewBox="0 0 120 120" role="img" aria-label={`${centerLabel}: ${shown.map((i) => `${i.label} ${format(i.value)}`).join(', ')}`}>
+        <circle className="ld-donut__track" cx="60" cy="60" r={R} />
+        <g transform="rotate(-90 60 60)">
+          {shown.map((it, i) => {
+            const len = ((v[i] ?? 0) / total) * C; // v tweens from 0, so the ring draws in
+            const seg = (
+              <circle
+                key={it.key}
+                className={`ld-donut__seg${hover === i ? ' is-hover' : ''}`}
+                cx="60" cy="60" r={R}
+                style={{ strokeOpacity: opacity(i) }}
+                strokeDasharray={`${Math.max(0, len - 1.2)} ${C}`}
+                strokeDashoffset={-acc}
+                onMouseEnter={() => setHover(i)}
+                onMouseLeave={() => setHover(null)}
+              />
+            );
+            acc += len;
+            return seg;
+          })}
+        </g>
+        <text className="ld-donut__value" x="60" y="58" textAnchor="middle">{h ? format(h.value) : format(total)}</text>
+        <text className="ld-donut__label" x="60" y="74" textAnchor="middle">{h ? `${Math.round((h.value / total) * 100)}% · ${h.label}`.slice(0, 22) : centerLabel}</text>
+      </svg>
+      <ul className="ld-donut__legend">
+        {shown.map((it, i) => (
+          <li key={it.key} className={hover === i ? 'is-hover' : ''} onMouseEnter={() => setHover(i)} onMouseLeave={() => setHover(null)} style={{ animationDelay: `${0.15 + i * 0.06}s` }}>
+            <i style={{ opacity: opacity(i) }} />
+            <span>{it.label}</span>
+            <b>{format(it.value)}</b>
+            <em>{Math.round((it.value / total) * 100)}%</em>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+// ─── Heatmap: one row per line, one cell per day, cells pop in ───────────────
+// Darker = higher value. Empty cells (null) mean no data that day.
+export function Heatmap({ rows, days, tone, format, label }: {
+  rows: { key: string; label: string; values: (number | null)[] }[]; days: DayPoint[];
+  tone: 'good' | 'reject' | 'loss'; format: (v: number) => string; label: string;
+}) {
+  const all = rows.flatMap((r) => r.values.filter((x): x is number => x != null));
+  const top = Math.max(1, ...all);
+  if (!rows.length || !all.some((x) => x > 0)) return <div className="ld-empty ld-empty--good ld-dempty">Nothing recorded.</div>;
+  return (
+    <div className={`ld-heat ld-heat--${tone}`} role="table" aria-label={label} style={{ ['--cols' as any]: days.length }}>
+      <div className="ld-heat__row ld-heat__row--head" role="row">
+        <span role="columnheader" />
+        {days.map((d) => <span key={d.key} role="columnheader" className={d.isToday ? 'is-today' : ''}>{d.isToday ? 'Today' : d.label}</span>)}
+      </div>
+      {rows.map((r, ri) => (
+        <div key={r.key} className="ld-heat__row" role="row">
+          <span role="rowheader" className="ld-heat__label" title={r.label}>{r.label}</span>
+          {r.values.map((x, ci) => (
+            <span
+              key={ci}
+              role="cell"
+              className={`ld-heat__cell${x == null ? ' is-empty' : ''}${days[ci]?.isToday ? ' is-today' : ''}`}
+              style={{ ['--k' as any]: x == null ? 0 : 0.12 + 0.88 * (x / top), animationDelay: `${ri * 0.05 + ci * 0.035}s` }}
+              title={`${r.label} · ${days[ci]?.label}: ${x == null ? 'no data' : format(x)}`}
+            >
+              {x == null ? '' : format(x)}
+            </span>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
 }
 
 // ─── Geometry ─────────────────────────────────────────────────────────────────
@@ -308,6 +434,93 @@ export function TrendChart({ days, good, plan, achievement, rows, title }: {
                 { label: 'Good production', value: `${fmtInt(good[hover])} pcs`, swatch: 'var(--good)' },
                 { label: 'Plan', value: `${fmtInt(plan[hover])} pcs`, swatch: 'var(--plan)' },
                 { label: 'Achievement', value: fmtPct(achievement[hover]) },
+              ]}
+            />
+          ) : null}
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+// ─── Line trend: one measure per day, smooth line + area, dashed average ─────
+export function LineTrendChart({ days, values, rows, title, tone, unit, format, extra }: {
+  days: DayPoint[]; values: number[]; rows: ValueRow[]; title: string; tone: 'reject' | 'loss'; unit: string;
+  format: (v: number) => string; extra?: (i: number) => { label: string; value: string }[];
+}) {
+  const [ref, { width, height }] = useSize<HTMLDivElement>();
+  const [hover, setHover] = useState<number | null>(null);
+  const id = safeId(useId());
+  const v = useTween(values, 1100);
+  const [reveal] = useTween([1], 1600);
+  const max = niceMax(Math.max(1, ...values) * 1.15);
+  const f = frame(width, height, days.length, max, rows.length);
+  const pts = v.map((val, i) => [f.cx(i), f.y(val)] as [number, number]);
+  const line = smoothPath(pts);
+  const area = pts.length ? `${line}L${pts[pts.length - 1][0]},${f.base}L${pts[0][0]},${f.base}Z` : '';
+  const ti = days.findIndex((d) => d.isToday);
+  const peak = values.indexOf(Math.max(...values));
+  // Average of the completed days (today is still running).
+  const done = values.filter((_, i) => i !== ti);
+  const avg = done.length ? done.reduce((n, x) => n + x, 0) / done.length : 0;
+  const color = tone === 'reject' ? 'var(--reject)' : 'var(--loss)';
+  const change = (i: number) => {
+    if (i === 0) return '—';
+    const d = values[i] - values[i - 1];
+    return d === 0 ? 'No change' : `${d > 0 ? '▲ +' : '▼ −'}${format(Math.abs(d))}`;
+  };
+
+  return (
+    <div className="ld-chart" ref={ref}>
+      {width > 0 && height > 0 ? (
+        <>
+          <svg width={width} height={height} role="img" aria-label={title}>
+            <defs>
+              <linearGradient id={`${id}-area`} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={color} stopOpacity="0.36" />
+                <stop offset="100%" stopColor={color} stopOpacity="0" />
+              </linearGradient>
+              <filter id={`${id}-glow`} x="-20%" y="-20%" width="140%" height="140%">
+                <feGaussianBlur stdDeviation="4" result="b" />
+                <feMerge><feMergeNode in="b" /><feMergeNode in="SourceGraphic" /></feMerge>
+              </filter>
+              <clipPath id={`${id}-reveal`}>
+                <rect x={0} y={0} width={f.m.left + (width - f.m.left) * reveal} height={height} />
+              </clipPath>
+            </defs>
+            <Axes f={f} days={days} rows={rows} unit={unit} hover={hover} />
+            {avg > 0 ? (
+              <g>
+                <line className="ld-avg" x1={f.m.left} x2={f.width - f.m.right} y1={f.y(avg)} y2={f.y(avg)} />
+                <text className="ld-avg__label" x={f.width - f.m.right} y={f.y(avg) - 7} textAnchor="end">avg {format(avg)}</text>
+              </g>
+            ) : null}
+            <g clipPath={`url(#${id}-reveal)`}>
+              <path d={area} fill={`url(#${id}-area)`} />
+              <path className="ld-line" d={line} stroke={color} strokeWidth={3} filter={`url(#${id}-glow)`} />
+              {pts.map(([x, y], i) => (i === ti ? null : <circle key={i} className="ld-dot" style={{ fill: color }} cx={x} cy={y} r={hover === i ? 8 : 6} />))}
+            </g>
+            {ti >= 0 && pts[ti] ? (
+              <g transform={`translate(${pts[ti][0]},${pts[ti][1]})`}>
+                <circle className="ld-pulse" style={{ fill: color }} r={9} />
+                <circle className="ld-dot ld-dot--today" style={{ stroke: color }} r={8} />
+              </g>
+            ) : null}
+            {[...new Set([peak, ti])].filter((i) => i >= 0 && values[i] > 0 && pts[i]).map((i) => (
+              <text key={i} className="ld-direct" x={pts[i][0]} y={pts[i][1] - 18} textAnchor="middle">{format(v[i])}</text>
+            ))}
+            <HoverLayer f={f} n={days.length} hover={hover} setHover={setHover} />
+          </svg>
+          {hover != null ? (
+            <Tooltip
+              f={f}
+              i={hover}
+              title={days[hover].isToday ? 'Today (in progress)' : days[hover].label}
+              lines={[
+                { label: title, value: format(values[hover]), swatch: color },
+                { label: 'vs previous day', value: change(hover) },
+                { label: 'Average (completed days)', value: format(avg) },
+                ...(extra ? extra(hover) : []),
               ]}
             />
           ) : null}
@@ -603,7 +816,7 @@ export function StoppedLinesBoard({ lines, activeCount }: {
 }
 
 // ─── Rotating panel: cycles its views, pauses on hover ───────────────────────
-export function RotatingPanel({ views, intervalMs = 15000 }: { views: { title: string; meta?: React.ReactNode; body: React.ReactNode }[]; intervalMs?: number }) {
+export function RotatingPanel({ views, intervalMs = 15000, onOpen }: { views: { title: string; meta?: React.ReactNode; body: React.ReactNode }[]; intervalMs?: number; onOpen?: () => void }) {
   const [i, setI] = useState(0);
   const [paused, setPaused] = useState(false);
   useEffect(() => {
@@ -613,7 +826,7 @@ export function RotatingPanel({ views, intervalMs = 15000 }: { views: { title: s
   }, [paused, views.length, intervalMs]);
   const v = views[i % views.length];
   return (
-    <section className="ld-panel" onMouseEnter={() => setPaused(true)} onMouseLeave={() => setPaused(false)}>
+    <section className={`ld-panel${onOpen ? ' is-clickable' : ''}`} onMouseEnter={() => setPaused(true)} onMouseLeave={() => setPaused(false)} {...openProps(onOpen, v.title)}>
       <header className="ld-panel__head">
         <h2 className="ld-panel__title">{v.title}</h2>
         <span className="ld-dots">
