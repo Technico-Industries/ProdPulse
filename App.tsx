@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { NavigationContainer, LinkingOptions } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { StatusBar } from 'expo-status-bar';
@@ -6,7 +6,9 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import ScreenContainer from './src/components/ScreenContainer';
 import AuthSplash from './src/components/AuthSplash';
+import OnScreenKeyboard from './src/components/OnScreenKeyboard';
 import { useAuthStore } from './src/stores/authStore';
+import { useWebKeyboardStore } from './src/stores/webKeyboardStore';
 
 import LoginScreen from './src/screens/LoginScreen';
 import DashboardScreen from './src/screens/DashboardScreen';
@@ -206,6 +208,12 @@ const linking: LinkingOptions<RootStackParamList> = {
 // (e.g. a reload on /record-production) only once it knows who is signed in.
 export default function App() {
   const initializing = useAuthStore((s) => s.initializing);
+  // On-screen keyboard setting is per user — reload it whenever who is
+  // signed in changes.
+  const uid = useAuthStore((s) => s.user?.uid ?? null);
+  useEffect(() => {
+    useWebKeyboardStore.getState().setUser(uid);
+  }, [uid]);
   return (
     <SafeAreaProvider>
       <StatusBar style="light" backgroundColor="#14181C" />
@@ -216,6 +224,8 @@ export default function App() {
           <RootNavigator />
         </NavigationContainer>
       )}
+      {/* Web only: built-in keyboard, switched on/off from any dashboard. */}
+      <OnScreenKeyboard />
     </SafeAreaProvider>
   );
 }
