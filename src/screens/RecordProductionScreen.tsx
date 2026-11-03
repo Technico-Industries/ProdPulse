@@ -994,16 +994,10 @@ export default function RecordProductionScreen() {
       }
       leavingRef.current = true;
       try {
-        const ok = hasPendingChanges() ? await flushSessionNow() : true;
-        await sessionQueueRef.current.idle();
-        if (!ok) {
-          const leave = await confirmAsync(
-            'Changes not saved to server',
-            'Your latest entries could not be saved to the server, so other devices can\'t see them yet. They are kept on this device and will be synced when you reopen this session on this device. Leave anyway?',
-            'Leave'
-          );
-          if (!leave) return;
-        }
+        // Leave instantly: unsynced entries are kept in the on-device draft
+        // and synced when the session is reopened; the server push runs in
+        // the background without blocking or prompting.
+        if (hasPendingChanges()) flushSessionNow();
         resetSessionState();
       } finally {
         leavingRef.current = false;
@@ -3899,17 +3893,16 @@ export default function RecordProductionScreen() {
         ...segKeys.map((k) => `rejectionsBySlot|${k}`),
         ...segKeys.map((k) => `lossReasonBySlot|${k}`),
       ]);
-      const synced = await persistSession(undefined, undefined, [slot.index], savedKeys);
-      if (synced) {
-        applySavedSlots(new Set(savedSlotIndicesRef.current).add(slot.index));
-        Alert.alert('Saved', savedMessage);
-      } else {
-        notify(
-          'Slot saved — session not updated',
-          `${savedMessage} The production record was written, but this session's progress could not be updated on the server, so other devices may not show it yet. ` +
-            'Your entries are kept on this device and sync is retried automatically. You can also tap Save Slot again — it updates the same record, it never adds another.'
-        );
-      }
+      // The record is written — the slot is saved: turn its button into the
+      // green Update Slot right away and free the slot, without waiting on
+      // the session sync below (it runs in the background and retries
+      // itself on failure).
+      applySavedSlots(new Set(savedSlotIndicesRef.current).add(slot.index));
+      savingSlotsRef.current.delete(slot.index);
+      setSavingSlotIndices(new Set(savingSlotsRef.current));
+      Alert.alert('Saved', savedMessage);
+      // A failed sync retries automatically (scheduleSyncRetry) — no popup.
+      persistSession(undefined, undefined, [slot.index], savedKeys);
     } catch (err) {
       console.error('saveSlot', err);
       Alert.alert('Error', `Could not save slot. Your entries are kept — tap ${savedSlotIndicesRef.current.has(slot.index) ? 'Update Slot' : 'Save Slot'} to retry.`);

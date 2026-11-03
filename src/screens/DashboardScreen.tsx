@@ -14,7 +14,6 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import WebRefreshButton from '../components/WebRefreshButton';
-import WebKeyboardToggle from '../components/WebKeyboardToggle';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { collection, getDocs, onSnapshot, query, where, orderBy, Timestamp, doc, updateDoc, serverTimestamp } from 'firebase/firestore';
 import { db } from '../services/firebase';
@@ -1105,12 +1104,9 @@ export default function DashboardScreen() {
           <Text style={styles.title}>{headerTitle}</Text>
           <Text style={styles.subtitle}>{user?.email}</Text>
         </View>
-        <View style={{ flexDirection: 'row', gap: 10 }}>
-          <WebKeyboardToggle variant="icon" />
-          <Pressable onPress={handleLogout} style={styles.logoutButton} hitSlop={10}>
-            <Ionicons name="log-out-outline" size={22} color="#8A96A3" />
-          </Pressable>
-        </View>
+        <Pressable onPress={handleLogout} style={styles.logoutButton} hitSlop={10}>
+          <Ionicons name="log-out-outline" size={22} color="#8A96A3" />
+        </Pressable>
       </View>
 
       {isTechnician ? (

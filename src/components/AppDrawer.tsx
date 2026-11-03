@@ -29,7 +29,6 @@ import { Ionicons } from '@expo/vector-icons';
 import { useNavigation } from '@react-navigation/native';
 import { AdminMenuItem, visibleMenuItems } from '../constants/adminMenu';
 import { useAuthStore } from '../stores/authStore';
-import WebKeyboardToggle from './WebKeyboardToggle';
 
 interface Props {
   visible: boolean;
@@ -148,13 +147,6 @@ export default function AppDrawer({ visible, onClose, items, dashboardSubtitle }
             ))}
           </ScrollView>
 
-          {/* Web only (renders nothing on Android/iOS). */}
-          {Platform.OS === 'web' ? (
-            <View style={styles.settings}>
-              <WebKeyboardToggle />
-            </View>
-          ) : null}
-
           <Pressable
             onPress={handleLogout}
             style={({ pressed }) => [styles.logout, pressed && styles.itemPressed]}
@@ -231,12 +223,6 @@ const styles = StyleSheet.create({
   },
   itemTitle: { color: '#ECEFF2', fontSize: 14, fontWeight: '700' },
   itemSub: { color: '#8A96A3', fontSize: 11.5, marginTop: 1 },
-  settings: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderTopWidth: 1,
-    borderTopColor: '#2C343C',
-  },
   logout: {
     flexDirection: 'row',
     alignItems: 'center',

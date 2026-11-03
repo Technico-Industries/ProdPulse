@@ -276,7 +276,13 @@ export const LIVE_DASHBOARD_CSS = `
 .ll-legend { margin-left: auto; display: flex; gap: 1.2em; color: var(--muted); font-size: 0.92em; align-items: center; }
 .ll-legend span { display: inline-flex; align-items: center; gap: 0.45em; }
 
-.ll-grid { flex: 1; min-height: 0; display: grid; gap: 0.8em; }
+.ll-grid { flex: 1; min-height: 0; display: grid; gap: 0.8em; overflow-x: hidden; overflow-y: auto;
+  scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; overscroll-behavior: contain; }
+/* More lines than fit: scroll by whole rows, so a row at rest is never cut. */
+.ll-grid--scroll { scrollbar-gutter: stable; scroll-snap-type: y mandatory; }
+.ll-grid--scroll .ll-card { scroll-snap-align: start; min-height: var(--row-min, 0); }
+.ll-grid::-webkit-scrollbar { width: 0.45em; }
+.ll-grid::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 999px; }
 .ll-card { position: relative; min-height: 0; min-width: 0; overflow: hidden; display: flex; flex-direction: column; gap: 0.45em;
   padding: 0.85em 1em 0.75em; border-radius: 0.9em; border: 1px solid var(--border);
   background:
@@ -352,7 +358,8 @@ export const LIVE_DASHBOARD_CSS = `
 .ll-note-awaiting span { overflow: hidden; text-overflow: ellipsis; }
 .ll-note-awaiting i { flex: none; width: 0.6em; height: 0.6em; border-radius: 50%; background: var(--warn); }
 
-@keyframes ll-in { from { opacity: 0; transform: translateY(1em) scale(0.98); } to { opacity: 1; transform: none; } }
+/* Scale only: a card sliding in from below would briefly overflow the grid. */
+@keyframes ll-in { from { opacity: 0; transform: scale(0.96); } to { opacity: 1; transform: none; } }
 @keyframes ll-flow { from { background-position: 200% 0; } to { background-position: 0 0; } }
 @keyframes ll-alarm { 0%, 100% { box-shadow: 0 0 0.8em rgba(208,59,59,0.18); } 50% { box-shadow: 0 0 2em rgba(208,59,59,0.45); } }
 @keyframes ll-pop { 0% { transform: scale(0.3); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
