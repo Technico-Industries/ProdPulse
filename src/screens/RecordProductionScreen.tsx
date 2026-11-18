@@ -118,6 +118,9 @@ import {
   timeOfDayToShiftAbs,
   validateChangeoverInterval,
   validateProductionStartTime,
+  validateShiftStartWindow,
+  shiftForStartTime,
+  SHIFT_START_WINDOWS,
   formatAbsMinutes24,
 } from '../utils/productionSchedule';
 import {
@@ -746,6 +749,18 @@ function defaultStartTimeText(shift: 'A' | 'B'): string {
   return formatAbsMinutes24(shift === 'A' ? SHIFT_A_START : SHIFT_B_START);
 }
 
+function localMinuteOfDay(ms: number = Date.now()): number {
+  const d = new Date(ms);
+  return d.getHours() * 60 + d.getMinutes();
+}
+
+// The shift that may be started right now; Shift B in its 18:30–19:00
+// lead-in gap, Shift A in 06:30–07:00 (the next shift to come).
+function currentStartableShift(): 'A' | 'B' {
+  const m = localMinuteOfDay();
+  return shiftForStartTime(m) ?? (m >= 12 * 60 ? 'B' : 'A');
+}
+
 // Planned parts for a list of slots on one part (the shift's planned total
 // before any changeover exists).
 function plannedTotalFor(slotList: Slot[], line: Line | null, partIndex: number): number {
@@ -873,11 +888,13 @@ export default function RecordProductionScreen() {
   const [plant, setPlant] = useState<string | null>(null);
   const [workshop, setWorkshop] = useState<string | null>(null);
   const [division, setDivision] = useState<string | null>(null);
-  const [selectedShift, setSelectedShift] = useState<'A' | 'B'>('A');
+  // Defaults to the shift that may be started at the current time (Shift B
+  // from 19:00 to 06:30, else A) — see SHIFT_START_WINDOWS.
+  const [selectedShift, setSelectedShift] = useState<'A' | 'B'>(() => currentStartableShift());
   const [otHours, setOtHours] = useState(0);
   // Production Start Time as typed on the setup screen (24-hour "HH:MM").
   // Defaults to the selected shift's start (see defaultStartTimeText).
-  const [startTimeText, setStartTimeText] = useState(() => defaultStartTimeText('A'));
+  const [startTimeText, setStartTimeText] = useState(() => defaultStartTimeText(currentStartableShift()));
   // The active session's stored production start (absolute minutes), or
   // null for a legacy session that has none.
   const [sessionStartAbs, setSessionStartAbs] = useState<number | null>(null);
@@ -1401,6 +1418,8 @@ export default function RecordProductionScreen() {
         return (['A', 'B'] as const).map((sh) => ({
           key: sh,
           label: `Shift ${sh} · ${formatAbsMinutesToAmPm(sh === 'A' ? SHIFT_A_START : SHIFT_B_START)} – ${formatAbsMinutesToAmPm(sh === 'A' ? SHIFT_A_END : SHIFT_B_END_ABS)}`,
+          sublabel: `Can be started ${formatAbsMinutesToAmPm(SHIFT_START_WINDOWS[sh].start)} – ${formatAbsMinutesToAmPm(SHIFT_START_WINDOWS[sh].end)}` +
+            (validateShiftStartWindow(sh, localMinuteOfDay()) ? ' · not available now' : ''),
         }));
       default:
         return [];
@@ -2480,6 +2499,17 @@ export default function RecordProductionScreen() {
     // current time (persistSession's create branch aside) — see
     // resolveActiveSessionProductionDate for every later read.
     const startedMs = Date.now();
+
+    // Shift start window: Shift A only 07:00–18:30, Shift B only
+    // 19:00–06:30, by the current clock — stops the wrong shift being
+    // started by mistake.
+    const windowError = validateShiftStartWindow(selectedShift, localMinuteOfDay(startedMs));
+    if (windowError) {
+      if (Platform.OS === 'web') window.alert(windowError);
+      else Alert.alert('Wrong shift', windowError);
+      return;
+    }
+
     const pd = productionDayKeyFor(startedMs);
 
     // Production Start Time: a valid time inside the shift, not in the

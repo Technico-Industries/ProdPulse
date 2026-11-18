@@ -30,9 +30,13 @@
 // ─── PRODUCTION DATA ─────────────────────────────────────────────────────────
 // The real `productionRecords` collection written by RecordProductionScreen
 // (saveSlot / handleFinalizeSession). Never sampleProductionRecords or any
-// mock source. Records are matched on `productionDate` — the 6:30 AM-cutover
-// production-day key the session itself is pinned to — then narrowed to the
-// active line ids client-side.
+// mock source. Records are fetched by `productionDate` — the 6:30 AM-cutover
+// production-day key the session itself is pinned to, so Shift B's
+// after-midnight slots stay on the night they started — then narrowed
+// client-side to each session's own line + production day + SHIFT
+// (utils/supervisorShift). Shift A and Shift B of a line share one
+// productionDate, so without the shift match the two shifts were added
+// together. Every KPI below is the session's own shift only.
 //
 // ─── FORMULAS ────────────────────────────────────────────────────────────────
 // Identical to the Admin overview / GenerateReportScreen / KPIAnalysisScreen,
@@ -76,6 +80,12 @@ import { SUPERVISOR_MENU_ITEMS } from '../constants/supervisorMenu';
 import AppDrawer from '../components/AppDrawer';
 import { DowntimeStop, formatDowntimeMinutes, isAnyStopRunning, sessionDowntimeMinutes } from '../utils/downtime';
 import { isSupervisorsSession } from '../utils/supervisorHandover';
+import {
+  ShiftScopedSession,
+  normalizeShift,
+  selectSessionShiftRecords,
+  sessionProductionDate,
+} from '../utils/supervisorShift';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -309,8 +319,12 @@ export default function SupervisorOverviewScreen() {
               plant: data.plant ?? null,
               workshop: data.workshop ?? null,
               division: data.division ?? null,
-              shift: data.shift === 'B' ? 'B' : 'A',
-              productionDate: data.productionDate ?? null,
+              shift: normalizeShift(data.shift),
+              // Pinned at session start; older docs fall back to startedAt.
+              productionDate: sessionProductionDate({
+                productionDate: data.productionDate,
+                startedAtMs: data.startedAt?.toMillis ? data.startedAt.toMillis() : null,
+              }),
               plannedProductionTotal: data.plannedProductionTotal ?? null,
               supervisorName: data.supervisorName ?? null,
               operatorCount: Array.isArray(data.operators) ? data.operators.length : 0,
@@ -344,7 +358,12 @@ export default function SupervisorOverviewScreen() {
   }, [subscribeSessions]);
 
   // ── STEP 2: the active line ids and production day(s) of that session.
-  const activeLineIds = useMemo(() => sessions.map((s) => s.lineId), [sessions]);
+  // Each session's line + shift + production day — the exact scope its
+  // records must match.
+  const sessionScope = useMemo<ShiftScopedSession[]>(
+    () => sessions.map((s) => ({ lineId: s.lineId, shift: s.shift, productionDate: s.productionDate })),
+    [sessions]
+  );
   const productionDates = useMemo(
     () => Array.from(new Set(sessions.map((s) => s.productionDate).filter(Boolean) as string[])),
     [sessions]
@@ -356,7 +375,7 @@ export default function SupervisorOverviewScreen() {
   const fetchSignature = useMemo(
     () =>
       sessions
-        .map((s) => `${s.lineId}:${s.productionDate}:${s.updatedAtMs ?? 0}`)
+        .map((s) => `${s.lineId}:${s.productionDate}:${s.shift}:${s.updatedAtMs ?? 0}`)
         .sort()
         .join('|'),
     [sessions]
@@ -371,8 +390,8 @@ export default function SupervisorOverviewScreen() {
   // `in` on another. In practice a supervisor's sessions share one
   // production day, so this is one query.
   const fetchRecords = useCallback(
-    async (dates: string[], lineIds: string[], isRefresh = false) => {
-      if (dates.length === 0 || lineIds.length === 0) {
+    async (dates: string[], scope: ShiftScopedSession[], isRefresh = false) => {
+      if (dates.length === 0 || scope.length === 0) {
         setRecords([]);
         setRecordsError(null);
         setRefreshing(false); // returns before the finally below
@@ -381,19 +400,18 @@ export default function SupervisorOverviewScreen() {
       if (!isRefresh) setRecordsLoading(true);
       setRecordsError(null);
       try {
-        const lineIdSet = new Set(lineIds);
         // `in` caps at 10 values; more than 10 distinct production days
         // across one supervisor's live sessions isn't a real scenario, but
         // slice defensively rather than letting Firestore throw.
         const snap = await getDocs(
           query(collection(db, 'productionRecords'), where('productionDate', 'in', dates.slice(0, 10)))
         );
-        const mapped: ProductionRecord[] = snap.docs
+        const all: ProductionRecord[] = snap.docs
           .map((d) => {
             const data: any = d.data();
             return {
               id: d.id,
-              shift: data.shift === 'B' ? 'B' : 'A',
+              shift: normalizeShift(data.shift),
               lineId: data.lineId ?? null,
               lineName: data.lineName ?? null,
               partName: data.partName ?? null,
@@ -404,11 +422,11 @@ export default function SupervisorOverviewScreen() {
               rejections: data.rejections ?? null,
               stopEvents: Array.isArray(data.stopEvents) ? data.stopEvents : null,
             } as ProductionRecord;
-          })
-          // ONLY this supervisor's active lines. Nothing from another
-          // line, another supervisor, or an inactive line reaches the UI.
-          .filter((r) => r.lineId != null && lineIdSet.has(r.lineId));
-        setRecords(mapped);
+          });
+        // ONLY each session's own line + production day + shift. Nothing
+        // from another line, another supervisor, or the other shift of the
+        // same line and day reaches the UI.
+        setRecords(selectSessionShiftRecords(scope, all));
       } catch (e) {
         console.error('[SupervisorOverview] productionRecords fetch failed', e);
         setRecords([]);
@@ -427,19 +445,19 @@ export default function SupervisorOverviewScreen() {
     if (sessionsLoading) return;
     if (fetchSignature === lastSignature.current) return;
     lastSignature.current = fetchSignature;
-    fetchRecords(productionDates, activeLineIds);
-  }, [fetchSignature, sessionsLoading, productionDates, activeLineIds, fetchRecords]);
+    fetchRecords(productionDates, sessionScope);
+  }, [fetchSignature, sessionsLoading, productionDates, sessionScope, fetchRecords]);
 
   const onRefresh = useCallback(() => {
     setRefreshing(true);
-    fetchRecords(productionDates, activeLineIds, true);
-  }, [fetchRecords, productionDates, activeLineIds]);
+    fetchRecords(productionDates, sessionScope, true);
+  }, [fetchRecords, productionDates, sessionScope]);
 
   const retry = useCallback(() => {
     lastSignature.current = '';
     setSessionsError(null);
-    fetchRecords(productionDates, activeLineIds);
-  }, [fetchRecords, productionDates, activeLineIds]);
+    fetchRecords(productionDates, sessionScope);
+  }, [fetchRecords, productionDates, sessionScope]);
 
   // ── Clock for a stopped line's live downtime. Ticks only while some
   // line is stopped; stop/resume themselves arrive via the listener above.

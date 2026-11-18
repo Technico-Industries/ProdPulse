@@ -413,6 +413,47 @@ export function validateProductionStartTime(
   return { ok: true, startAbs };
 }
 
+// ─── Shift start window ──────────────────────────────────────────────────────
+// When a shift's session may be STARTED, by the current clock time, so a
+// supervisor can't start the wrong shift by mistake:
+//   Shift A: 07:00 – 18:30
+//   Shift B: 19:00 – 06:30 (next morning)
+// Start inclusive, end exclusive. 18:30–19:00 and 06:30–07:00 belong to
+// neither shift. Applies only to starting a new session — a running session
+// is never blocked by it.
+export const SHIFT_START_WINDOWS: Record<ShiftCode, TimeInterval> = {
+  A: { start: 7 * 60, end: 18 * 60 + 30 },
+  B: { start: 19 * 60, end: 6 * 60 + 30 }, // wraps past midnight
+};
+
+function inStartWindow(shift: ShiftCode, minuteOfDay: number): boolean {
+  const { start, end } = SHIFT_START_WINDOWS[shift];
+  return start < end
+    ? minuteOfDay >= start && minuteOfDay < end
+    : minuteOfDay >= start || minuteOfDay < end;
+}
+
+// The shift that may be started at this minute of the day, or null in the
+// gaps between the two windows.
+export function shiftForStartTime(minuteOfDay: number): ShiftCode | null {
+  if (inStartWindow('A', minuteOfDay)) return 'A';
+  if (inStartWindow('B', minuteOfDay)) return 'B';
+  return null;
+}
+
+// Error message when `shift` may not be started at `minuteOfDay`, else null.
+export function validateShiftStartWindow(shift: ShiftCode, minuteOfDay: number): string | null {
+  if (inStartWindow(shift, minuteOfDay)) return null;
+  const w = SHIFT_START_WINDOWS[shift];
+  const now = formatAbsMinutesToAmPm(minuteOfDay);
+  const allowed = shiftForStartTime(minuteOfDay);
+  return (
+    `Shift ${shift} can only be started between ${formatAbsMinutesToAmPm(w.start)} and ${formatAbsMinutesToAmPm(w.end)}. ` +
+    `The current time is ${now}` +
+    (allowed ? ` — select Shift ${allowed} instead.` : ' — no shift can be started right now.')
+  );
+}
+
 // ─── Single-time changeover ──────────────────────────────────────────────────
 // A changeover is entered as ONE time: the moment the line switches part.
 // The slot it falls in is split into BEFORE [slot start, time) and AFTER

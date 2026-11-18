@@ -58,6 +58,7 @@
     "test:report-downtime": "tsx scripts/testReportDowntime.ts",
     "test:prod-ai-panel": "tsx scripts/testProdAIPanel.ts",
     "test:supervisor-handover": "tsx scripts/testSupervisorHandover.ts",
+    "test:supervisor-shift": "tsx scripts/testSupervisorShift.ts",
     "test:slot-save-button": "tsx scripts/testSlotSaveButton.ts",
     "test:ai": "tsx functions/test/prodPulseAI.test.ts",
     "test:cors": "tsx functions/test/cors.test.ts",
