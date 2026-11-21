@@ -1,6 +1,6 @@
 export const PLANTS = ['Bawal 1', 'Bawal 2'];
 export const WORKSHOPS = ['Assembly Shop', 'Welding Shop', 'Plating Shop', 'Press Shop'];
-export const DIVISIONS = ['Side Door', 'S. Jack', 'RR Center', 'Break Pedal', 'Hood Hinge', 'Back Door', 'Non-MSIL', 'Count Cable', 'CNC Pipe Bending', 'Bolt Stacking', 'Nisan P1324'];
+export const DIVISIONS = ['Side Door', 'S. Jack', 'RR Center', 'Break Pedal', 'Hood Hinge', 'Back Door', 'Non-MSIL', 'Count Cable', 'CNC Pipe Bending', 'Bolt Stacking', 'Nissan P1324'];
 export const ASSIGN_ROLES = ['Supervisor', 'Technician', 'Restocker', 'Quality Control'];
 // Bawal 1 → Welding records production per division (Div-1 … Div-5) the way
 // Assembly does per its sections. Every other workshop keeps DIVISIONS.
