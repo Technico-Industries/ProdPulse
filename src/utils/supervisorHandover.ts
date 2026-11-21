@@ -32,7 +32,7 @@
 // over the de-duplicated records of the session's line + date + shift.
 
 import { EfficiencyRecord, efficiencyOf, recordsForSession } from './lineEfficiency';
-import { ShiftCode, TimeInterval, buildSlots } from './productionSchedule';
+import { ShiftCode, TimeInterval, buildSlots, scheduleProfileFor } from './productionSchedule';
 import { isProductionDayKey, millisToProductionDayMinute, resolveSessionProductionDate, timestampToMillis } from './productionDay';
 
 // ─── Session doc → running session ───────────────────────────────────────────
@@ -133,11 +133,13 @@ export interface SlotEntrySummary {
 }
 
 export function slotEntryStatuses(
-  s: Pick<RunningSession, 'shift' | 'otHours' | 'changeovers' | 'productionStartAbs' | 'savedSlotIndices' | 'deletedSlotIndices'>,
+  s: Pick<RunningSession, 'shift' | 'otHours' | 'changeovers' | 'productionStartAbs' | 'savedSlotIndices' | 'deletedSlotIndices'>
+    & Partial<Pick<RunningSession, 'plant' | 'workshop'>>,
   nowAbs: number | null
 ): SlotEntrySummary {
   const intervals: TimeInterval[] = s.changeovers.map((co) => ({ start: co.startAbs, end: co.endAbs }));
-  const slots = buildSlots(s.shift, s.otHours, intervals, s.productionStartAbs);
+  // The session's workshop schedule (Bawal 1 → Welding has its own).
+  const slots = buildSlots(s.shift, s.otHours, intervals, s.productionStartAbs, scheduleProfileFor(s));
   const saved = new Set(s.savedSlotIndices);
   const deleted = new Set(s.deletedSlotIndices);
   const out: SlotEntrySummary = { bySlot: {}, completed: [], awaiting: [], current: null, upcoming: [] };

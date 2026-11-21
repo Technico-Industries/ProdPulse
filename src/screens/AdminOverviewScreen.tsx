@@ -60,7 +60,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { collection, getDocs, onSnapshot } from 'firebase/firestore';
 import { db } from '../services/firebase';
 import { fetchProductionRecordsForDateRange } from '../services/productionRecordQueries';
-import { PLANTS, WORKSHOPS, DIVISIONS } from '../constants/lineOptions';
+import { PLANTS, WORKSHOPS, DIVISIONS, WELDING_DIVISIONS, divisionsForWorkshop, workshopHasDivisions } from '../constants/lineOptions';
 import AppDrawer from '../components/AppDrawer';
 import { PROD_AI_BUTTON_CLEARANCE } from '../utils/prodAIPanelLayout';
 import { ADMIN_MENU_ITEMS } from '../constants/adminMenu';
@@ -182,7 +182,8 @@ function sameValue(a: string | null | undefined, b: string | null | undefined) {
 // Division only applies under the Assembly workshop — matched by substring
 // rather than an exact label, exactly as GenerateReportScreen does it.
 function isAssemblyWorkshop(w: string | null) {
-  return !!w && w.toLowerCase().includes('assembly');
+  // Workshops with a Division filter: Assembly, and Welding (Div-1 … Div-5).
+  return workshopHasDivisions(w);
 }
 
 // ─── Saved selection ──────────────────────────────────────────────────────────
@@ -513,7 +514,7 @@ export default function AdminOverviewScreen() {
           // can never match anything.
           if (saved.plant && PLANTS.includes(saved.plant)) setPlant(saved.plant);
           if (saved.workshop && WORKSHOPS.includes(saved.workshop)) setWorkshop(saved.workshop);
-          if (saved.division && DIVISIONS.includes(saved.division)) setDivision(saved.division);
+          if (saved.division && (DIVISIONS.includes(saved.division) || WELDING_DIVISIONS.includes(saved.division))) setDivision(saved.division);
         }
       } catch (e) {
         console.warn('[AdminOverview] could not restore saved selection', e);
@@ -539,7 +540,7 @@ export default function AdminOverviewScreen() {
   // ── Division only exists under the Assembly workshop (same rule as
   // GenerateReportScreen) — clear it when the workshop moves away.
   useEffect(() => {
-    if (!isAssemblyWorkshop(workshop) && division) setDivision(null);
+    if (division && (!isAssemblyWorkshop(workshop) || !divisionsForWorkshop(workshop).includes(division))) setDivision(null);
   }, [workshop, division]);
 
   // ── productionLines, fetched once. Not per date: the line roster doesn't
@@ -1130,7 +1131,7 @@ export default function AdminOverviewScreen() {
             ? 'Select Workshop'
             : 'Select Division'
         }
-        options={openFilter === 'plant' ? PLANTS : openFilter === 'workshop' ? WORKSHOPS : DIVISIONS}
+        options={openFilter === 'plant' ? PLANTS : openFilter === 'workshop' ? WORKSHOPS : divisionsForWorkshop(workshop)}
         value={openFilter === 'plant' ? plant : openFilter === 'workshop' ? workshop : division}
         onClose={() => setOpenFilter(null)}
         onSelect={(next) => {

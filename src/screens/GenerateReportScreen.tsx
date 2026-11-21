@@ -53,7 +53,7 @@ import {
   formatDowntimeMinutes,
   totalDowntimeMinutes,
 } from '../utils/downtime';
-import { PLANTS, WORKSHOPS, DIVISIONS } from '../constants/lineOptions';
+import { PLANTS, WORKSHOPS, divisionsForWorkshop, workshopHasDivisions } from '../constants/lineOptions';
 // npm install react-native-gifted-charts react-native-svg
 import { BarChart, LineChart, PieChart } from 'react-native-gifted-charts';
 // npm install xlsx-js-style && npx expo install expo-file-system expo-sharing
@@ -228,7 +228,8 @@ function deriveReasonFromStops(events: StopEventRecord[] | null): string | null 
 // rather than an exact hardcoded string so this doesn't silently break if the
 // exact label in lineOptions.ts changes (e.g. "Assembly" vs "Assembly Shop").
 function isAssemblyWorkshop(w: string | null) {
-  return !!w && w.toLowerCase().includes('assembly');
+  // Workshops with a Division filter: Assembly, and Welding (Div-1 … Div-5).
+  return workshopHasDivisions(w);
 }
 
 function pad2(n: number) {
@@ -434,7 +435,7 @@ export default function GenerateReportScreen() {
   // different workshop — the field disappeared from the UI while silently
   // filtering out every record. Clear it whenever it's no longer applicable.
   useEffect(() => {
-    if (!isAssemblyWorkshop(workshop) && division) setDivision(null);
+    if (division && (!isAssemblyWorkshop(workshop) || !divisionsForWorkshop(workshop).includes(division))) setDivision(null);
   }, [workshop]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Clear a selected line if it falls outside the current plant/workshop/division filters
@@ -1325,7 +1326,7 @@ export default function GenerateReportScreen() {
       case 'workshop':
         return [{ key: 'ANY', label: 'Any' }, ...WORKSHOPS.map((w) => ({ key: w, label: w }))];
       case 'division':
-        return [{ key: 'ANY', label: 'Any' }, ...DIVISIONS.map((d) => ({ key: d, label: d }))];
+        return [{ key: 'ANY', label: 'Any' }, ...divisionsForWorkshop(workshop).map((d) => ({ key: d, label: d }))];
       case 'line':
         return [
           { key: 'ALL', label: 'All lines' },

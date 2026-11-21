@@ -29,7 +29,7 @@ import {
   downtimeSessionKey,
 } from './downtime';
 import { LiveSession, currentStop, formatStopReason, recordsForSession } from './lineEfficiency';
-import { buildSlots } from './productionSchedule';
+import { buildSlots, scheduleProfileFor } from './productionSchedule';
 import {
   LinePartsLookup,
   RunningLineCard,
@@ -519,7 +519,7 @@ export function liveLines(input: {
       cur.expected += r.expectedParts ?? 0;
       bySlot.set(r.slotIndex, cur);
     });
-    const schedule = buildSlots(s.shift, s.otHours, s.changeovers.map((co) => ({ start: co.startAbs, end: co.endAbs })), s.productionStartAbs);
+    const schedule = buildSlots(s.shift, s.otHours, s.changeovers.map((co) => ({ start: co.startAbs, end: co.endAbs })), s.productionStartAbs, scheduleProfileFor(s));
     const slots: LiveSlot[] = schedule
       .filter((sl) => card.slots.bySlot[sl.index] != null)
       .map((sl) => ({

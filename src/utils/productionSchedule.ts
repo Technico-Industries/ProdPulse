@@ -45,7 +45,7 @@ export const SHIFT_B_REJECTION_CLEARANCE: TimeInterval = { start: 24 * 60 + 3 * 
 // Overtime tea break, 4:30–4:40 AM — only reached when OT runs past 4:30.
 export const SHIFT_B_OT_TEA_BREAK: TimeInterval = { start: 24 * 60 + 4 * 60 + 30, end: 24 * 60 + 4 * 60 + 40 };
 
-function shiftBreaks(shift: ShiftCode, otHours: number): TimeInterval[] {
+function assemblyShiftBreaks(shift: ShiftCode, otHours: number): TimeInterval[] {
   if (shift === 'A') return BREAKS;
   return [
     SHIFT_B_DINNER_BREAK,
@@ -76,9 +76,143 @@ export const FIXED_PRODUCTIVE_MINUTES_BY_HOUR: Record<number, number> = {
 // Productive-minute ceiling for a slot whose nominal hour starts at
 // `hourStartAbs`, or null when the slot has no fixed rule. Matched on clock
 // time of day, so Shift B's after-midnight frame (+1440) maps correctly.
-export function fixedProductiveMinutesFor(hourStartAbs: number): number | null {
+export function fixedProductiveMinutesFor(
+  hourStartAbs: number,
+  ceilings: Record<number, number> = FIXED_PRODUCTIVE_MINUTES_BY_HOUR
+): number | null {
   const ofDay = ((hourStartAbs % 1440) + 1440) % 1440;
-  return FIXED_PRODUCTIVE_MINUTES_BY_HOUR[ofDay] ?? null;
+  return ceilings[ofDay] ?? null;
+}
+
+// ─── Workshop schedule profiles ──────────────────────────────────────────────
+// Each workshop that records production keeps its own shift timings, lunch,
+// tea breaks and fixed-hour rules. Every schedule function below takes an
+// optional profile and defaults to ASSEMBLY_SCHEDULE, so the Assembly
+// schedule (and everything already built on it) is unchanged; Bawal 1 →
+// Welding passes WELDING_SCHEDULE (see scheduleProfileFor).
+
+export type ScheduleProfileId = 'assembly' | 'welding';
+
+export type ShiftSchedule = {
+  // Regular shift window (absolute minutes; Shift B in its +1440 frame).
+  start: number;
+  end: number;
+  // Lunch the slots are bent around (the hour holding it becomes a break
+  // card) and that no changeover may touch. null when the shift has none.
+  lunch: TimeInterval | null;
+  // Every scheduled break of the shift for this OT, lunch included.
+  breaks: (otHours: number) => TimeInterval[];
+  // Fixed productive-minute ceilings by clock hour (see FIXED_PRODUCTIVE_MINUTES_BY_HOUR).
+  fixedCeilings: (otHours: number) => Record<number, number>;
+  // Clock window in which a new session of this shift may be started.
+  startWindow: TimeInterval;
+};
+
+export type ScheduleProfile = {
+  id: ScheduleProfileId;
+  shifts: Record<ShiftCode, ShiftSchedule>;
+};
+
+export const ASSEMBLY_SCHEDULE: ScheduleProfile = {
+  id: 'assembly',
+  shifts: {
+    A: {
+      start: SHIFT_A_START,
+      end: SHIFT_A_END,
+      lunch: LUNCH_BREAK,
+      breaks: (ot) => assemblyShiftBreaks('A', ot),
+      fixedCeilings: () => FIXED_PRODUCTIVE_MINUTES_BY_HOUR,
+      startWindow: { start: 7 * 60, end: 18 * 60 + 30 },
+    },
+    B: {
+      start: SHIFT_B_START,
+      end: SHIFT_B_END_ABS,
+      // Shift B never reaches the 12:15 lunch (its frame starts at 19:00), so
+      // it never bends a slot; it is kept so changeover validation answers
+      // exactly as before profiles existed.
+      lunch: LUNCH_BREAK,
+      breaks: (ot) => assemblyShiftBreaks('B', ot),
+      fixedCeilings: () => FIXED_PRODUCTIVE_MINUTES_BY_HOUR,
+      startWindow: { start: 19 * 60, end: 6 * 60 + 30 },
+    },
+  },
+};
+
+// ── Bawal 1 → Welding ──
+// Shift A 7:00 AM – 5:00 PM, lunch 11:15–11:45 AM: 10:00–11:15 and
+// 11:45–1:00 are the two 75-minute slots. Tea 9:30–9:40 AM and 2:00–2:10 PM;
+// the first 10 minutes (7:00–7:10) are the startup reserve.
+// Shift B 5:00 PM – 3:00 AM, lunch 9:15–9:45 PM: 8:00–9:15 and 9:45–11:00
+// are the 75-minute slots. Tea 1:30–1:40 AM, startup reserve 5:00–5:10 PM,
+// and the 4:30–4:40 AM tea break only when overtime is worked.
+export const WELDING_SHIFT_A_START = 7 * 60;
+export const WELDING_SHIFT_A_END = 17 * 60;
+export const WELDING_SHIFT_B_START = 17 * 60;
+export const WELDING_SHIFT_B_END_ABS = 24 * 60 + 3 * 60;
+export const WELDING_SHIFT_A_LUNCH: TimeInterval = { start: 11 * 60 + 15, end: 11 * 60 + 45 };
+export const WELDING_SHIFT_B_LUNCH: TimeInterval = { start: 21 * 60 + 15, end: 21 * 60 + 45 };
+export const WELDING_SHIFT_A_TEA_BREAKS: TimeInterval[] = [
+  { start: 9 * 60 + 30, end: 9 * 60 + 40 },
+  { start: 14 * 60, end: 14 * 60 + 10 },
+];
+export const WELDING_SHIFT_B_TEA_BREAK: TimeInterval = { start: 24 * 60 + 60 + 30, end: 24 * 60 + 60 + 40 };
+export const WELDING_SHIFT_B_OT_TEA_BREAK: TimeInterval = { start: 24 * 60 + 4 * 60 + 30, end: 24 * 60 + 4 * 60 + 40 };
+// Shift A overtime: the 5–6 PM hour is held at 50 productive minutes only
+// when 3 or more OT hours are worked; with 1–2 OT hours it is a full 60.
+export const WELDING_OT_FIXED_HOUR_MIN_OT = 3;
+
+export const WELDING_SCHEDULE: ScheduleProfile = {
+  id: 'welding',
+  shifts: {
+    A: {
+      start: WELDING_SHIFT_A_START,
+      end: WELDING_SHIFT_A_END,
+      lunch: WELDING_SHIFT_A_LUNCH,
+      breaks: () => [WELDING_SHIFT_A_TEA_BREAKS[0], WELDING_SHIFT_A_LUNCH, WELDING_SHIFT_A_TEA_BREAKS[1]],
+      fixedCeilings: (ot) => ({
+        [7 * 60]: 50,
+        [9 * 60]: 50,
+        [14 * 60]: 50,
+        ...(ot >= WELDING_OT_FIXED_HOUR_MIN_OT ? { [17 * 60]: 50 } : {}),
+      }),
+      startWindow: { start: 7 * 60, end: 17 * 60 },
+    },
+    B: {
+      start: WELDING_SHIFT_B_START,
+      end: WELDING_SHIFT_B_END_ABS,
+      lunch: WELDING_SHIFT_B_LUNCH,
+      breaks: (ot) => [WELDING_SHIFT_B_LUNCH, WELDING_SHIFT_B_TEA_BREAK, ...(ot > 0 ? [WELDING_SHIFT_B_OT_TEA_BREAK] : [])],
+      // Shift B keeps each slot's own productive time (the startup reserve
+      // and tea breaks already make 5–6 PM, 1–2 AM and OT 4–5 AM 50 minutes).
+      fixedCeilings: () => ({}),
+      startWindow: { start: 17 * 60, end: 6 * 60 + 30 },
+    },
+  },
+};
+
+function normalizeLabel(v: unknown) {
+  return String(v ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+// The schedule a line / session runs on, from its plant and workshop.
+// Only Bawal 1 → Welding has its own schedule ("Bawal 1", "Bawal - 1",
+// "Welding", "Welding Shop" all match); everything else keeps Assembly's,
+// as before. A stored `scheduleProfile` id on a session wins when present.
+export function scheduleProfileFor(src: {
+  plant?: string | null;
+  workshop?: string | null;
+  scheduleProfile?: unknown;
+} | null | undefined): ScheduleProfile {
+  if (src?.scheduleProfile === 'welding') return WELDING_SCHEDULE;
+  if (src?.scheduleProfile === 'assembly') return ASSEMBLY_SCHEDULE;
+  const plant = normalizeLabel(src?.plant);
+  const workshop = normalizeLabel(src?.workshop);
+  if (plant === 'bawal1' && workshop.includes('welding')) return WELDING_SCHEDULE;
+  return ASSEMBLY_SCHEDULE;
+}
+
+export function shiftSchedule(shift: ShiftCode, profile: ScheduleProfile = ASSEMBLY_SCHEDULE): ShiftSchedule {
+  return profile.shifts[shift];
 }
 
 export type ScheduleSlot = {
@@ -153,25 +287,30 @@ export function productiveMinutesIn(from: number, to: number, nonProductive: Tim
   return Math.max(0, round2(to - from - coveredMinutes(from, to, nonProductive)));
 }
 
-export function shiftWindow(shift: ShiftCode, otHours: number): TimeInterval {
-  const start = shift === 'A' ? SHIFT_A_START : SHIFT_B_START;
-  const end = (shift === 'A' ? SHIFT_A_END : SHIFT_B_END_ABS) + otHours * 60;
-  return { start, end };
+export function shiftWindow(shift: ShiftCode, otHours: number, profile: ScheduleProfile = ASSEMBLY_SCHEDULE): TimeInterval {
+  const sch = shiftSchedule(shift, profile);
+  return { start: sch.start, end: sch.end + otHours * 60 };
 }
 
 // Scheduled non-productive time for a shift: its breaks and the first
 // slot's startup reserve. Shift A's overtime has no break of its own — 4–5 PM
 // is a full 60-minute slot; Shift B's has the 4:30–4:40 AM tea break.
-export function scheduledNonProductive(shift: ShiftCode, otHours: number): TimeInterval[] {
-  const { start } = shiftWindow(shift, otHours);
-  return [...shiftBreaks(shift, otHours), { start, end: start + STARTUP_RESERVE_MINUTES }];
+export function scheduledNonProductive(shift: ShiftCode, otHours: number, profile: ScheduleProfile = ASSEMBLY_SCHEDULE): TimeInterval[] {
+  const { start } = shiftWindow(shift, otHours, profile);
+  return [...shiftSchedule(shift, profile).breaks(otHours), { start, end: start + STARTUP_RESERVE_MINUTES }];
 }
 
 // Productive minutes of one slot window: the window's own productive time,
 // capped by the slot's fixed rule when it has one.
-export function slotProductiveMinutes(hourStartAbs: number, from: number, to: number, nonProductive: TimeInterval[]) {
+export function slotProductiveMinutes(
+  hourStartAbs: number,
+  from: number,
+  to: number,
+  nonProductive: TimeInterval[],
+  ceilings: Record<number, number> = FIXED_PRODUCTIVE_MINUTES_BY_HOUR
+) {
   const natural = productiveMinutesIn(from, to, nonProductive);
-  const fixed = fixedProductiveMinutesFor(hourStartAbs);
+  const fixed = fixedProductiveMinutesFor(hourStartAbs, ceilings);
   return fixed == null ? natural : Math.min(fixed, natural);
 }
 
@@ -192,9 +331,12 @@ export function buildSlots(
   shift: ShiftCode,
   otHours: number,
   changeoverIntervals: TimeInterval[] = [],
-  productionStartAbs: number | null = null
+  productionStartAbs: number | null = null,
+  profile: ScheduleProfile = ASSEMBLY_SCHEDULE
 ): ScheduleSlot[] {
-  const { start: shiftStart, end: shiftEnd } = shiftWindow(shift, otHours);
+  const { start: shiftStart, end: shiftEnd } = shiftWindow(shift, otHours, profile);
+  const { lunch } = shiftSchedule(shift, profile);
+  const ceilings = shiftSchedule(shift, profile).fixedCeilings(otHours);
 
   const windows: { hourStart: number; hourEnd: number; start: number; end: number; isBreak: boolean }[] = [];
   for (let h = shiftStart; h < shiftEnd; h += 60) {
@@ -205,23 +347,23 @@ export function buildSlots(
   // Bend the slots around lunch: the hour containing it becomes the lunch
   // interval only, the previous slot runs up to lunch start and the next
   // one starts at lunch end. Only applies when lunch sits strictly inside an
-  // hour with a slot on each side (Shift A) — Shift B never reaches it.
-  const lunchIdx = windows.findIndex(
-    (w) => w.start < LUNCH_BREAK.start && LUNCH_BREAK.end <= w.end
-  );
-  if (lunchIdx > 0 && lunchIdx < windows.length - 1) {
-    windows[lunchIdx - 1].end = LUNCH_BREAK.start;
-    windows[lunchIdx].start = LUNCH_BREAK.start;
-    windows[lunchIdx].end = LUNCH_BREAK.end;
+  // hour with a slot on each side (Assembly Shift A, both Welding shifts).
+  const lunchIdx = lunch
+    ? windows.findIndex((w) => w.start < lunch.start && lunch.end <= w.end)
+    : -1;
+  if (lunch && lunchIdx > 0 && lunchIdx < windows.length - 1) {
+    windows[lunchIdx - 1].end = lunch.start;
+    windows[lunchIdx].start = lunch.start;
+    windows[lunchIdx].end = lunch.end;
     windows[lunchIdx].isBreak = true;
-    windows[lunchIdx + 1].start = LUNCH_BREAK.end;
+    windows[lunchIdx + 1].start = lunch.end;
   }
 
   const start = productionStartAbs != null && Number.isFinite(productionStartAbs) && productionStartAbs > shiftStart
     ? productionStartAbs
     : null;
 
-  const nonProductive = [...scheduledNonProductive(shift, otHours), ...changeoverIntervals];
+  const nonProductive = [...scheduledNonProductive(shift, otHours, profile), ...changeoverIntervals];
   return windows
     .map((w, idx) => ({ w, idx }))
     .filter(({ w }) => start == null || w.end > start)
@@ -235,7 +377,7 @@ export function buildSlots(
         startMinutesAbs: from,
         endMinutesAbs: w.end,
         durationMinutes: w.end - from,
-        productiveMinutes: slotProductiveMinutes(w.hourStart, from, w.end, nonProductive),
+        productiveMinutes: slotProductiveMinutes(w.hourStart, from, w.end, nonProductive, ceilings),
         isBreak: w.isBreak,
         startAdjusted,
         label: startAdjusted
@@ -307,22 +449,29 @@ export type ChangeoverValidationInput = {
   // Single-time changeovers are an instant (start === end). Without this
   // flag an instant is rejected — only start/end intervals are accepted.
   allowInstant?: boolean;
+  // The shift's lunch (ShiftSchedule.lunch). Omitted → Assembly's 12:15–12:45
+  // lunch, as before; null → the shift has no lunch to rule out.
+  lunch?: TimeInterval | null;
 };
 
-export const LUNCH_CHANGEOVER_MESSAGE =
-  `A changeover cannot be recorded during the lunch break (${formatAbsMinutesToAmPm(LUNCH_BREAK.start)} – ${formatAbsMinutesToAmPm(LUNCH_BREAK.end)}). ` +
-  `Enter a time before ${formatAbsMinutesToAmPm(LUNCH_BREAK.start)} or from ${formatAbsMinutesToAmPm(LUNCH_BREAK.end)} onwards.`;
+export function lunchChangeoverMessage(lunch: TimeInterval) {
+  return `A changeover cannot be recorded during the lunch break (${formatAbsMinutesToAmPm(lunch.start)} – ${formatAbsMinutesToAmPm(lunch.end)}). ` +
+    `Enter a time before ${formatAbsMinutesToAmPm(lunch.start)} or from ${formatAbsMinutesToAmPm(lunch.end)} onwards.`;
+}
+
+export const LUNCH_CHANGEOVER_MESSAGE = lunchChangeoverMessage(LUNCH_BREAK);
 
 // Shared changeover rule check. Returns an error message, or null if valid.
-export function validateChangeoverInterval({ interval, slots, otherIntervals, allowInstant }: ChangeoverValidationInput): string | null {
+export function validateChangeoverInterval({ interval, slots, otherIntervals, allowInstant, lunch: lunchIn }: ChangeoverValidationInput): string | null {
   const { start, end } = interval;
   if (!Number.isFinite(start) || !Number.isFinite(end)) return 'Enter a valid start and end time.';
   if (end < start || (end === start && !allowInstant)) return 'The changeover end time must be after its start time.';
 
-  const touchesLunch = end === start
-    ? start >= LUNCH_BREAK.start && start < LUNCH_BREAK.end
-    : intervalsOverlap(interval, LUNCH_BREAK);
-  if (touchesLunch) return LUNCH_CHANGEOVER_MESSAGE;
+  const lunch = lunchIn === undefined ? LUNCH_BREAK : lunchIn;
+  const touchesLunch = lunch != null && (end === start
+    ? start >= lunch.start && start < lunch.end
+    : intervalsOverlap(interval, lunch));
+  if (touchesLunch) return lunch === LUNCH_BREAK ? LUNCH_CHANGEOVER_MESSAGE : lunchChangeoverMessage(lunch!);
 
   const productionSlots = slots.filter((s) => !s.isBreak);
   const startSlot = productionSlots.find((s) => start >= s.startMinutesAbs && start < s.endMinutesAbs);
@@ -390,14 +539,15 @@ export function validateProductionStartTime(
   text: string,
   shift: ShiftCode,
   otHours: number,
-  nowAbs: number | null = null
+  nowAbs: number | null = null,
+  profile: ScheduleProfile = ASSEMBLY_SCHEDULE
 ): ProductionStartCheck {
   const minuteOfDay = parseTimeInput(text);
   if (minuteOfDay == null) {
     return { ok: false, error: 'Enter the production start time as HH:MM in 24-hour format, e.g. 07:05 or 14:15.' };
   }
   const startAbs = timeOfDayToShiftAbs(minuteOfDay, shift);
-  const { start, end } = shiftWindow(shift, otHours);
+  const { start, end } = shiftWindow(shift, otHours, profile);
   if (startAbs < start || startAbs >= end) {
     return {
       ok: false,
@@ -421,13 +571,14 @@ export function validateProductionStartTime(
 // Start inclusive, end exclusive. 18:30–19:00 and 06:30–07:00 belong to
 // neither shift. Applies only to starting a new session — a running session
 // is never blocked by it.
+// Welding (WELDING_SCHEDULE): Shift A 07:00 – 17:00, Shift B 17:00 – 06:30.
 export const SHIFT_START_WINDOWS: Record<ShiftCode, TimeInterval> = {
-  A: { start: 7 * 60, end: 18 * 60 + 30 },
-  B: { start: 19 * 60, end: 6 * 60 + 30 }, // wraps past midnight
+  A: ASSEMBLY_SCHEDULE.shifts.A.startWindow,
+  B: ASSEMBLY_SCHEDULE.shifts.B.startWindow, // wraps past midnight
 };
 
-function inStartWindow(shift: ShiftCode, minuteOfDay: number): boolean {
-  const { start, end } = SHIFT_START_WINDOWS[shift];
+function inStartWindow(shift: ShiftCode, minuteOfDay: number, profile: ScheduleProfile = ASSEMBLY_SCHEDULE): boolean {
+  const { start, end } = shiftSchedule(shift, profile).startWindow;
   return start < end
     ? minuteOfDay >= start && minuteOfDay < end
     : minuteOfDay >= start || minuteOfDay < end;
@@ -435,18 +586,18 @@ function inStartWindow(shift: ShiftCode, minuteOfDay: number): boolean {
 
 // The shift that may be started at this minute of the day, or null in the
 // gaps between the two windows.
-export function shiftForStartTime(minuteOfDay: number): ShiftCode | null {
-  if (inStartWindow('A', minuteOfDay)) return 'A';
-  if (inStartWindow('B', minuteOfDay)) return 'B';
+export function shiftForStartTime(minuteOfDay: number, profile: ScheduleProfile = ASSEMBLY_SCHEDULE): ShiftCode | null {
+  if (inStartWindow('A', minuteOfDay, profile)) return 'A';
+  if (inStartWindow('B', minuteOfDay, profile)) return 'B';
   return null;
 }
 
 // Error message when `shift` may not be started at `minuteOfDay`, else null.
-export function validateShiftStartWindow(shift: ShiftCode, minuteOfDay: number): string | null {
-  if (inStartWindow(shift, minuteOfDay)) return null;
-  const w = SHIFT_START_WINDOWS[shift];
+export function validateShiftStartWindow(shift: ShiftCode, minuteOfDay: number, profile: ScheduleProfile = ASSEMBLY_SCHEDULE): string | null {
+  if (inStartWindow(shift, minuteOfDay, profile)) return null;
+  const w = shiftSchedule(shift, profile).startWindow;
   const now = formatAbsMinutesToAmPm(minuteOfDay);
-  const allowed = shiftForStartTime(minuteOfDay);
+  const allowed = shiftForStartTime(minuteOfDay, profile);
   return (
     `Shift ${shift} can only be started between ${formatAbsMinutesToAmPm(w.start)} and ${formatAbsMinutesToAmPm(w.end)}. ` +
     `The current time is ${now}` +
@@ -467,9 +618,10 @@ export type ChangeoverPlacement =
 export function placeChangeoverTime(
   atAbs: number,
   slots: ScheduleSlot[],
-  otherIntervals: TimeInterval[]
+  otherIntervals: TimeInterval[],
+  lunch?: TimeInterval | null
 ): ChangeoverPlacement {
-  const error = validateChangeoverInterval({ interval: { start: atAbs, end: atAbs }, slots, otherIntervals, allowInstant: true });
+  const error = validateChangeoverInterval({ interval: { start: atAbs, end: atAbs }, slots, otherIntervals, allowInstant: true, lunch });
   if (error) return { ok: false, error };
   const slot = slots.find((s) => !s.isBreak && atAbs >= s.startMinutesAbs && atAbs < s.endMinutesAbs);
   if (!slot) return { ok: false, error: 'The changeover time is outside this shift\'s production slots.' };

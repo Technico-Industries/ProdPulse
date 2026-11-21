@@ -24,7 +24,7 @@ import {
 } from 'firebase/firestore';
 import { db } from '../services/firebase';
 import { useAuthStore } from '../stores/authStore';
-import { PLANTS, WORKSHOPS, DIVISIONS } from '../constants/lineOptions';
+import { PLANTS, WORKSHOPS, divisionsForWorkshop } from '../constants/lineOptions';
 
 interface PartRow {
   id: string;
@@ -217,8 +217,17 @@ export default function RegisterLineScreen() {
           <Text style={styles.sectionLabel}>LOCATION</Text>
 
           <ChipSelector label="PLANT" options={PLANTS} value={plant} onChange={setPlant} />
-          <ChipSelector label="WORKSHOP" options={WORKSHOPS} value={workshop} onChange={setWorkshop} />
-          <ChipSelector label="DIVISION" options={DIVISIONS} value={division} onChange={setDivision} />
+          <ChipSelector
+            label="WORKSHOP"
+            options={WORKSHOPS}
+            value={workshop}
+            onChange={(w) => {
+              setWorkshop(w);
+              // Welding has its own divisions (Div-1 … Div-5).
+              if (division && !divisionsForWorkshop(w).includes(division)) setDivision(null);
+            }}
+          />
+          <ChipSelector label="DIVISION" options={divisionsForWorkshop(workshop)} value={division} onChange={setDivision} />
 
           <View style={styles.field}>
             <Text style={styles.label}>LINE NAME</Text>

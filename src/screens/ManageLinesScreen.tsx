@@ -16,7 +16,7 @@ import WebRefreshButton from '../components/WebRefreshButton';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { collection, getDocs, orderBy, query, deleteDoc, doc } from 'firebase/firestore';
 import { db } from '../services/firebase';
-import { WORKSHOPS, DIVISIONS } from '../constants/lineOptions';
+import { WORKSHOPS, divisionsForWorkshop } from '../constants/lineOptions';
 
 interface LineItem {
   id: string;
@@ -166,7 +166,7 @@ export default function ManageLinesScreen() {
           <Text style={styles.filterLabel}>WORKSHOP</Text>
           <View style={styles.chipRow}>
             <Pressable
-              onPress={() => setFilterWorkshop(null)}
+              onPress={() => { setFilterWorkshop(null); if (filterDivision && !divisionsForWorkshop(null).includes(filterDivision)) setFilterDivision(null); }}
               style={[styles.chip, !filterWorkshop && styles.chipSelected]}
             >
               <Text style={[styles.chipText, !filterWorkshop && styles.chipTextSelected]}>All</Text>
@@ -176,7 +176,11 @@ export default function ManageLinesScreen() {
               return (
                 <Pressable
                   key={w}
-                  onPress={() => setFilterWorkshop(selected ? null : w)}
+                  onPress={() => {
+                    const next = selected ? null : w;
+                    setFilterWorkshop(next);
+                    if (filterDivision && !divisionsForWorkshop(next).includes(filterDivision)) setFilterDivision(null);
+                  }}
                   style={[styles.chip, selected && styles.chipSelected]}
                 >
                   <Text style={[styles.chipText, selected && styles.chipTextSelected]}>{w}</Text>
@@ -195,7 +199,7 @@ export default function ManageLinesScreen() {
             >
               <Text style={[styles.chipText, !filterDivision && styles.chipTextSelected]}>All</Text>
             </Pressable>
-            {DIVISIONS.map((d) => {
+            {divisionsForWorkshop(filterWorkshop).map((d) => {
               const selected = filterDivision === d;
               return (
                 <Pressable

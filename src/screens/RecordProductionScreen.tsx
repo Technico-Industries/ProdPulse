@@ -96,14 +96,16 @@ import {
   resolveSessionProductionDate,
   timestampToMillis,
 } from '../utils/productionDay';
-import { PLANTS, WORKSHOPS, DIVISIONS } from '../constants/lineOptions';
+import { PLANTS, WORKSHOPS, divisionsForWorkshop, workshopHasDivisions } from '../constants/lineOptions';
 import {
-  SHIFT_A_START,
-  SHIFT_A_END,
-  SHIFT_B_START,
-  SHIFT_B_END_ABS,
+  ASSEMBLY_SCHEDULE,
   LUNCH_BREAK,
+  STARTUP_RESERVE_MINUTES,
+  ScheduleProfile,
   ScheduleSlot,
+  intervalsOverlap,
+  scheduleProfileFor,
+  shiftSchedule,
   TimeInterval,
   buildSlots,
   scheduledNonProductive,
@@ -120,7 +122,6 @@ import {
   validateProductionStartTime,
   validateShiftStartWindow,
   shiftForStartTime,
-  SHIFT_START_WINDOWS,
   formatAbsMinutes24,
 } from '../utils/productionSchedule';
 import {
@@ -742,11 +743,33 @@ function formatSessionStartedAt(ms: number | null): string {
   return `${day}/${mon} · ${formatAbsMinutesToAmPm(d.getHours() * 60 + d.getMinutes())}`;
 }
 
-// Default Production Start Time for a shift: its scheduled start (Shift A
-// 07:00, Shift B 19:00). The supervisor overwrites it when production
-// actually started later.
-function defaultStartTimeText(shift: 'A' | 'B'): string {
-  return formatAbsMinutes24(shift === 'A' ? SHIFT_A_START : SHIFT_B_START);
+// Default Production Start Time for a shift: its scheduled start (Assembly
+// Shift A 07:00, Shift B 19:00; Welding 07:00 / 17:00). The supervisor
+// overwrites it when production actually started later.
+function defaultStartTimeText(shift: 'A' | 'B', profile: ScheduleProfile = ASSEMBLY_SCHEDULE): string {
+  return formatAbsMinutes24(shiftSchedule(shift, profile).start);
+}
+
+// "Shift A · 07:00 AM – 03:30 PM" for the workshop's schedule.
+function shiftRangeLabel(shift: 'A' | 'B', profile: ScheduleProfile): string {
+  const sch = shiftSchedule(shift, profile);
+  return `Shift ${shift} · ${formatAbsMinutesToAmPm(sch.start)} – ${formatAbsMinutesToAmPm(sch.end)}`;
+}
+
+// Tea breaks / startup reserve inside a slot, for the slot card (Welding
+// only — Assembly cards are unchanged). Lunch has its own break card.
+function slotBreakNote(s: ScheduleSlot, shift: 'A' | 'B', otHours: number, profile: ScheduleProfile): string {
+  if (profile.id === 'assembly') return '';
+  const sch = shiftSchedule(shift, profile);
+  const win = { start: s.startMinutesAbs, end: s.endMinutesAbs };
+  const parts: string[] = [];
+  const reserve = { start: sch.start, end: sch.start + STARTUP_RESERVE_MINUTES };
+  if (intervalsOverlap(win, reserve)) parts.push(`Startup ${formatAbsMinutesToAmPm(reserve.start)}–${formatAbsMinutesToAmPm(reserve.end)}`);
+  for (const b of sch.breaks(otHours)) {
+    if (sch.lunch && b.start === sch.lunch.start && b.end === sch.lunch.end) continue;
+    if (intervalsOverlap(win, b)) parts.push(`Tea break ${formatAbsMinutesToAmPm(b.start)}–${formatAbsMinutesToAmPm(b.end)}`);
+  }
+  return parts.length ? ` · ${parts.join(' · ')} (not counted)` : '';
 }
 
 function localMinuteOfDay(ms: number = Date.now()): number {
@@ -756,9 +779,9 @@ function localMinuteOfDay(ms: number = Date.now()): number {
 
 // The shift that may be started right now; Shift B in its 18:30–19:00
 // lead-in gap, Shift A in 06:30–07:00 (the next shift to come).
-function currentStartableShift(): 'A' | 'B' {
+function currentStartableShift(profile: ScheduleProfile = ASSEMBLY_SCHEDULE): 'A' | 'B' {
   const m = localMinuteOfDay();
-  return shiftForStartTime(m) ?? (m >= 12 * 60 ? 'B' : 'A');
+  return shiftForStartTime(m, profile) ?? (m >= 12 * 60 ? 'B' : 'A');
 }
 
 // Planned parts for a list of slots on one part (the shift's planned total
@@ -767,13 +790,6 @@ function plannedTotalFor(slotList: Slot[], line: Line | null, partIndex: number)
   const cycle = line?.parts?.[partIndex]?.cycleTimeSeconds ?? 0;
   if (!cycle) return 0;
   return slotList.reduce((sum, s) => sum + expectedPartsFor(cycle, s.productiveMinutes), 0);
-}
-
-// Division only applies under the Assembly workshop. Matched by substring
-// rather than an exact hardcoded string so this keeps working even if the
-// exact label in lineOptions.ts changes (e.g. "Assembly" vs "Assembly Shop").
-function isAssemblyWorkshop(w: string | null) {
-  return !!w && w.toLowerCase().includes('assembly');
 }
 
 // Rejection counter of one card: − / + steppers around a numeric field.
@@ -911,6 +927,33 @@ export default function RecordProductionScreen() {
   const [selectedPartIndex, setSelectedPartIndex] = useState(0);
   const selectedLine = allLines.find((l) => l.id === selectedLineId) ?? null;
 
+  // The workshop schedule this line runs on — Bawal 1 → Welding has its own
+  // shift timings, lunch and tea breaks; every other line keeps Assembly's
+  // (see scheduleProfileFor). The line's own plant/workshop win over the
+  // filter chips, the same rule every saved document uses.
+  const schedulePlant = selectedLine?.plant ?? plant;
+  const scheduleWorkshop = selectedLine?.workshop ?? workshop;
+  const scheduleProfile = useMemo(
+    () => scheduleProfileFor({ plant: schedulePlant, workshop: scheduleWorkshop }),
+    [schedulePlant, scheduleWorkshop]
+  );
+  const shiftSch = shiftSchedule(selectedShift, scheduleProfile);
+
+  // Setup only: when the chosen line moves to a workshop with a different
+  // schedule (Assembly ↔ Welding), re-default the shift that may be started
+  // now and its start time from that schedule. A running session's shift
+  // is never touched.
+  const lastProfileIdRef = useRef(scheduleProfile.id);
+  useEffect(() => {
+    if (lastProfileIdRef.current === scheduleProfile.id) return;
+    lastProfileIdRef.current = scheduleProfile.id;
+    // Not while a session is being restored or is running.
+    if (latestRef.current.phase !== 'setup') return;
+    const sh = currentStartableShift(scheduleProfile);
+    setSelectedShift(sh);
+    setStartTimeText(defaultStartTimeText(sh, scheduleProfile));
+  }, [scheduleProfile]);
+
   // ── Production data (active phase)
   const [producedBySlot, setProducedBySlot] = useState<Record<number, number | null>>({});
   // Keyed by String(slot.index) for a normal slot, or `${slot.index}:before`
@@ -967,7 +1010,7 @@ export default function RecordProductionScreen() {
     setDeletedSlotIndices(new Set());
     setProductionDate(null);
     setSessionStartAbs(null);
-    setStartTimeText(defaultStartTimeText(selectedShift));
+    setStartTimeText(defaultStartTimeText(selectedShift, scheduleProfile));
     sessionInstanceRef.current = null;
     confirmedRevisionRef.current = revisionRef.current;
     setSessionSync('saved');
@@ -1174,7 +1217,7 @@ export default function RecordProductionScreen() {
   // stored start, or — on the setup screen — the typed time once it is a
   // valid time inside the shift (the "not in the future" rule is checked
   // against the clock when Start Production is pressed).
-  const setupStartCheck = validateProductionStartTime(startTimeText, selectedShift, otHours);
+  const setupStartCheck = validateProductionStartTime(startTimeText, selectedShift, otHours, null, scheduleProfile);
   const effectiveStartAbs = phase === 'active'
     ? sessionStartAbs
     : setupStartCheck.ok ? setupStartCheck.startAbs : null;
@@ -1185,8 +1228,8 @@ export default function RecordProductionScreen() {
   // its own slot's end reduces the following slot too. Slots before the
   // production start are left out and the slot it falls in is clipped to it.
   const slots = useMemo(
-    () => buildSlots(selectedShift, otHours, changeoverIntervals, effectiveStartAbs),
-    [selectedShift, otHours, changeoverIntervals, effectiveStartAbs]
+    () => buildSlots(selectedShift, otHours, changeoverIntervals, effectiveStartAbs, scheduleProfile),
+    [selectedShift, otHours, changeoverIntervals, effectiveStartAbs, scheduleProfile]
   );
 
   // Every changeover with its BEFORE/AFTER productive minutes recomputed
@@ -1194,7 +1237,7 @@ export default function RecordProductionScreen() {
   // changing OT, can never leave stale minutes behind. This is what gets
   // persisted, validated and listed.
   const allChangeovers = useMemo(() => {
-    const nonProductive = [...scheduledNonProductive(selectedShift, otHours), ...changeoverIntervals];
+    const nonProductive = [...scheduledNonProductive(selectedShift, otHours, scheduleProfile), ...changeoverIntervals];
     const result: Record<number, ChangeoverInfo | null> = {};
     Object.entries(storedChangeovers).forEach(([k, co]) => {
       if (!co) return;
@@ -1405,7 +1448,7 @@ export default function RecordProductionScreen() {
       case 'workshop':
         return [{ key: 'ANY', label: 'Any' }, ...WORKSHOPS.map((w) => ({ key: w, label: w }))];
       case 'division':
-        return [{ key: 'ANY', label: 'Any' }, ...DIVISIONS.map((d) => ({ key: d, label: d }))];
+        return [{ key: 'ANY', label: 'Any' }, ...divisionsForWorkshop(workshop).map((d) => ({ key: d, label: d }))];
       case 'line':
         return filteredLines.map((l) => ({
           key: l.id,
@@ -1417,14 +1460,14 @@ export default function RecordProductionScreen() {
       case 'shift':
         return (['A', 'B'] as const).map((sh) => ({
           key: sh,
-          label: `Shift ${sh} · ${formatAbsMinutesToAmPm(sh === 'A' ? SHIFT_A_START : SHIFT_B_START)} – ${formatAbsMinutesToAmPm(sh === 'A' ? SHIFT_A_END : SHIFT_B_END_ABS)}`,
-          sublabel: `Can be started ${formatAbsMinutesToAmPm(SHIFT_START_WINDOWS[sh].start)} – ${formatAbsMinutesToAmPm(SHIFT_START_WINDOWS[sh].end)}` +
-            (validateShiftStartWindow(sh, localMinuteOfDay()) ? ' · not available now' : ''),
+          label: shiftRangeLabel(sh, scheduleProfile),
+          sublabel: `Can be started ${formatAbsMinutesToAmPm(shiftSchedule(sh, scheduleProfile).startWindow.start)} – ${formatAbsMinutesToAmPm(shiftSchedule(sh, scheduleProfile).startWindow.end)}` +
+            (validateShiftStartWindow(sh, localMinuteOfDay(), scheduleProfile) ? ' · not available now' : ''),
         }));
       default:
         return [];
     }
-  }, [activeDropdown, filteredLines, selectedLine]);
+  }, [activeDropdown, filteredLines, selectedLine, workshop, scheduleProfile]);
 
   const dropdownSelectedKey = useMemo(() => {
     switch (activeDropdown) {
@@ -1450,7 +1493,9 @@ export default function RecordProductionScreen() {
         break;
       case 'workshop':
         setWorkshop(key === 'ANY' ? null : key);
-        if (!isAssemblyWorkshop(key)) setDivision(null);
+        // Each workshop has its own division list (Assembly sections,
+        // Welding Div-1 … Div-5) — drop a division the new one doesn't have.
+        if (!workshopHasDivisions(key) || (division && !divisionsForWorkshop(key).includes(division))) setDivision(null);
         break;
       case 'division':
         setDivision(key === 'ANY' ? null : key);
@@ -1464,7 +1509,7 @@ export default function RecordProductionScreen() {
         break;
       case 'shift':
         setSelectedShift(key as 'A' | 'B');
-        setStartTimeText(defaultStartTimeText(key as 'A' | 'B'));
+        setStartTimeText(defaultStartTimeText(key as 'A' | 'B', scheduleProfile));
         break;
     }
     setActiveDropdown(null);
@@ -1760,7 +1805,7 @@ export default function RecordProductionScreen() {
     const splitSlotsFor = (cos: SyncState['changeovers']) => {
       const list = Object.values(cos).filter(Boolean) as unknown as ChangeoverInfo[];
       const intervals = list.map((co) => ({ start: co.startAbs ?? co.atAbs, end: co.endAbs ?? co.atAbs }));
-      const sched = buildSlots(sd.shift, sd.otHours ?? 0, intervals, storedStart);
+      const sched = buildSlots(sd.shift, sd.otHours ?? 0, intervals, storedStart, scheduleProfileFor(sd));
       const split = new Set<number>();
       for (const co of list) {
         const slot = sched.find((s) => s.index === co.slotIndex);
@@ -2503,7 +2548,7 @@ export default function RecordProductionScreen() {
     // Shift start window: Shift A only 07:00–18:30, Shift B only
     // 19:00–06:30, by the current clock — stops the wrong shift being
     // started by mistake.
-    const windowError = validateShiftStartWindow(selectedShift, localMinuteOfDay(startedMs));
+    const windowError = validateShiftStartWindow(selectedShift, localMinuteOfDay(startedMs), scheduleProfile);
     if (windowError) {
       if (Platform.OS === 'web') window.alert(windowError);
       else Alert.alert('Wrong shift', windowError);
@@ -2515,7 +2560,7 @@ export default function RecordProductionScreen() {
     // Production Start Time: a valid time inside the shift, not in the
     // future, measured on the same production day the session is pinned to.
     const nowAbs = millisToProductionDayMinute(pd, startedMs);
-    const startCheck = validateProductionStartTime(startTimeText, selectedShift, otHours, nowAbs);
+    const startCheck = validateProductionStartTime(startTimeText, selectedShift, otHours, nowAbs, scheduleProfile);
     if (!startCheck.ok) {
       if (Platform.OS === 'web') window.alert(startCheck.error);
       else Alert.alert('Invalid production start time', startCheck.error);
@@ -2548,7 +2593,7 @@ export default function RecordProductionScreen() {
     setStartingProduction(true);
     // Planned total from the schedule for THIS start time (no changeovers or
     // deleted slots exist yet), rather than the last render's value.
-    const plannedTotal = plannedTotalFor(buildSlots(selectedShift, otHours, [], startAbs), selectedLine, selectedPartIndex);
+    const plannedTotal = plannedTotalFor(buildSlots(selectedShift, otHours, [], startAbs, scheduleProfile), selectedLine, selectedPartIndex);
     const sessionInstanceId = newSessionInstanceId();
     try {
       const docRef = doc(db, 'activeSessions', lineId);
@@ -3202,6 +3247,7 @@ export default function RecordProductionScreen() {
       // Single-time changeovers are an instant; older sessions may still
       // hold start/end intervals, which are validated as intervals.
       allowInstant: true,
+      lunch: shiftSch.lunch,
     });
   }
 
@@ -3216,7 +3262,7 @@ export default function RecordProductionScreen() {
       return { ok: false, error: 'Enter the changeover time as HH:MM in 24-hour format (00–23 : 00–59), e.g. 10:20 or 14:05.' };
     }
     const atAbs = timeOfDayToShiftAbs(minuteOfDay, selectedShift);
-    const placement = placeChangeoverTime(atAbs, visibleSlots, otherChangeoverIntervals(-1));
+    const placement = placeChangeoverTime(atAbs, visibleSlots, otherChangeoverIntervals(-1), shiftSch.lunch);
     if (!placement.ok) return placement;
     if (storedChangeovers[placement.slot.index]) {
       return { ok: false, error: `${placement.slot.label} already has a changeover. Remove it first if it needs correcting.` };
@@ -4017,7 +4063,7 @@ export default function RecordProductionScreen() {
           <Text style={[styles.sectionLabel, { marginTop: 8 }]}>LOCATION</Text>
           <PickerBox label="Plant" value={plant} placeholder="Any" onPress={() => setActiveDropdown('plant')} />
           <PickerBox label="Workshop" value={workshop} placeholder="Any" onPress={() => setActiveDropdown('workshop')} />
-          {isAssemblyWorkshop(workshop) && (
+          {workshopHasDivisions(workshop) && (
             <PickerBox label="Division" value={division} placeholder="Any" onPress={() => setActiveDropdown('division')} />
           )}
 
@@ -4048,7 +4094,7 @@ export default function RecordProductionScreen() {
           <Text style={[styles.sectionLabel, { marginTop: 8 }]}>SHIFT CONFIG</Text>
           <PickerBox
             label="Shift"
-            value={`Shift ${selectedShift} · ${formatAbsMinutesToAmPm(selectedShift === 'A' ? SHIFT_A_START : SHIFT_B_START)} – ${formatAbsMinutesToAmPm(selectedShift === 'A' ? SHIFT_A_END : SHIFT_B_END_ABS)}`}
+            value={shiftRangeLabel(selectedShift, scheduleProfile)}
             placeholder="Select shift"
             onPress={() => setActiveDropdown('shift')}
           />
@@ -4083,7 +4129,7 @@ export default function RecordProductionScreen() {
             }
             const nowMsSetup = Date.now();
             const pdSetup = productionDayKeyFor(nowMsSetup);
-            const check = validateProductionStartTime(startTimeText, selectedShift, otHours, millisToProductionDayMinute(pdSetup, nowMsSetup));
+            const check = validateProductionStartTime(startTimeText, selectedShift, otHours, millisToProductionDayMinute(pdSetup, nowMsSetup), scheduleProfile);
             if (!check.ok) return <Text style={[styles.muted, { marginTop: 8, color: '#F0A8A8' }]}>{check.error}</Text>;
             const first = slots[0];
             return first ? (
@@ -4636,7 +4682,7 @@ export default function RecordProductionScreen() {
                     <Text style={styles.muted}>0 min prod.</Text>
                   </View>
                   <Text style={styles.muted}>
-                    Lunch break {formatAbsMinutesToAmPm(LUNCH_BREAK.start)} – {formatAbsMinutesToAmPm(LUNCH_BREAK.end)} · no production
+                    Lunch break {formatAbsMinutesToAmPm(s.startMinutesAbs)} – {formatAbsMinutesToAmPm(s.endMinutesAbs)} · no production
                   </Text>
                 </View>
               );
@@ -4661,7 +4707,7 @@ export default function RecordProductionScreen() {
                 cardKey: `slot-${s.index}`,
                 stopSlotIndex: s.index,
                 timeLabel: s.label,
-                minutesLabel: `${windowPrefix(s)}${productive} min prod.`,
+                minutesLabel: `${windowPrefix(s)}${productive} min prod.${slotBreakNote(s, selectedShift, otHours, scheduleProfile)}`,
                 partName: selectedLine?.parts?.[activePart]?.name ?? '—',
                 expParts,
                 enteredValue: producedVal,
@@ -4804,7 +4850,7 @@ export default function RecordProductionScreen() {
               if (changeTimeText.replace(/\D/g, '').length < 4) {
                 return (
                   <Text style={[styles.muted, { marginTop: 8 }]}>
-                    Type 4 digits, e.g. 1020 → 10:20. No changeover during lunch ({formatAbsMinutesToAmPm(LUNCH_BREAK.start)} – {formatAbsMinutesToAmPm(LUNCH_BREAK.end)}).
+                    Type 4 digits, e.g. 1020 → 10:20. No changeover during lunch ({formatAbsMinutesToAmPm((shiftSch.lunch ?? LUNCH_BREAK).start)} – {formatAbsMinutesToAmPm((shiftSch.lunch ?? LUNCH_BREAK).end)}).
                   </Text>
                 );
               }

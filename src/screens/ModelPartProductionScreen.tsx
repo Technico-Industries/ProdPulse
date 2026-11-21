@@ -35,7 +35,7 @@ import { useNavigation } from '@react-navigation/native';
 import { collection, getDocs } from 'firebase/firestore';
 import { db } from '../services/firebase';
 import { useAuthStore } from '../stores/authStore';
-import { PLANTS, WORKSHOPS, DIVISIONS } from '../constants/lineOptions';
+import { PLANTS, WORKSHOPS, divisionsForWorkshop, workshopHasDivisions } from '../constants/lineOptions';
 import { loadModelPartRecords } from '../services/modelPartProductionQueries';
 import { exportModelPartToExcel } from '../utils/modelPartExcelExport';
 import {
@@ -105,7 +105,8 @@ function formatInt(n: number) {
 }
 
 function isAssemblyWorkshop(w: string | null) {
-  return !!w && w.toLowerCase().includes('assembly');
+  // Workshops with a Division filter: Assembly, and Welding (Div-1 … Div-5).
+  return workshopHasDivisions(w);
 }
 
 const SORTS: { key: PartSort; label: string }[] = [
@@ -275,7 +276,7 @@ function ModelPartProductionContent() {
 
   // Stale selections are cleared, never left filtering out everything unseen.
   useEffect(() => {
-    if (!isAssemblyWorkshop(filters.workshop) && filters.division) setFilters((f) => ({ ...f, division: null }));
+    if (filters.division && (!isAssemblyWorkshop(filters.workshop) || !divisionsForWorkshop(filters.workshop).includes(filters.division))) setFilters((f) => ({ ...f, division: null }));
   }, [filters.workshop]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (filters.lineId && !loadingLines && !scopedLines.some((l) => l.id === filters.lineId)) setFilters((f) => ({ ...f, lineId: null }));
@@ -325,7 +326,7 @@ function ModelPartProductionContent() {
     switch (activeDropdown) {
       case 'plant': return [{ key: 'ANY', label: 'Any' }, ...PLANTS.map((p) => ({ key: p, label: p }))];
       case 'workshop': return [{ key: 'ANY', label: 'Any' }, ...WORKSHOPS.map((w) => ({ key: w, label: w }))];
-      case 'division': return [{ key: 'ANY', label: 'Any' }, ...DIVISIONS.map((d) => ({ key: d, label: d }))];
+      case 'division': return [{ key: 'ANY', label: 'Any' }, ...divisionsForWorkshop(filters.workshop).map((d) => ({ key: d, label: d }))];
       case 'line': return [{ key: 'ANY', label: 'All lines' }, ...scopedLines.map((l) => ({ key: l.id, label: l.lineName ?? l.id }))];
       case 'part': return [{ key: 'ANY', label: 'All models / parts' }, ...parts];
       case 'shift': return [{ key: 'All', label: 'All shifts' }, { key: 'A', label: 'Shift A' }, { key: 'B', label: 'Shift B' }];
