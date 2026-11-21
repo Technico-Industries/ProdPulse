@@ -235,6 +235,25 @@ test('plant / workshop filter', () => {
   });
 });
 
+test('division filter', () => {
+  const lines: RegisteredLine[] = [
+    { id: 'A1', lineName: 'A1', plant: 'Bawal 1', workshop: 'Assembly Shop', division: 'Side Door' },
+    { id: 'A2', lineName: 'A2', plant: 'Bawal 1', workshop: 'Assembly Shop', division: 'Nissan P1324' },
+    { id: 'W1', lineName: 'W1', plant: 'Bawal 1', workshop: 'Welding Shop', division: 'Div-1' },
+    { id: 'X1', lineName: 'X1', plant: 'Bawal 1', workshop: 'Welding Shop', division: null },
+  ];
+  const cards = buildLineCards(lines, [session('W1')], []);
+  const ids = (division: string | null, workshop: string | null = null) =>
+    filterLineCards(cards, { plant: null, workshop, division }).map((c) => c.lineId).sort();
+  assert.deepEqual(ids(null), ['A1', 'A2', 'W1', 'X1']);
+  assert.deepEqual(ids('nissan p1324 '), ['A2']); // case/space-insensitive
+  assert.deepEqual(ids('Div-1'), ['W1']);
+  assert.deepEqual(ids('Div-1', 'Assembly Shop'), []);
+  assert.deepEqual(ids('Div-1', 'Welding Shop'), ['W1']);
+  // Without the field, the old two-filter call is unchanged.
+  assert.equal(filterLineCards(cards, { plant: null, workshop: null }).length, 4);
+});
+
 // ─── Actual / Target under the line name ────────────────────────────────────
 
 // A saved slot as RecordProductionScreen stores it: deterministic ID,

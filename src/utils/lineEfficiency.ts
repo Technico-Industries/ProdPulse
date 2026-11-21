@@ -335,11 +335,12 @@ function sameValue(a: string | null | undefined, b: string | null | undefined) {
 
 export function filterLineCards(
   cards: LineCard[],
-  filters: { plant: string | null; workshop: string | null }
+  filters: { plant: string | null; workshop: string | null; division?: string | null }
 ): LineCard[] {
   return cards.filter(
     (c) =>
       (!filters.plant || sameValue(c.plant, filters.plant)) &&
-      (!filters.workshop || sameValue(c.workshop, filters.workshop))
+      (!filters.workshop || sameValue(c.workshop, filters.workshop)) &&
+      (!filters.division || sameValue(c.division, filters.division))
   );
 }

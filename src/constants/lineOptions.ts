@@ -19,3 +19,12 @@ export function workshopHasDivisions(w: string | null | undefined) {
 export function divisionsForWorkshop(w: string | null | undefined): string[] {
   return isWeldingWorkshop(w) ? WELDING_DIVISIONS : DIVISIONS;
 }
+
+// Every division of every workshop (Assembly's, then Welding's).
+export const ALL_DIVISIONS = [...DIVISIONS, ...WELDING_DIVISIONS];
+
+// Division filter options: the chosen workshop's divisions, or all of them
+// when no workshop is selected.
+export function divisionFilterOptions(workshop: string | null | undefined): string[] {
+  return workshop ? divisionsForWorkshop(workshop) : ALL_DIVISIONS;
+}

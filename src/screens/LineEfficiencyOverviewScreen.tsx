@@ -51,7 +51,7 @@ import { collection, getDocs, onSnapshot, query, where } from 'firebase/firestor
 import { db } from '../services/firebase';
 import AppDrawer from '../components/AppDrawer';
 import { ADMIN_MENU_ITEMS } from '../constants/adminMenu';
-import { PLANTS, WORKSHOPS } from '../constants/lineOptions';
+import { PLANTS, WORKSHOPS, ALL_DIVISIONS, divisionFilterOptions } from '../constants/lineOptions';
 import {
   BAND_COLORS,
   BAND_LABELS,
@@ -271,10 +271,11 @@ function LineTile({
   );
 }
 
-// ─── Plant / Workshop filter ─────────────────────────────────────────────────
-// Same chip + picker as the Production page (AdminOverviewScreen).
+// ─── Plant / Workshop / Division filter ──────────────────────────────────────
+// Same chip + picker as the Production page (AdminOverviewScreen). Also used
+// by the QC Lines page (LiveQualityLinesScreen).
 
-function FilterChip({ label, value, onPress }: { label: string; value: string | null; onPress: () => void }) {
+export function FilterChip({ label, value, onPress }: { label: string; value: string | null; onPress: () => void }) {
   const active = !!value;
   return (
     <Pressable
@@ -292,7 +293,7 @@ function FilterChip({ label, value, onPress }: { label: string; value: string | 
   );
 }
 
-function OptionPickerModal({
+export function OptionPickerModal({
   visible,
   title,
   options,
@@ -339,7 +340,7 @@ function OptionPickerModal({
   );
 }
 
-// Plant / Workshop survive a reload or app restart, like the Production
+// Plant / Workshop / Division survive a reload or app restart, like the Production
 // page's filters.
 const FILTERS_KEY = 'prodpulse.lineEfficiency.filters.v1';
 
@@ -358,7 +359,8 @@ export default function LineEfficiencyOverviewScreen() {
 
   const [plant, setPlant] = useState<string | null>(null);
   const [workshop, setWorkshop] = useState<string | null>(null);
-  const [openFilter, setOpenFilter] = useState<'plant' | 'workshop' | null>(null);
+  const [division, setDivision] = useState<string | null>(null);
+  const [openFilter, setOpenFilter] = useState<'plant' | 'workshop' | 'division' | null>(null);
   const [filtersLoaded, setFiltersLoaded] = useState(false);
 
   useEffect(() => {
@@ -371,6 +373,7 @@ export default function LineEfficiencyOverviewScreen() {
         // back as a filter that never matches.
         if (saved?.plant && PLANTS.includes(saved.plant)) setPlant(saved.plant);
         if (saved?.workshop && WORKSHOPS.includes(saved.workshop)) setWorkshop(saved.workshop);
+        if (saved?.division && ALL_DIVISIONS.includes(saved.division)) setDivision(saved.division);
       })
       .catch((e) => console.warn('[LineEfficiency] could not restore filters', e))
       .finally(() => {
@@ -383,10 +386,15 @@ export default function LineEfficiencyOverviewScreen() {
 
   useEffect(() => {
     if (!filtersLoaded) return;
-    AsyncStorage.setItem(FILTERS_KEY, JSON.stringify({ plant, workshop })).catch((e) =>
+    AsyncStorage.setItem(FILTERS_KEY, JSON.stringify({ plant, workshop, division })).catch((e) =>
       console.warn('[LineEfficiency] could not save filters', e)
     );
-  }, [filtersLoaded, plant, workshop]);
+  }, [filtersLoaded, plant, workshop, division]);
+
+  // A division the chosen workshop doesn't have can never match — clear it.
+  useEffect(() => {
+    if (division && !divisionFilterOptions(workshop).includes(division)) setDivision(null);
+  }, [workshop, division]);
 
   const [lines, setLines] = useState<RegisteredLine[]>([]);
   const [linesLoaded, setLinesLoaded] = useState(false);
@@ -539,7 +547,7 @@ export default function LineEfficiencyOverviewScreen() {
 
   const allCards = useMemo(() => buildLineCards(lines, sessions, records), [lines, sessions, records]);
   // Client-side over the same data — changing a filter never re-queries.
-  const cards = useMemo(() => filterLineCards(allCards, { plant, workshop }), [allCards, plant, workshop]);
+  const cards = useMemo(() => filterLineCards(allCards, { plant, workshop, division }), [allCards, plant, workshop, division]);
   const counts = useMemo(() => summarize(cards), [cards]);
 
   // ── Downtime per running line, from its activeSessions stopsBySlot (the
@@ -560,7 +568,7 @@ export default function LineEfficiencyOverviewScreen() {
     );
     return map;
   }, [sessions, nowMs]);
-  const activeFilterCount = [plant, workshop].filter(Boolean).length;
+  const activeFilterCount = [plant, workshop, division].filter(Boolean).length;
 
   // ── End Production (admin) — see utils/endProduction. The UI check below
   // is not the permission: the transaction re-reads the admin's profile.
@@ -677,7 +685,7 @@ export default function LineEfficiencyOverviewScreen() {
           </View>
         ) : (
           <>
-            {/* ── Plant / Workshop ────────────────────────────────────── */}
+            {/* ── Plant / Workshop / Division ─────────────────────────── */}
             <View style={styles.filterBlock}>
               <View style={styles.filterHeader}>
                 <Text style={styles.sectionLabel}>FILTERS</Text>
@@ -686,6 +694,7 @@ export default function LineEfficiencyOverviewScreen() {
                     onPress={() => {
                       setPlant(null);
                       setWorkshop(null);
+                      setDivision(null);
                     }}
                     hitSlop={8}
                   >
@@ -696,6 +705,7 @@ export default function LineEfficiencyOverviewScreen() {
               <View style={styles.filterRow}>
                 <FilterChip label="Plant" value={plant} onPress={() => setOpenFilter('plant')} />
                 <FilterChip label="Workshop" value={workshop} onPress={() => setOpenFilter('workshop')} />
+                <FilterChip label="Division" value={division} onPress={() => setOpenFilter('division')} />
               </View>
             </View>
 
@@ -756,12 +766,13 @@ export default function LineEfficiencyOverviewScreen() {
                 </View>
                 <Text style={styles.stateTitle}>No lines match these filters</Text>
                 <Text style={styles.stateText}>
-                  None of the {allCards.length} registered lines are in {[plant, workshop].filter(Boolean).join(' · ')}.
+                  None of the {allCards.length} registered lines are in {[plant, workshop, division].filter(Boolean).join(' · ')}.
                 </Text>
                 <Pressable
                   onPress={() => {
                     setPlant(null);
                     setWorkshop(null);
+                    setDivision(null);
                   }}
                   style={({ pressed }) => [styles.retryButton, pressed && styles.pressed]}
                   accessibilityRole="button"
@@ -789,13 +800,14 @@ export default function LineEfficiencyOverviewScreen() {
 
       <OptionPickerModal
         visible={openFilter !== null}
-        title={openFilter === 'plant' ? 'Select Plant' : 'Select Workshop'}
-        options={openFilter === 'plant' ? PLANTS : WORKSHOPS}
-        value={openFilter === 'plant' ? plant : workshop}
+        title={openFilter === 'plant' ? 'Select Plant' : openFilter === 'workshop' ? 'Select Workshop' : 'Select Division'}
+        options={openFilter === 'plant' ? PLANTS : openFilter === 'workshop' ? WORKSHOPS : divisionFilterOptions(workshop)}
+        value={openFilter === 'plant' ? plant : openFilter === 'workshop' ? workshop : division}
         onClose={() => setOpenFilter(null)}
         onSelect={(next) => {
           if (openFilter === 'plant') setPlant(next);
           else if (openFilter === 'workshop') setWorkshop(next);
+          else if (openFilter === 'division') setDivision(next);
           setOpenFilter(null);
         }}
       />

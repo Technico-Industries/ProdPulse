@@ -47,6 +47,8 @@ import AppDrawer from '../components/AppDrawer';
 import { ADMIN_MENU_ITEMS } from '../constants/adminMenu';
 import { QUALITY_MENU_ITEMS } from '../constants/qualityMenu';
 import { LiveSession, RegisteredLine } from '../utils/lineEfficiency';
+import { ALL_DIVISIONS } from '../constants/lineOptions';
+import { FilterChip, OptionPickerModal } from './LineEfficiencyOverviewScreen';
 import {
   QUALITY_COLORS,
   QUALITY_LABELS,
@@ -67,6 +69,12 @@ function formatClock(ms: number): string {
   const h = d.getHours();
   const m = String(d.getMinutes()).padStart(2, '0');
   return `${h % 12 === 0 ? 12 : h % 12}:${m} ${h < 12 ? 'AM' : 'PM'}`;
+}
+
+// Case/whitespace-insensitive division match; no filter matches everything.
+function sameDivision(d: string | null | undefined, filter: string | null) {
+  if (!filter) return true;
+  return d != null && String(d).trim().toLowerCase() === filter.trim().toLowerCase();
 }
 
 function formatInt(n: number) {
@@ -380,7 +388,18 @@ export default function LiveQualityLinesScreen({ role }: { role: 'admin' | 'qual
     () => buildQualityCards(lines, sessions, prodRecords),
     [lines, sessions, prodRecords]
   );
-  const summary = useMemo(() => summarizeQuality(cards), [cards]);
+
+  // ── Division filter — client-side over the same cards, so the summary
+  // tiles, gauges and the not-running list all follow it.
+  const [division, setDivision] = useState<string | null>(null);
+  const [divisionPickerOpen, setDivisionPickerOpen] = useState(false);
+  const visibleCards = useMemo(() => cards.filter((c) => sameDivision(c.division, division)), [cards, division]);
+  const visibleNotRunning = useMemo(() => {
+    if (!division) return notRunning;
+    const divisionById = new Map(lines.map((l) => [l.id, l.division]));
+    return notRunning.filter((l) => sameDivision(divisionById.get(l.lineId), division));
+  }, [notRunning, lines, division]);
+  const summary = useMemo(() => summarizeQuality(visibleCards), [visibleCards]);
 
   // ── Responsive grid — LineEfficiencyOverviewScreen's breakpoints.
   const columns =
@@ -454,6 +473,21 @@ export default function LiveQualityLinesScreen({ role }: { role: 'admin' | 'qual
           </View>
         ) : (
           <>
+            {/* ── Division filter ──────────────────────────────────────── */}
+            <View style={styles.filterBlock}>
+              <View style={styles.filterHeader}>
+                <Text style={styles.sectionLabel}>FILTERS</Text>
+                {division ? (
+                  <Pressable onPress={() => setDivision(null)} hitSlop={8}>
+                    <Text style={styles.linkText}>Clear all</Text>
+                  </Pressable>
+                ) : null}
+              </View>
+              <View style={styles.filterRow}>
+                <FilterChip label="Division" value={division} onPress={() => setDivisionPickerOpen(true)} />
+              </View>
+            </View>
+
             {/* ── Summary — from the same cards the gauges render ─────── */}
             <View style={styles.summaryRow}>
               <SummaryTile
@@ -498,28 +532,30 @@ export default function LiveQualityLinesScreen({ role }: { role: 'admin' | 'qual
             </View>
 
             {/* ── Grid ────────────────────────────────────────────────── */}
-            {cards.length === 0 ? (
+            {visibleCards.length === 0 ? (
               <View style={styles.stateCard}>
                 <View style={[styles.stateIcon, { borderColor: '#5C6670', backgroundColor: '#5C667022' }]}>
                   <Ionicons name="pause-circle-outline" size={30} color="#8A96A3" />
                 </View>
-                <Text style={styles.stateTitle}>No active production sessions</Text>
+                <Text style={styles.stateTitle}>
+                  {division && cards.length > 0 ? `No active sessions in ${division}` : 'No active production sessions'}
+                </Text>
                 <Text style={styles.stateText}>Gauges appear here as soon as a supervisor starts a session.</Text>
               </View>
             ) : (
               <View style={styles.grid}>
-                {cards.map((card) => (
+                {visibleCards.map((card) => (
                   <QualityTile key={card.lineId} card={card} width={tileWidth} />
                 ))}
               </View>
             )}
 
             {/* ── Lines with no active session, muted ─────────────────── */}
-            {notRunning.length > 0 ? (
+            {visibleNotRunning.length > 0 ? (
               <View style={styles.notRunning}>
-                <Text style={styles.sectionLabel}>NOT RUNNING · {notRunning.length}</Text>
+                <Text style={styles.sectionLabel}>NOT RUNNING · {visibleNotRunning.length}</Text>
                 <View style={styles.notRunningList}>
-                  {notRunning.map((l) => (
+                  {visibleNotRunning.map((l) => (
                     <View key={l.lineId} style={styles.notRunningChip}>
                       <Ionicons name="power" size={10} color="#5C6670" />
                       <Text style={styles.notRunningText} numberOfLines={1}>
@@ -533,6 +569,18 @@ export default function LiveQualityLinesScreen({ role }: { role: 'admin' | 'qual
           </>
         )}
       </ScrollView>
+
+      <OptionPickerModal
+        visible={divisionPickerOpen}
+        title="Select Division"
+        options={ALL_DIVISIONS}
+        value={division}
+        onClose={() => setDivisionPickerOpen(false)}
+        onSelect={(next) => {
+          setDivision(next);
+          setDivisionPickerOpen(false);
+        }}
+      />
 
       <AppDrawer
         visible={drawerOpen}
@@ -625,6 +673,10 @@ const styles = StyleSheet.create({
   },
   warnText: { flex: 1, color: '#F2A93B', fontSize: 12, fontWeight: '600' },
   linkText: { color: '#3E7CB1', fontSize: 12.5, fontWeight: '700' },
+  // Division filter — LineEfficiencyOverviewScreen's layout.
+  filterBlock: { gap: 8 },
+  filterHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  filterRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
 
   legend: { flexDirection: 'row', flexWrap: 'wrap', columnGap: 14, rowGap: 6 },
   legendItem: { flexDirection: 'row', alignItems: 'center', gap: 6 },
