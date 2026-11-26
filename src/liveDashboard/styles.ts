@@ -12,7 +12,7 @@ export const LIVE_DASHBOARD_CSS = `
 .ld {
   --bg: #0b0f13; --surface: #141a20; --surface-2: #1b232b; --border: #26303a; --border-strong: #354250;
   --text: #eef1f4; --text-2: #b4bdc6; --muted: #7f8b96;
-  --good: #3987e5; --plan: #c3c2b7; --reject: #d95926; --loss: #199e70;
+  --good: #3987e5; --plan: #c3c2b7; --reject: #d95926; --rej-line: #ff3b3b; --loss: #199e70;
   --ok: #0ca30c; --ok-text: #3cc63c; --warn: #fab219; --crit: #d03b3b; --crit-text: #f07272;
   position: fixed; inset: 0; z-index: 10; box-sizing: border-box;
   font-size: min(0.8333vw, 1.4815vh);
@@ -117,6 +117,7 @@ export const LIVE_DASHBOARD_CSS = `
 .ld-sw { display: inline-block; width: 1.6em; height: 0; border-top: 3px solid; }
 .ld-sw--good { border-color: var(--good); box-shadow: 0 0 0.5em rgba(57,135,229,0.8); }
 .ld-sw--plan { border-color: var(--plan); border-top-style: dashed; }
+.ld-sw--rej { border-color: var(--rej-line); border-top-width: 2px; }
 .ld-sw--today { width: 0.9em; height: 0.9em; border: 2.5px solid var(--good); border-radius: 50%; }
 
 /* ── Charts ── */
@@ -135,12 +136,21 @@ export const LIVE_DASHBOARD_CSS = `
 .ld-hit { fill: transparent; cursor: crosshair; }
 .ld-crosshair { stroke: rgba(255,255,255,0.35); stroke-width: 1; stroke-dasharray: 3 4; pointer-events: none; }
 .ld-line { fill: none; stroke-linejoin: round; stroke-linecap: round; }
-.ld-line--good { stroke: var(--good); stroke-width: 3; }
+.ld-line--good { stroke: var(--good); stroke-width: 4; }
 .ld-line--plan { stroke: var(--plan); stroke-dasharray: 7 7; stroke-width: 2; opacity: 0.85; animation: ld-dash 1.4s linear infinite; }
+.ld-line--subtle { opacity: 0.5; }
+.ld-line--rej { stroke: var(--rej-line); stroke-width: 1.75; }
 .ld-dot { fill: var(--good); stroke: var(--surface); stroke-width: 2.5; transition: r 0.2s; }
 .ld-dot--today { fill: var(--surface); stroke: var(--good); stroke-width: 3.5; }
 .ld-pulse { fill: var(--good); opacity: 0.5; transform-box: fill-box; transform-origin: center; animation: ld-ring 2s ease-out infinite; }
+.ld-dot--rej { fill: var(--rej-line); stroke-width: 1; }
+.ld-dot--rejtoday { fill: var(--surface); stroke: var(--rej-line); stroke-width: 2; }
+.ld-todayband { fill: rgba(57,135,229,0.09); }
 .ld-direct { fill: var(--text); font-size: 1.05em; font-weight: 800; paint-order: stroke; stroke: var(--surface); stroke-width: 5px; stroke-linejoin: round; }
+.ld-tick--rej { fill: #ff7b7b; }
+.ld-axistitle { font-size: 0.9em; font-weight: 700; }
+.ld-axistitle--good { fill: #6ba6ee; }
+.ld-axistitle--rej { fill: #ff7b7b; }
 .ld-avg { stroke: var(--text-2); stroke-width: 1.5; stroke-dasharray: 5 6; opacity: 0.55; }
 .ld-avg__label { fill: var(--muted); font-size: 0.85em; font-weight: 600; }
 .ld-bar { transition: filter 0.2s, opacity 0.2s; }
@@ -409,6 +419,7 @@ export const LIVE_DASHBOARD_CSS = `
 .ld-ditem > .ld-dpanel { flex: 1; }
 .ld-dpanel { animation-delay: 0.05s; }
 .ld-dpanel--chart { height: 26em; }
+.ld-ditem > .ld-dpanel--chart { flex: none; }
 .ld-dpanel .ld-empty { flex: none; }
 .ld-dempty { padding: 1.2em 0; }
 

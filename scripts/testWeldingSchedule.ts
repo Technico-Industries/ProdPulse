@@ -126,9 +126,9 @@ test('slots 5–6 PM … 8–9:15, lunch 9:15–9:45, 9:45–11 … 2–3 AM', (
   assert.ok(s[4].isBreak);
 });
 
-test('tea 1:30 AM and startup reserve: 50 in 5–6 PM and 1–2 AM; no OT tea without OT', () => {
+test('tea 11:30 PM, 1:30 AM and startup reserve: 50 in 5–6 PM, 11–12 PM and 1–2 AM; no OT tea without OT', () => {
   const s = buildSlots('B', 0, [], null, W).filter((x) => !x.isBreak);
-  assert.deepEqual(s.map((x) => x.productiveMinutes), [50, 60, 60, 75, 75, 60, 60, 50, 60]);
+  assert.deepEqual(s.map((x) => x.productiveMinutes), [50, 60, 60, 75, 75, 50, 60, 50, 60]);
   assert.ok(!scheduledNonProductive('B', 0, W).some((b) => b.start === t(28, 30)));
   assert.ok(!buildSlots('B', 0, [], null, W).some((x) => x.hourStartAbs >= t(27)));
 });
@@ -151,10 +151,10 @@ test('75-minute slots = hourly target × 1.25 (20 s cycle: 180 → 225)', () => 
   assert.equal(b.length, 2);
 });
 
-test('shift targets use available minutes only (A 540, B 550 at 0 OT)', () => {
+test('shift targets use available minutes only (A 540, B 540 at 0 OT)', () => {
   const sum = (sh: 'A' | 'B') => buildSlots(sh, 0, [], null, W).reduce((n, x) => n + x.productiveMinutes, 0);
   assert.equal(sum('A'), 540); // 600 − 30 lunch − 2×10 tea − 10 startup
-  assert.equal(sum('B'), 550); // 600 − 30 lunch − 10 tea − 10 startup
+  assert.equal(sum('B'), 540); // 600 − 30 lunch − 2×10 tea − 10 startup
   assert.equal(buildSlots('A', 0, [], null, W).filter((x) => x.isBreak).reduce((n, x) => n + expectedPartsFor(20, x.productiveMinutes), 0), 0);
 });
 

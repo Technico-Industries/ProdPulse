@@ -22,18 +22,56 @@ export async function fetchProductionRecordsForDateRange(fromKey: string, toKey:
   const { startMs, endMs } = legacyCreatedAtWindow(fromKey, toKey);
   // Single-field range filters only — both are served by Firestore's
   // automatic indexes, no composite index needed.
+  // TEMPORARY DIAGNOSTIC (performance audit, step A) — per-query wall time.
+  // Both queries still start together (Promise.all), exactly as before.
+  const t0 = Date.now();
+  const timed = <T,>(label: string, p: Promise<T>) =>
+    p.then((v) => {
+      console.log(`[productionRecordQueries] ${label} resolved after ${Date.now() - t0}ms`);
+      return v;
+    });
   const [byDate, byCreatedAt] = await Promise.all([
-    getDocs(query(records, where('productionDate', '>=', fromKey), where('productionDate', '<=', toKey))),
-    getDocs(query(
+    timed('byDate', getDocs(query(records, where('productionDate', '>=', fromKey), where('productionDate', '<=', toKey)))),
+    timed('byCreatedAt', getDocs(query(
       records,
       where('createdAt', '>=', Timestamp.fromMillis(startMs)),
       where('createdAt', '<', Timestamp.fromMillis(endMs))
-    )),
+    ))),
   ]);
+  // TEMPORARY DIAGNOSTIC (step A) — downloaded payload size, measured after
+  // the timings above so it does not affect them.
+  {
+    const tSize = Date.now();
+    let total = 0;
+    let largest = { id: '', bytes: 0, operators: 0, stopEvents: 0 };
+    byDate.docs.forEach((d) => {
+      const data: any = d.data();
+      const bytes = JSON.stringify(data).length;
+      total += bytes;
+      if (bytes > largest.bytes) {
+        largest = {
+          id: d.id,
+          bytes,
+          operators: Array.isArray(data.operators) ? data.operators.length : 0,
+          stopEvents: Array.isArray(data.stopEvents) ? data.stopEvents.length : 0,
+        };
+      }
+    });
+    console.log('[productionRecordQueries] byDate payload', {
+      docs: byDate.size,
+      totalKB: Math.round(total / 1024),
+      avgBytes: byDate.size ? Math.round(total / byDate.size) : 0,
+      largest,
+      sizingMs: Date.now() - tSize,
+    });
+  }
   const rows = (docs: QueryDocumentSnapshot[]): StoredRecordRow<QueryDocumentSnapshot>[] =>
     docs.map((d) => {
       const data: any = d.data();
       return { id: d.id, shift: data.shift ?? 'A', productionDate: data.productionDate, createdAtMs: timestampToMillis(data.createdAt), doc: d };
     });
-  return selectRecordsInProductionRange([rows(byDate.docs), rows(byCreatedAt.docs)], fromKey, toKey);
+  const merged = selectRecordsInProductionRange([rows(byDate.docs), rows(byCreatedAt.docs)], fromKey, toKey);
+  // TEMPORARY DIAGNOSTIC (performance audit) — document counts per query.
+  console.log('[productionRecordQueries] counts', { fromKey, toKey, byDate: byDate.size, byCreatedAt: byCreatedAt.size, merged: merged.length });
+  return merged;
 }

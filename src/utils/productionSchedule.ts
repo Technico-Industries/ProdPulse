@@ -36,6 +36,9 @@ export const BREAKS: TimeInterval[] = [
 // 15 minutes in each of 9–10 PM and 10–11 PM (45 + 45), never 30 twice.
 export const SHIFT_B_DINNER_BREAK: TimeInterval = { start: 21 * 60 + 45, end: 22 * 60 + 15 };
 export const SHIFT_B_TEA_BREAK: TimeInterval = { start: 24 * 60 + 60 + 30, end: 24 * 60 + 60 + 40 };
+// Late-evening tea break, 11:30–11:40 PM, making the 11 PM – 12 AM slot 50
+// productive minutes. Shared by every Shift B schedule (Assembly and Welding).
+export const SHIFT_B_LATE_TEA_BREAK: TimeInterval = { start: 23 * 60 + 30, end: 23 * 60 + 40 };
 // Rejection clearance closes the regular shift: 3:20–3:30 AM, leaving
 // 3:00–3:30 AM with 20 productive minutes. Only applied without overtime —
 // with OT that slot becomes a full 3:00–4:00 AM hour, and whether the
@@ -49,6 +52,7 @@ function assemblyShiftBreaks(shift: ShiftCode, otHours: number): TimeInterval[] 
   if (shift === 'A') return BREAKS;
   return [
     SHIFT_B_DINNER_BREAK,
+    SHIFT_B_LATE_TEA_BREAK,
     SHIFT_B_TEA_BREAK,
     ...(otHours > 0 ? [SHIFT_B_OT_TEA_BREAK] : [SHIFT_B_REJECTION_CLEARANCE]),
   ];
@@ -143,7 +147,7 @@ export const ASSEMBLY_SCHEDULE: ScheduleProfile = {
 // 11:45–1:00 are the two 75-minute slots. Tea 9:30–9:40 AM and 2:00–2:10 PM;
 // the first 10 minutes (7:00–7:10) are the startup reserve.
 // Shift B 5:00 PM – 3:00 AM, lunch 9:15–9:45 PM: 8:00–9:15 and 9:45–11:00
-// are the 75-minute slots. Tea 1:30–1:40 AM, startup reserve 5:00–5:10 PM,
+// are the 75-minute slots. Tea 11:30–11:40 PM and 1:30–1:40 AM, startup reserve 5:00–5:10 PM,
 // and the 4:30–4:40 AM tea break only when overtime is worked.
 export const WELDING_SHIFT_A_START = 7 * 60;
 export const WELDING_SHIFT_A_END = 17 * 60;
@@ -181,9 +185,15 @@ export const WELDING_SCHEDULE: ScheduleProfile = {
       start: WELDING_SHIFT_B_START,
       end: WELDING_SHIFT_B_END_ABS,
       lunch: WELDING_SHIFT_B_LUNCH,
-      breaks: (ot) => [WELDING_SHIFT_B_LUNCH, WELDING_SHIFT_B_TEA_BREAK, ...(ot > 0 ? [WELDING_SHIFT_B_OT_TEA_BREAK] : [])],
+      breaks: (ot) => [
+        WELDING_SHIFT_B_LUNCH,
+        SHIFT_B_LATE_TEA_BREAK,
+        WELDING_SHIFT_B_TEA_BREAK,
+        ...(ot > 0 ? [WELDING_SHIFT_B_OT_TEA_BREAK] : []),
+      ],
       // Shift B keeps each slot's own productive time (the startup reserve
-      // and tea breaks already make 5–6 PM, 1–2 AM and OT 4–5 AM 50 minutes).
+      // and tea breaks already make 5–6 PM, 11 PM–12 AM, 1–2 AM and OT
+      // 4–5 AM 50 minutes).
       fixedCeilings: () => ({}),
       startWindow: { start: 17 * 60, end: 6 * 60 + 30 },
     },

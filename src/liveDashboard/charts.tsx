@@ -5,7 +5,8 @@
 //   • values tween (count up / bars grow / curves morph) whenever live data
 //     changes, so an update is visible but never jumps;
 //   • smooth monotone curves (never overshoot the data) with gradient areas;
-//   • one y-axis per chart, a legend for multi-series charts, a value table
+//   • one y-axis per chart (the production trend adds a right-hand axis for
+//     rejections), a legend for multi-series charts, a value table
 //     under the x-axis instead of a number on every point;
 //   • hover crosshair + tooltip card for anyone at a desk;
 //   • prefers-reduced-motion turns every animation off.
@@ -289,6 +290,7 @@ interface Frame {
   width: number;
   height: number;
   m: { top: number; right: number; bottom: number; left: number };
+  rowH: number; // value-table row height
   band: number;
   base: number;
   ih: number;
@@ -297,13 +299,13 @@ interface Frame {
   max: number;
 }
 
-function frame(width: number, height: number, n: number, max: number, rows: number): Frame {
-  const m = { top: 30, right: 22, bottom: 36 + rows * 28, left: 76 };
+function frame(width: number, height: number, n: number, max: number, rows: number, pad = { top: 30, right: 22 }, rowH = 28): Frame {
+  const m = { ...pad, bottom: 36 + rows * rowH, left: 76 };
   const iw = Math.max(0, width - m.left - m.right);
   const ih = Math.max(0, height - m.top - m.bottom);
   const band = n ? iw / n : 0;
   return {
-    width, height, m, band, ih, max,
+    width, height, m, rowH, band, ih, max,
     base: m.top + ih,
     cx: (i) => m.left + band * i + band / 2,
     y: (v) => m.top + ih - (Math.max(0, v) / max) * ih,
@@ -331,9 +333,9 @@ function Axes({ f, days, rows, unit, hover }: { f: Frame; days: DayPoint[]; rows
       ))}
       {rows.map((r, ri) => (
         <g key={r.label}>
-          <text className="ld-rowlabel" x={f.m.left - 12} y={f.base + 53 + ri * 28} textAnchor="end">{r.label}</text>
+          <text className="ld-rowlabel" x={f.m.left - 12} y={f.base + 25 + (ri + 1) * f.rowH} textAnchor="end">{r.label}</text>
           {r.values.map((v, i) => (
-            <text key={i} className={`ld-rowvalue${days[i]?.isToday ? ' is-today' : ''}${hover === i ? ' is-hover' : ''}`} x={f.cx(i)} y={f.base + 53 + ri * 28} textAnchor="middle">{v}</text>
+            <text key={i} className={`ld-rowvalue${days[i]?.isToday ? ' is-today' : ''}${hover === i ? ' is-hover' : ''}`} x={f.cx(i)} y={f.base + 25 + (ri + 1) * f.rowH} textAnchor="middle">{v}</text>
           ))}
         </g>
       ))}
@@ -370,24 +372,40 @@ function Tooltip({ f, i, title, lines }: { f: Frame; i: number; title: string; l
   );
 }
 
-// ─── Production trend: smooth area (good) + dashed plan, one axis ────────────
-export function TrendChart({ days, good, plan, achievement, rows, title }: {
-  days: DayPoint[]; good: number[]; plan: number[]; achievement: (number | null)[]; rows: ValueRow[]; title: string;
+// ─── Production trend: smooth area (good) + dashed plan on the left
+// axis, rejections as a red line on an independent right axis. Exact values are
+// in the tooltip, not printed on the graph.
+// `rejected` null = unknown for that day (records without a rejection counter):
+// no node, and the line breaks there instead of dropping to 0.
+export function TrendChart({ days, good, plan, rejected, achievement, rows, title }: {
+  days: DayPoint[]; good: number[]; plan: number[]; rejected: (number | null)[]; achievement: (number | null)[]; rows: ValueRow[]; title: string;
 }) {
   const [ref, { width, height }] = useSize<HTMLDivElement>();
   const [hover, setHover] = useState<number | null>(null);
   const id = safeId(useId());
   const g = useTween(good, 1100);
   const p = useTween(plan, 1100);
+  const r = useTween(rejected.map((v) => v ?? 0), 1100);
   const [reveal] = useTween([1], 1600);
   const max = niceMax(Math.max(1, ...good, ...plan) * 1.1);
-  const f = frame(width, height, days.length, max, rows.length);
+  const f = frame(width, height, days.length, max, rows.length, { top: 38, right: 64 }, Math.min(28, Math.max(18, height * 0.075)));
+  // The right axis follows the real peak with headroom; a multiple of 4 keeps
+  // its ticks whole parts.
+  const rejPeak = Math.max(0, ...rejected.map((v) => v ?? 0));
+  const rejMax = Math.ceil(niceMax(Math.max(1, rejPeak) * 1.4) / 4) * 4;
+  const rejY = (v: number) => f.y((v / rejMax) * max);
+  const rejPts = r.map((v, i) => [f.cx(i), rejY(v)] as [number, number]);
+  const rejRuns: [number, number][][] = [];
+  rejected.forEach((v, i) => {
+    if (v == null || !rejPts[i]) return;
+    if (i > 0 && rejected[i - 1] != null && rejRuns.length) rejRuns[rejRuns.length - 1].push(rejPts[i]);
+    else rejRuns.push([rejPts[i]]);
+  });
   const goodPts = g.map((v, i) => [f.cx(i), f.y(v)] as [number, number]);
   const planPts = p.map((v, i) => [f.cx(i), f.y(v)] as [number, number]);
   const line = smoothPath(goodPts);
   const area = goodPts.length ? `${line}L${goodPts[goodPts.length - 1][0]},${f.base}L${goodPts[0][0]},${f.base}Z` : '';
   const ti = days.findIndex((d) => d.isToday);
-  const peak = good.indexOf(Math.max(...good));
 
   return (
     <div className="ld-chart" ref={ref}>
@@ -396,23 +414,27 @@ export function TrendChart({ days, good, plan, achievement, rows, title }: {
           <svg width={width} height={height} role="img" aria-label={title}>
             <defs>
               <linearGradient id={`${id}-area`} x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="var(--good)" stopOpacity="0.38" />
+                <stop offset="0%" stopColor="var(--good)" stopOpacity="0.16" />
                 <stop offset="100%" stopColor="var(--good)" stopOpacity="0" />
               </linearGradient>
-              <filter id={`${id}-glow`} x="-20%" y="-20%" width="140%" height="140%">
-                <feGaussianBlur stdDeviation="4" result="b" />
-                <feMerge><feMergeNode in="b" /><feMergeNode in="SourceGraphic" /></feMerge>
-              </filter>
               <clipPath id={`${id}-reveal`}>
                 <rect x={0} y={0} width={f.m.left + (width - f.m.left) * reveal} height={height} />
               </clipPath>
             </defs>
-            <Axes f={f} days={days} rows={rows} unit="pcs" hover={hover} />
+            {ti >= 0 ? <rect className="ld-todayband" x={f.m.left + f.band * ti} y={f.m.top} width={f.band} height={f.ih} /> : null}
+            <Axes f={f} days={days} rows={rows} hover={hover} />
+            <text className="ld-axistitle ld-axistitle--good" x={0} y={f.m.top - 19}>Production (pcs)</text>
+            <text className="ld-axistitle ld-axistitle--rej" x={width} y={f.m.top - 19} textAnchor="end">Rejections (pcs)</text>
+            {[0, 0.25, 0.5, 0.75, 1].map((t) => (
+              <text key={t} className="ld-tick ld-tick--rej" x={width - f.m.right + 12} y={f.y(t * max)} dy="0.32em">{fmtInt(t * rejMax)}</text>
+            ))}
             <g clipPath={`url(#${id}-reveal)`}>
               <path d={area} fill={`url(#${id}-area)`} />
-              <path className="ld-line ld-line--plan" d={smoothPath(planPts)} />
-              <path className="ld-line ld-line--good" d={line} filter={`url(#${id}-glow)`} />
-              {goodPts.map(([x, y], i) => (i === ti ? null : <circle key={i} className="ld-dot" cx={x} cy={y} r={hover === i ? 8 : 6} />))}
+              <path className="ld-line ld-line--plan ld-line--subtle" d={smoothPath(planPts)} />
+              {rejRuns.map((run, i) => <path key={i} className="ld-line ld-line--rej" d={smoothPath(run)} />)}
+              {rejPts.map(([x, y], i) => (i === ti || rejected[i] == null ? null : <circle key={i} className="ld-dot ld-dot--rej" cx={x} cy={y} r={hover === i ? 5 : 3.5} />))}
+              <path className="ld-line ld-line--good" d={line} />
+              {goodPts.map(([x, y], i) => (i === ti ? null : <circle key={i} className="ld-dot" cx={x} cy={y} r={hover === i ? 8.5 : 7} />))}
             </g>
             {ti >= 0 && goodPts[ti] ? (
               <g transform={`translate(${goodPts[ti][0]},${goodPts[ti][1]})`}>
@@ -420,9 +442,11 @@ export function TrendChart({ days, good, plan, achievement, rows, title }: {
                 <circle className="ld-dot ld-dot--today" r={8} />
               </g>
             ) : null}
-            {[...new Set([peak, ti])].filter((i) => i >= 0 && good[i] > 0 && goodPts[i]).map((i) => (
-              <text key={i} className="ld-direct" x={goodPts[i][0]} y={goodPts[i][1] - 18} textAnchor="middle">{fmtInt(g[i])}</text>
-            ))}
+            {ti >= 0 && rejPts[ti] && rejected[ti] != null ? (
+              <g transform={`translate(${rejPts[ti][0]},${rejPts[ti][1]})`}>
+                <circle className="ld-dot ld-dot--rejtoday" r={5} />
+              </g>
+            ) : null}
             <HoverLayer f={f} n={days.length} hover={hover} setHover={setHover} />
           </svg>
           {hover != null ? (
@@ -433,6 +457,7 @@ export function TrendChart({ days, good, plan, achievement, rows, title }: {
               lines={[
                 { label: 'Good production', value: `${fmtInt(good[hover])} pcs`, swatch: 'var(--good)' },
                 { label: 'Plan', value: `${fmtInt(plan[hover])} pcs`, swatch: 'var(--plan)' },
+                { label: 'Rejections', value: rejected[hover] == null ? 'Not recorded' : `${fmtInt(rejected[hover])} pcs`, swatch: 'var(--rej-line)' },
                 { label: 'Achievement', value: fmtPct(achievement[hover]) },
               ]}
             />

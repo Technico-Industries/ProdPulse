@@ -292,10 +292,11 @@ export default function DetailView({ data, detail, days, dayLabel, onClose }: {
   const trend = (title: string) => (
     <DPanel title={title} wide chart>
       <TrendChart
-        title="Good production and plan per production day"
+        title="Good production, plan and rejections per production day"
         days={days}
         good={series.map((d) => d.goodProduction)}
         plan={series.map((d) => d.plan)}
+        rejected={series.map((d) => d.rejectedParts)}
         achievement={series.map((d) => d.achievementPct)}
         rows={[
           { label: 'Good', values: series.map((d) => fmtInt(d.goodProduction)) },

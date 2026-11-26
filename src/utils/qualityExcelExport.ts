@@ -2,6 +2,7 @@ import { Platform } from 'react-native';
 import * as XLSX from 'xlsx-js-style';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
+import type { DivisionQuality } from './divisionQuality';
 
 export interface QualityExcelRecord {
   date: string | null;
@@ -175,8 +176,11 @@ export async function exportQualityToExcel(params: {
   records: QualityExcelRecord[];
   paretoRows: QualityExcelParetoRow[];
   filters: QualityExcelFilters;
+  // The on-screen division-wise breakdown (utils/divisionQuality). Omitted →
+  // the workbook is exactly as before.
+  divisions?: DivisionQuality[];
 }): Promise<void> {
-  const { records, paretoRows, filters } = params;
+  const { records, paretoRows, filters, divisions } = params;
   const totalRejectionQty = records.reduce((total, record) => total + (record.rejectionQty || 0), 0);
   const uniqueDefects = new Set(records.map((record) => record.defect).filter(Boolean)).size;
   const uniqueParts = new Set(records.map((record) => record.partName).filter(Boolean)).size;
@@ -259,6 +263,62 @@ export async function exportQualityToExcel(params: {
     ),
     'DEFECT ANALYSIS',
   );
+  if (divisions) {
+    // Blank cell for an unknown figure (legacy slots / no production) so it
+    // is never read as 0 or 0%.
+    const num = (n: number | null): CellValue => (n == null ? '—' : n);
+    const divisionRows: CellValue[][] = divisions.map((d) => [
+      safe(d.plant),
+      safe(d.workshop),
+      d.division,
+      num(d.totalProduction),
+      d.goodProduction,
+      num(d.rejections),
+      num(d.rejectionPct),
+      d.lineCount,
+      d.status === 'unavailable' ? 'No data' : d.status.charAt(0).toUpperCase() + d.status.slice(1),
+    ]);
+    const lineDetailRows: CellValue[][] = divisions.flatMap((d) =>
+      d.lines.map((l) => [
+        safe(d.plant),
+        safe(d.workshop),
+        d.division,
+        l.lineName,
+        l.models.join(', ') || '—',
+        num(l.totalProduction),
+        l.slotRecords ? l.goodProduction : '—',
+        num(l.rejections),
+        num(l.rejectionPct),
+        l.defects.map((df) => `${df.defect}: ${df.qty}`).join('; ') || '—',
+        l.remarks.join(' | ') || '—',
+      ]),
+    );
+    XLSX.utils.book_append_sheet(
+      workbook,
+      buildTableSheet(
+        'DIVISION-WISE QUALITY',
+        `${dateRange} · Rejection % = Rejections / Total Production × 100`,
+        ['Plant', 'Workshop', 'Division', 'Total Production', 'Good Production', 'Rejections', 'Rejection %', 'Lines', 'Quality Status'],
+        divisionRows,
+        [14, 18, 18, 18, 18, 14, 14, 10, 16],
+        { 3: '#,##0', 4: '#,##0', 5: '#,##0', 6: '0.0"%"', 7: '0' },
+      ),
+      'DIVISION SUMMARY',
+    );
+    XLSX.utils.book_append_sheet(
+      workbook,
+      buildTableSheet(
+        'DIVISION LINE DETAILS',
+        `${dateRange} · Logged defects and remarks from Record Rejection`,
+        ['Plant', 'Workshop', 'Division', 'Line', 'Model', 'Total Production', 'Good Production', 'Rejections', 'Rejection %', 'Logged Defects', 'Remarks'],
+        lineDetailRows,
+        [14, 18, 18, 20, 26, 18, 18, 14, 14, 40, 40],
+        { 5: '#,##0', 6: '#,##0', 7: '#,##0', 8: '0.0"%"' },
+      ),
+      'DIVISION LINE DETAILS',
+    );
+  }
+
   const analyses: [string, string, CellValue[][]][] = [
     ['LINE ANALYSIS', 'LINE ANALYSIS', lineRows],
     ['PART ANALYSIS', 'PART ANALYSIS', partRows],

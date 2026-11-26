@@ -1,12 +1,21 @@
 // QualityAnalysisScreen.tsx
 //
-// Quality Control's rejection records search. Reads ONLY the
-// `rejectionRecords` collection (written by RejectionRecordScreen when a QC
-// inspector logs a rejected part) — no productionRecords, no digital-vs-
-// visual comparison, no charts. Pick filters, tap "Search Records", get a
-// list of matching rejection cards.
+// Quality Control's quality report. Pick filters, tap "Search Records", get
+// the division-wise quality cards (line details on "View Details"), the
+// optional Graphical Analysis and the Excel export. The individual rejection
+// records are no longer listed on screen; they stay in the export's
+// DETAILED RECORDS sheet.
 //
 // Read-only: this screen never writes back to Firestore.
+//
+// DIVISION-WISE QUALITY (after a search): one expandable card per division,
+// built by utils/divisionQuality from the SAME search — production / good /
+// rejected from the date range's productionRecords (the Record Production
+// rejection counter, via qualityMetrics), and the logged defects + remarks
+// from the filtered rejectionRecords. Divisions come from the workshop
+// configuration (constants/lineOptions divisionsForWorkshop); a record's
+// division is resolved from its productionLines doc when the record itself
+// doesn't carry one.
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -28,9 +37,12 @@ import { Ionicons } from '@expo/vector-icons';
 import { useNavigation } from '@react-navigation/native';
 import { collection, getDocs, query, where } from 'firebase/firestore';
 import { db } from '../services/firebase';
-import { PLANTS, WORKSHOPS, DIVISIONS } from '../constants/lineOptions';
+import { PLANTS, WORKSHOPS, divisionFilterOptions, divisionsForWorkshop, workshopHasDivisions } from '../constants/lineOptions';
 import { BarChart, LineChart, PieChart } from 'react-native-gifted-charts';
 import { exportQualityToExcel } from '../utils/qualityExcelExport';
+import { fetchProductionRecordsForDateRange } from '../services/productionRecordQueries';
+import { buildDivisionQuality, DivisionQuality, DQProductionRecord } from '../utils/divisionQuality';
+import { QUALITY_COLORS, QUALITY_LABELS } from '../utils/liveQuality';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -49,6 +61,11 @@ type RejectionStage = (typeof REJECTION_STAGES)[number];
 const SHIFTS = ['A', 'B'] as const;
 
 const RESPONSIBILITIES = ['Stamping', 'Plating', 'Assy', 'Welding', 'BOP', 'Bolt Sticking'] as const;
+
+// A productionRecords slot doc, reduced to what the division breakdown needs.
+interface ProductionSlot extends DQProductionRecord {
+  shift: string | null;
+}
 
 interface RejectionRecord {
   id: string;
@@ -93,6 +110,44 @@ function isValidDateStr(s: string) {
 function sameStr(a: string | null | undefined, b: string | null | undefined) {
   if (!a || !b) return true; // an unset field never excludes a record
   return String(a).toLowerCase() === String(b).toLowerCase();
+}
+
+function fmtQty(n: number | null) {
+  return n == null ? '—' : n.toLocaleString('en-IN');
+}
+
+function fmtPct(n: number | null) {
+  return n == null ? '—' : `${n.toFixed(1)}%`;
+}
+
+type Located = { lineId: string | null; plant: string | null; workshop: string | null; division: string | null; lineName: string | null };
+
+// Fills a rejection record's MISSING plant/workshop/division/lineName from
+// its productionLines doc (Record Rejection only stores a division under
+// some workshops), so each record lands in its own division. Values the
+// record already carries are kept as they are.
+function fillFromLine<T extends Located>(r: T, line: Line | undefined): T {
+  if (!line) return r;
+  return {
+    ...r,
+    plant: r.plant ?? line.plant ?? null,
+    workshop: r.workshop ?? line.workshop ?? null,
+    division: r.division ?? line.division ?? null,
+    lineName: r.lineName ?? line.lineName ?? null,
+  };
+}
+
+// Production slots take their location from the productionLines doc first
+// (the same resolution Generate Report uses), falling back to their own.
+function resolveFromLine<T extends Located>(r: T, line: Line | undefined): T {
+  if (!line) return r;
+  return {
+    ...r,
+    plant: line.plant ?? r.plant,
+    workshop: line.workshop ?? r.workshop,
+    division: line.division ?? r.division,
+    lineName: line.lineName ?? r.lineName,
+  };
 }
 
 // ─── Charts — colors, layout constants, and small shared building blocks ──
@@ -289,6 +344,120 @@ function SearchablePickerBox({
   );
 }
 
+// ─── Division card (expandable, line-wise details) ─────────────────────────
+
+function StatusBadge({ status }: { status: DivisionQuality['status'] }) {
+  const color = QUALITY_COLORS[status];
+  return (
+    <View style={[styles.statusBadge, { borderColor: color, backgroundColor: `${color}1F` }]}>
+      <Text style={[styles.statusBadgeText, { color }]}>{QUALITY_LABELS[status]}</Text>
+    </View>
+  );
+}
+
+function Stat({ label, value, color }: { label: string; value: string; color?: string }) {
+  return (
+    <View style={styles.divStat}>
+      <Text style={[styles.divStatValue, color ? { color } : null]} numberOfLines={1}>{value}</Text>
+      <Text style={styles.divStatLabel} numberOfLines={1}>{label}</Text>
+    </View>
+  );
+}
+
+function DivisionCard({
+  division: d,
+  showLocation,
+  expanded,
+  onToggle,
+}: {
+  division: DivisionQuality;
+  showLocation: boolean;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const location = [d.plant, d.workshop].filter(Boolean).join(' · ');
+  return (
+    <View style={[styles.divCard, { borderLeftColor: QUALITY_COLORS[d.status] }]}>
+      <View style={styles.divHeader}>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.divTitle} numberOfLines={1}>{d.division}</Text>
+          {showLocation && !!location && <Text style={styles.recordMeta} numberOfLines={1}>{location}</Text>}
+        </View>
+        <StatusBadge status={d.status} />
+      </View>
+
+      <View style={styles.divStatsRow}>
+        <Stat label="Production" value={fmtQty(d.totalProduction)} />
+        <Stat label="Rejections" value={fmtQty(d.rejections)} color="#D64545" />
+        <Stat label="Rejection %" value={fmtPct(d.rejectionPct)} color={QUALITY_COLORS[d.status]} />
+        <Stat label="Lines" value={String(d.lineCount)} />
+      </View>
+
+      <Pressable
+        onPress={onToggle}
+        style={({ pressed }) => [styles.divToggle, pressed && { opacity: 0.85 }]}
+        accessibilityRole="button"
+        accessibilityState={{ expanded }}
+        accessibilityLabel={`${expanded ? 'Hide' : 'View'} line details for ${d.division}`}
+      >
+        <Text style={styles.divToggleText}>{expanded ? 'Hide Details' : 'View Details'}</Text>
+        <Ionicons name={expanded ? 'chevron-up' : 'chevron-down'} size={16} color="#F2A93B" />
+      </Pressable>
+
+      {expanded && (
+        <View style={styles.divLines}>
+          {d.lines.length === 0 ? (
+            <Text style={styles.muted}>No line records for this division in the selected period.</Text>
+          ) : (
+            d.lines.map((l) => (
+              <View key={l.key} style={styles.lineRow}>
+                <View style={styles.recordTopRow}>
+                  <Text style={styles.recordLine} numberOfLines={1}>{l.lineName}</Text>
+                  <StatusBadge status={l.status} />
+                </View>
+                <Text style={styles.recordMeta} numberOfLines={2}>Model: {l.models.length ? l.models.join(', ') : '—'}</Text>
+                <View style={styles.lineStatsRow}>
+                  <Stat label="Total" value={fmtQty(l.totalProduction)} />
+                  <Stat label="Good" value={fmtQty(l.slotRecords ? l.goodProduction : null)} color="#4C9A6A" />
+                  <Stat label="Rejected" value={fmtQty(l.rejections)} color="#D64545" />
+                  <Stat label="Rej %" value={fmtPct(l.rejectionPct)} color={QUALITY_COLORS[l.status]} />
+                </View>
+                {l.slotRecords === 0 && (
+                  <Text style={styles.muted}>No production slots recorded — logged defects only.</Text>
+                )}
+                {l.legacyRecords > 0 && (
+                  <Text style={styles.muted}>{l.legacyRecords} older slot(s) without a rejection counter not counted.</Text>
+                )}
+                {l.defects.length > 0 && (
+                  <View style={{ marginTop: 8 }}>
+                    <Text style={styles.fieldLabel}>LOGGED DEFECTS ({l.loggedDefectQty} pcs)</Text>
+                    <View style={styles.chipsRow}>
+                      {l.defects.map((df) => (
+                        <View key={df.defect} style={styles.defectChip}>
+                          <Text style={styles.defectChipText} numberOfLines={1}>{df.defect}</Text>
+                          <Text style={styles.defectChipQty}>{df.qty}</Text>
+                        </View>
+                      ))}
+                    </View>
+                  </View>
+                )}
+                {l.remarks.length > 0 && (
+                  <View style={{ marginTop: 6 }}>
+                    {l.remarks.slice(0, 5).map((rm) => (
+                      <Text key={rm} style={styles.recordRemarks}>"{rm}"</Text>
+                    ))}
+                    {l.remarks.length > 5 && <Text style={styles.muted}>+{l.remarks.length - 5} more remarks</Text>}
+                  </View>
+                )}
+              </View>
+            ))
+          )}
+        </View>
+      )}
+    </View>
+  );
+}
+
 // ─── Component ────────────────────────────────────────────────────────────
 
 export default function QualityAnalysisScreen() {
@@ -365,6 +534,12 @@ export default function QualityAnalysisScreen() {
     return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [filteredLines]);
 
+  // A division picked under one workshop (e.g. Welding's Div-1) is cleared
+  // when the workshop changes to one that doesn't have it.
+  useEffect(() => {
+    if (division && !divisionFilterOptions(workshop).includes(division)) setDivision(null);
+  }, [workshop]); // eslint-disable-line react-hooks/exhaustive-deps
+
   function selectLine(name: string) {
     const found = filteredLines.find((l) => (l.lineName || l.id) === name);
     setSelectedLineId(found?.id ?? null);
@@ -376,6 +551,11 @@ export default function QualityAnalysisScreen() {
   const [exportingExcel, setExportingExcel] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [hasSearched, setHasSearched] = useState(false);
+  // Production slots for the division breakdown. A failure here only
+  // affects that section; the rejection records still show.
+  const [productionSlots, setProductionSlots] = useState<ProductionSlot[]>([]);
+  const [productionError, setProductionError] = useState<string | null>(null);
+  const [expandedDivisions, setExpandedDivisions] = useState<Set<string>>(new Set());
 
   async function handleSearch() {
     if (!isValidDateStr(fromDate) || !isValidDateStr(toDate)) {
@@ -389,11 +569,17 @@ export default function QualityAnalysisScreen() {
     setLoading(true);
     setLoadError(null);
     try {
-      const snap = await getDocs(query(
-        collection(db, 'rejectionRecords'),
-        where('date', '>=', fromDate),
-        where('date', '<=', toDate),
-      ));
+      const [snap, prodResult] = await Promise.all([
+        getDocs(query(
+          collection(db, 'rejectionRecords'),
+          where('date', '>=', fromDate),
+          where('date', '<=', toDate),
+        )),
+        fetchProductionRecordsForDateRange(fromDate, toDate).then(
+          (docs) => ({ docs, error: null as unknown }),
+          (error: unknown) => ({ docs: null, error }),
+        ),
+      ]);
 
       const all: RejectionRecord[] = snap.docs.map((d) => {
         const data: any = d.data();
@@ -419,6 +605,31 @@ export default function QualityAnalysisScreen() {
 
       console.log('[QualityAnalysis] fetched', all.length, 'rejection records for', fromDate, 'to', toDate);
       setRecords(all);
+      if (prodResult.docs) {
+        setProductionSlots(
+          prodResult.docs.map((d) => {
+            const data: any = d.data();
+            return {
+              id: d.id,
+              shift: data.shift ?? 'A',
+              plant: data.plant ?? null,
+              workshop: data.workshop ?? null,
+              division: data.division ?? null,
+              lineId: data.lineId ?? null,
+              lineName: data.lineName ?? null,
+              partName: data.partName ?? null,
+              producedThisSlot: typeof data.producedThisSlot === 'number' ? data.producedThisSlot : null,
+              rejections: typeof data.rejections === 'number' ? data.rejections : null,
+            };
+          })
+        );
+        setProductionError(null);
+      } else {
+        console.error('[QualityAnalysis] production fetch failed', prodResult.error);
+        setProductionSlots([]);
+        setProductionError('Could not load production records for the division breakdown.');
+      }
+      setExpandedDivisions(new Set());
       setHasSearched(true);
     } catch (e) {
       console.error('[QualityAnalysis] fetch failed', e);
@@ -452,6 +663,7 @@ export default function QualityAnalysisScreen() {
           stage,
           responsibility,
         },
+        divisions: productionError ? undefined : divisionQuality,
       });
       Alert.alert(
         'Export complete',
@@ -465,8 +677,10 @@ export default function QualityAnalysisScreen() {
     }
   }
 
+  const lineById = useMemo(() => new Map(allLines.map((l) => [l.id, l])), [allLines]);
+
   const filteredRecords = useMemo(() => {
-    return records.filter((r) => {
+    return records.map((r) => fillFromLine(r, r.lineId ? lineById.get(r.lineId) : undefined)).filter((r) => {
       if (shift && r.shift !== shift) return false;
       if (plant && !sameStr(r.plant, plant)) return false;
       if (workshop && !sameStr(r.workshop, workshop)) return false;
@@ -477,12 +691,43 @@ export default function QualityAnalysisScreen() {
       if (responsibility && !sameStr(r.responsibility, responsibility)) return false;
       return true;
     });
-  }, [records, shift, plant, workshop, division, selectedLineId, selectedPart, stage, responsibility]);
+  }, [records, lineById, shift, plant, workshop, division, selectedLineId, selectedPart, stage, responsibility]);
 
-  const sortedRecords = useMemo(
-    () => filteredRecords.slice().sort((a, b) => (b.createdAtMs ?? 0) - (a.createdAtMs ?? 0)),
-    [filteredRecords]
-  );
+  // Production slots under the same filters. Stage / Responsibility exist
+  // only on rejection records, so they narrow the logged defects alone.
+  const filteredSlots = useMemo(() => {
+    return productionSlots
+      .map((r) => resolveFromLine(r, r.lineId ? lineById.get(r.lineId) : undefined))
+      .filter((r) => {
+        if (shift && r.shift !== shift) return false;
+        if (plant && !sameStr(r.plant, plant)) return false;
+        if (workshop && !sameStr(r.workshop, workshop)) return false;
+        if (division && !sameStr(r.division, division)) return false;
+        if (selectedLineId && r.lineId !== selectedLineId) return false;
+        if (selectedPart && !sameStr(r.partName, selectedPart)) return false;
+        return true;
+      });
+  }, [productionSlots, lineById, shift, plant, workshop, division, selectedLineId, selectedPart]);
+
+  const divisionQuality: DivisionQuality[] = useMemo(() => {
+    const hasDivs = !!workshop && workshopHasDivisions(workshop);
+    // Idle configured divisions are listed only when plant + workshop are
+    // chosen and nothing narrower (division / line) is.
+    const listConfigured = !!(plant && hasDivs && !division && !selectedLineId);
+    return buildDivisionQuality(filteredSlots, filteredRecords, {
+      configuredDivisions: hasDivs ? divisionsForWorkshop(workshop) : [],
+      context: listConfigured ? { plant: plant!, workshop: workshop! } : null,
+    });
+  }, [filteredSlots, filteredRecords, plant, workshop, division, selectedLineId]);
+
+  const toggleDivision = (key: string) =>
+    setExpandedDivisions((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+
 
   // ── Graphical Analysis — hidden until the button is pressed, and every
   // chart below is built from filteredRecords, so it always reflects
@@ -622,7 +867,7 @@ export default function QualityAnalysisScreen() {
         <View style={styles.field}>
           <Text style={styles.fieldLabel}>DIVISION</Text>
           <View style={styles.chipsRow}>
-            {DIVISIONS.map((dv) => {
+            {divisionFilterOptions(workshop).map((dv) => {
               const selected = division === dv;
               return (
                 <Pressable
@@ -911,42 +1156,35 @@ export default function QualityAnalysisScreen() {
           )
         )}
 
-        {hasSearched && (
+        {hasSearched && !loadError && (
           <>
             <Text style={[styles.sectionLabel, { marginTop: 22 }]}>
-              RECORDS ({sortedRecords.length})
+              DIVISION-WISE QUALITY ({divisionQuality.length})
             </Text>
-
-            {sortedRecords.length === 0 ? (
+            {(!!stage || !!responsibility) && (
+              <Text style={[styles.muted, { marginBottom: 8 }]}>
+                Stage / Responsibility filters narrow the logged defects only; production figures cover every slot.
+              </Text>
+            )}
+            {productionError ? (
               <View style={styles.centered}>
-                <Ionicons name="document-text-outline" size={26} color="#5C6670" />
-                <Text style={styles.emptyText}>No rejection records match these filters.</Text>
+                <Ionicons name="alert-circle-outline" size={26} color="#D64545" />
+                <Text style={styles.errorText}>{productionError}</Text>
+              </View>
+            ) : divisionQuality.length === 0 ? (
+              <View style={styles.centered}>
+                <Ionicons name="layers-outline" size={26} color="#5C6670" />
+                <Text style={styles.emptyText}>No production or rejection records match these filters.</Text>
               </View>
             ) : (
-              sortedRecords.map((r) => (
-                <View key={r.id} style={styles.recordCard}>
-                  <View style={styles.recordTopRow}>
-                    <Text style={styles.recordLine} numberOfLines={1}>{r.lineName || 'Unnamed line'}</Text>
-                    <View style={styles.stageBadge}>
-                      <Text style={styles.stageBadgeText}>{r.stage || '—'}</Text>
-                    </View>
-                  </View>
-
-                  <Text style={styles.recordMeta}>{r.date || 'No date'}</Text>
-                  <Text style={styles.recordMeta}>
-                    {[r.plant, r.workshop, r.division].filter(Boolean).join(' · ') || 'No location'}
-                  </Text>
-                  <Text style={styles.recordMeta}>Part: {r.partName || '—'}</Text>
-
-                  <View style={styles.recordDetailRow}>
-                    <Text style={styles.recordDefect} numberOfLines={1}>{r.defect || 'Unspecified defect'}</Text>
-                    <Text style={styles.recordQty}>{r.rejectionQty} pcs</Text>
-                  </View>
-
-                  <Text style={styles.recordMeta}>Responsibility: {r.responsibility || '—'}</Text>
-                  {!!r.remarks && <Text style={styles.recordRemarks}>"{r.remarks}"</Text>}
-                  {!!r.reportedByName && <Text style={styles.recordMeta}>Reported by {r.reportedByName}</Text>}
-                </View>
+              divisionQuality.map((d) => (
+                <DivisionCard
+                  key={d.key}
+                  division={d}
+                  showLocation={!plant || !workshop}
+                  expanded={expandedDivisions.has(d.key)}
+                  onToggle={() => toggleDivision(d.key)}
+                />
               ))
             )}
           </>
@@ -1021,19 +1259,41 @@ const styles = StyleSheet.create({
   analyzeButtonText: { color: '#14181C', fontSize: 16, fontWeight: '900' },
 
   // ── Rejection record cards
-  recordCard: {
-    backgroundColor: '#1D2329', borderWidth: 1, borderColor: '#2C343C', borderRadius: 10,
-    padding: 14, marginBottom: 10,
-  },
   recordTopRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 },
   recordLine: { color: '#ECEFF2', fontSize: 14.5, fontWeight: '800', flex: 1, marginRight: 8 },
-  stageBadge: { borderWidth: 1, borderColor: '#3E7CB1', borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3 },
-  stageBadgeText: { color: '#3E7CB1', fontSize: 10.5, fontWeight: '800' },
   recordMeta: { color: '#8A96A3', fontSize: 11.5, marginTop: 2 },
-  recordDetailRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 6 },
-  recordDefect: { color: '#ECEFF2', fontSize: 14, fontWeight: '700', flex: 1, marginRight: 8 },
-  recordQty: { color: '#D64545', fontSize: 14, fontWeight: '800' },
   recordRemarks: { color: '#8A96A3', fontSize: 12, fontStyle: 'italic', marginTop: 6 },
+
+  // ── Division-wise quality cards
+  divCard: {
+    backgroundColor: '#1D2329', borderWidth: 1, borderColor: '#2C343C', borderLeftWidth: 4,
+    borderRadius: 12, padding: 14, marginBottom: 12,
+  },
+  divHeader: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  divTitle: { color: '#ECEFF2', fontSize: 16, fontWeight: '800' },
+  divStatsRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 12 },
+  divStat: {
+    flexGrow: 1, flexBasis: 70, backgroundColor: '#14181C', borderRadius: 8,
+    paddingVertical: 8, paddingHorizontal: 6, alignItems: 'center',
+  },
+  divStatValue: { color: '#ECEFF2', fontSize: 15, fontWeight: '800' },
+  divStatLabel: { color: '#8A96A3', fontSize: 10.5, fontWeight: '700', marginTop: 2 },
+  divToggle: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6,
+    marginTop: 12, minHeight: 40, borderRadius: 8, borderWidth: 1, borderColor: '#F2A93B55',
+  },
+  divToggleText: { color: '#F2A93B', fontSize: 13, fontWeight: '800' },
+  divLines: { marginTop: 12, gap: 10 },
+  lineRow: { backgroundColor: '#14181C', borderWidth: 1, borderColor: '#2C343C', borderRadius: 10, padding: 12 },
+  lineStatsRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 8, marginBottom: 4 },
+  statusBadge: { borderWidth: 1, borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3 },
+  statusBadgeText: { fontSize: 10.5, fontWeight: '800' },
+  defectChip: {
+    flexDirection: 'row', alignItems: 'center', gap: 6, borderWidth: 1, borderColor: '#2C343C',
+    backgroundColor: '#1D2329', borderRadius: 14, paddingHorizontal: 10, paddingVertical: 5, maxWidth: '100%',
+  },
+  defectChipText: { color: '#ECEFF2', fontSize: 12, flexShrink: 1 },
+  defectChipQty: { color: '#D64545', fontSize: 12, fontWeight: '800' },
 
   // ── Graphical Analysis
   graphsToggle: {

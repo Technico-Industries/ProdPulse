@@ -259,7 +259,7 @@ const RECORDS: FakeRecord[] = [
       '08:00 PM - 09:00 PM': 60,
       '09:00 PM - 10:00 PM': 45, // dinner 9:45–10:00
       '10:00 PM - 11:00 PM': 45, // dinner 10:00–10:15
-      '11:00 PM - 12:00 AM': 60,
+      '11:00 PM - 12:00 AM': 50, // tea 11:30–11:40
       '12:00 AM - 01:00 AM': 60,
       '01:00 AM - 02:00 AM': 50, // tea 1:30–1:40
       '02:00 AM - 03:00 AM': 60,
@@ -273,11 +273,12 @@ const RECORDS: FakeRecord[] = [
     assert.equal(productiveMinutesIn(t(21), t(22), np), 45);
     assert.equal(productiveMinutesIn(t(22), t(23), np), 45);
     assert.equal(productiveMinutesIn(t(21), t(23), np), 90); // 120 − 30, not 120 − 60
-    // Whole shift: 510 wall minutes − 10 startup − 30 dinner − 10 tea − 10 clearance.
-    assert.equal(SLOTS_B.reduce((sum, s) => sum + s.productiveMinutes, 0), 450);
+    // Whole shift: 510 wall minutes − 10 startup − 30 dinner − 2×10 tea − 10 clearance.
+    assert.equal(SLOTS_B.reduce((sum, s) => sum + s.productiveMinutes, 0), 440);
   });
 
-  await test('12. 7–8 PM keeps one startup reserve; tea applies to 1–2 AM only', () => {
+  await test('12. 7–8 PM keeps one startup reserve; tea applies to 11–12 PM and 1–2 AM only', () => {
+    assert.equal(productiveMinutesIn(t(23), t(24), scheduledNonProductive('B', 0)), 50);
     const np = scheduledNonProductive('B', 0);
     assert.equal(np.filter((iv) => iv.start < t(20) && iv.end > t(19)).length, 1);
     assert.equal(productiveMinutesIn(t(19), t(20), np), 50);

@@ -227,15 +227,17 @@ export default function LiveDashboardView({ data, deniedMessage }: { data: LiveW
               <span className="ld-legend">
                 <span><i className="ld-sw ld-sw--good" />Good production</span>
                 <span><i className="ld-sw ld-sw--plan" />Plan</span>
+                <span><i className="ld-sw ld-sw--rej" />Rejections</span>
                 <span><i className="ld-sw ld-sw--today" />Today (in progress)</span>
               </span>
             }
           >
             <TrendChart
-              title="Good production and plan per production day, last 7 days"
+              title="Good production, plan and rejections per production day, last 7 days"
               days={days}
               good={series('goodProduction')}
               plan={series('plan')}
+              rejected={week.days.map((d) => d.rejectedParts)}
               achievement={week.days.map((d) => d.achievementPct)}
               rows={[
                 { label: 'Good', values: week.days.map((d) => fmtInt(d.goodProduction)) },
