@@ -40,13 +40,14 @@ import {
   Modal,
   Alert,
   Platform,
+  LayoutAnimation,
+  UIManager,
   useWindowDimensions,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import WebRefreshButton from '../components/WebRefreshButton';
 import { PROD_AI_BUTTON_CLEARANCE } from '../utils/prodAIPanelLayout';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import Svg, { Circle } from 'react-native-svg';
 import { collection, getDocs, onSnapshot, query, where } from 'firebase/firestore';
 import { db } from '../services/firebase';
 import AppDrawer from '../components/AppDrawer';
@@ -58,11 +59,14 @@ import {
   INACTIVE_COLOR,
   EfficiencyBand,
   EfficiencyRecord,
-  LineCard,
+  LiveLine,
   LiveSession,
   RegisteredLine,
-  buildLineCards,
+  buildLiveLines,
   filterLineCards,
+  lastSavedSlot,
+  capsuleFigures,
+  formatCapsulePct,
   productionFigures,
   summarize,
 } from '../utils/lineEfficiency';
@@ -94,60 +98,91 @@ function formatClock(ms: number): string {
   return `${h % 12 === 0 ? 12 : h % 12}:${m} ${h < 12 ? 'AM' : 'PM'}`;
 }
 
-// ─── Circular progress ring ──────────────────────────────────────────────────
+// Old-architecture Android needs LayoutAnimation switched on; the new
+// architecture (Fabric) supports it as is.
+if (
+  Platform.OS === 'android' &&
+  !(globalThis as any).nativeFabricUIManager &&
+  UIManager.setLayoutAnimationEnabledExperimental
+) {
+  UIManager.setLayoutAnimationEnabledExperimental(true);
+}
 
-// Compact gauges so more lines fit per row (see `columns` below).
-const RING_SIZE = 72;
-const RING_STROKE = 7;
+// ─── Efficiency capsule ──────────────────────────────────────────────────────
+// Pill-shaped bar, filled left → right by efficiency in the line's band
+// colour over the dark track the ring used. Two centred lines inside: the
+// efficiency, then "actual / planned". Over 100% fills the whole capsule,
+// the text keeps the real value. Tapping it expands / collapses the card.
+// The text is never truncated (no numberOfLines — on web that becomes a
+// CSS ellipsis); the short formats in lineEfficiency.ts keep it inside.
 
-function EfficiencyRing({ card }: { card: LineCard }) {
-  const r = (RING_SIZE - RING_STROKE) / 2;
-  const circumference = 2 * Math.PI * r;
-  // Only an active line with a real figure fills the ring; >100% caps at a
-  // full ring (the number still shows the true value).
-  const fill =
-    card.status !== 'not_running' && card.efficiency != null
-      ? Math.min(1, Math.max(0, card.efficiency / 100))
-      : 0;
-  const label =
-    card.status === 'not_running' || card.efficiency == null ? '—' : `${card.efficiency.toFixed(1)}%`;
+const CAPSULE_HEIGHT = 56;
+
+function EfficiencyCapsule({ card, expanded, onPress }: { card: LiveLine; expanded: boolean; onPress: () => void }) {
+  const active = card.status !== 'not_running' && card.efficiency != null;
+  const fill = active ? Math.min(1, Math.max(0, (card.efficiency as number) / 100)) : 0;
+  const figures = capsuleFigures(card);
+  const pct = active ? formatCapsulePct(card.efficiency) : '—';
+  const inactive = !active;
 
   return (
-    <View style={{ width: RING_SIZE, height: RING_SIZE }}>
-      <Svg width={RING_SIZE} height={RING_SIZE}>
-        <Circle
-          cx={RING_SIZE / 2}
-          cy={RING_SIZE / 2}
-          r={r}
-          stroke="#2C343C"
-          strokeWidth={RING_STROKE}
-          fill="none"
-        />
-        {fill > 0 ? (
-          <Circle
-            cx={RING_SIZE / 2}
-            cy={RING_SIZE / 2}
-            r={r}
-            stroke={card.color}
-            strokeWidth={RING_STROKE}
-            fill="none"
-            strokeLinecap="round"
-            strokeDasharray={`${circumference} ${circumference}`}
-            strokeDashoffset={circumference * (1 - fill)}
-            // Start at 12 o'clock and run clockwise.
-            transform={`rotate(-90 ${RING_SIZE / 2} ${RING_SIZE / 2})`}
-          />
-        ) : null}
-      </Svg>
-      <View style={styles.ringCenter} pointerEvents="none">
-        <Text
-          style={[styles.ringValue, { color: card.status === 'not_running' ? '#8A96A3' : card.color }]}
-          numberOfLines={1}
-          adjustsFontSizeToFit
-        >
-          {label}
-        </Text>
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => [styles.capsule, pressed && styles.capsulePressed]}
+      accessibilityRole="button"
+      accessibilityState={{ expanded }}
+      accessibilityLabel={`${card.lineName}: ${figures === '— / —' ? 'no production yet' : `${figures.replace(' / ', ' of ')} parts`}, efficiency ${
+        active ? `${pct.replace('%', ' percent')}` : 'not available'
+      }`}
+      accessibilityHint={expanded ? 'Hides slot, rejection and downtime details' : 'Shows slot, rejection and downtime details'}
+    >
+      {/* Only this track clips (rounded ends on the fill); the text layer
+          above it is never clipped. */}
+      <View style={styles.capsuleTrack} pointerEvents="none">
+        {fill > 0 ? <View style={[styles.capsuleFill, { width: `${fill * 100}%`, backgroundColor: card.color }]} /> : null}
       </View>
+      <View style={styles.capsuleContent} pointerEvents="none">
+        <Text style={[styles.capsulePct, inactive && styles.capsuleTextInactive]}>{pct}</Text>
+        <Text style={[styles.capsuleFigures, inactive && styles.capsuleTextInactive]}>{figures}</Text>
+      </View>
+    </Pressable>
+  );
+}
+
+// ─── Expanded details: Last slot · Rejection · Downtime ─────────────────────
+
+function DetailBlocks({
+  card,
+  downtime,
+  stacked,
+}: {
+  card: LiveLine;
+  downtime: LineDowntimeSummary | null;
+  stacked: boolean;
+}) {
+  const last = lastSavedSlot(card.slots);
+  const blocks: [string, string][] = [
+    ['Last slot', last ? `${last.label} · ${last.pcs.toLocaleString()} pcs` : 'No slot yet'],
+    [
+      'Rejection',
+      card.rejections == null
+        ? '—'
+        : `${card.rejections.toLocaleString()}${card.rejectionPct != null ? ` · ${card.rejectionPct.toFixed(1)}%` : ''}`,
+    ],
+    ['Downtime', formatDowntimeMinutes(downtime?.totalMinutes ?? 0)],
+  ];
+  return (
+    <View style={stacked ? styles.blocksStacked : styles.blocksSide}>
+      {blocks.map(([label, value]) => (
+        <View key={label} style={stacked ? styles.blockStacked : styles.blockSide} accessible accessibilityLabel={`${label}: ${value}`}>
+          <Text style={styles.blockLabel} numberOfLines={1}>
+            {label}
+          </Text>
+          <Text style={styles.blockValue} numberOfLines={2}>
+            {value}
+          </Text>
+        </View>
+      ))}
     </View>
   );
 }
@@ -160,13 +195,24 @@ function LineTile({
   ending,
   onEnd,
   downtime,
+  expanded,
+  sideBySide,
+  onToggle,
+  onCardPress,
 }: {
-  card: LineCard;
+  card: LiveLine;
   width: string;
   ending: boolean;
-  onEnd: ((card: LineCard) => void) | null;
+  onEnd: ((card: LiveLine) => void) | null;
   // The session's downtime so far (null for a line that isn't running).
   downtime: LineDowntimeSummary | null;
+  // Expanded across the whole grid row, with Last slot / Rejection / Downtime.
+  expanded: boolean;
+  // Wide enough for the three blocks beside the capsule; else under it.
+  sideBySide: boolean;
+  onToggle: (lineId: string) => void;
+  // A tap on the card outside the capsule (collapses another expanded card).
+  onCardPress: (lineId: string) => void;
 }) {
   const badgeColor =
     card.status === 'running' ? '#4C9A6A' : card.status === 'stopped' ? '#D64545' : INACTIVE_COLOR;
@@ -196,66 +242,70 @@ function LineTile({
   const totalDowntimeText = downtime ? `Shift downtime ${formatDowntimeMinutes(downtime.totalMinutes)}` : null;
   const figures = productionFigures(card);
 
-  return (
-    <View style={[styles.cell, { width: width as any }]}>
-      <View
+  const capsule = <EfficiencyCapsule card={card} expanded={expanded} onPress={() => onToggle(card.lineId)} />;
+  // Collapsed card: capsule + line name, nothing else.
+  const head = (
+    <>
+      {capsule}
+      <Pressable
+        onPress={() => onCardPress(card.lineId)}
         style={styles.tile}
         accessible
         accessibilityLabel={`${card.lineName}: ${figures === '— / —' ? '' : `${figures.replace(' / ', ' of ')} parts, `}${card.badge}${
           card.status !== 'not_running' && card.efficiency != null ? `, efficiency ${card.efficiency.toFixed(1)} percent` : ''
         }${detail ? `, ${detail}` : ''}${currentStopText ? `, ${currentStopText}` : ''}${totalDowntimeText ? `, ${totalDowntimeText}` : ''}`}
       >
-        <EfficiencyRing card={card} />
         <Text style={styles.tileName} numberOfLines={2}>
           {card.lineName}
         </Text>
-        <View style={styles.figures}>
-          <Text style={styles.figuresValue} numberOfLines={1} adjustsFontSizeToFit>
-            {figures}
-          </Text>
-          <Text style={styles.figuresLabel} numberOfLines={1}>
-            Actual / Target
-          </Text>
-        </View>
-        <View style={[styles.badge, { borderColor: `${badgeColor}88`, backgroundColor: `${badgeColor}22` }]}>
+        {/* Running / Stopped (or its reason) / Not Running — always visible. */}
+        <View style={[styles.badge, styles.tileBadge, { borderColor: `${badgeColor}88`, backgroundColor: `${badgeColor}22` }]}>
           <Ionicons name={icon as any} size={9} color={badgeColor} />
           <Text style={[styles.badgeText, { color: badgeColor }]} numberOfLines={1}>
             {card.badge}
           </Text>
         </View>
-        {detail ? (
-          <Text style={styles.tileDetail} numberOfLines={2}>
-            {detail}
-          </Text>
-        ) : null}
-        {currentStopText ? (
-          <Text style={[styles.tileDowntime, { color: '#D64545' }]} numberOfLines={1} adjustsFontSizeToFit>
-            {currentStopText}
-          </Text>
-        ) : null}
-        {totalDowntimeText ? (
-          <Text
-            style={[styles.tileDowntime, { color: (downtime?.totalMinutes ?? 0) > 0 ? '#F2A93B' : '#8A96A3' }]}
-            numberOfLines={1}
-            adjustsFontSizeToFit
-          >
-            {totalDowntimeText}
-          </Text>
-        ) : null}
-        {meta ? (
-          <Text style={styles.tileMeta} numberOfLines={2}>
-            {meta}
-          </Text>
-        ) : null}
-      </View>
+      </Pressable>
+    </>
+  );
+
+  if (!expanded) {
+    return <View style={[styles.cell, { width: width as any }]}>{head}</View>;
+  }
+
+  // Expanded section, in order: status badge + shift · (stop details) ·
+  // Last slot / Rejection / Downtime · End Production. Shift downtime is
+  // only in the Downtime block.
+  const section = (
+    <View style={[styles.expandedSection, !sideBySide && styles.expandedSectionStacked]}>
+      {/* The status badge is on the card itself (under the name). */}
+      {meta || card.supervisorName ? (
+        <View style={styles.statusLine}>
+          {meta ? <Text style={styles.statusShift}>{meta}</Text> : null}
+          {card.supervisorName ? (
+            <View style={styles.supervisor} accessible accessibilityLabel={`Supervisor ${card.supervisorName}`}>
+              <Ionicons name="person-outline" size={12} color="#8A96A3" />
+              <Text style={styles.supervisorName}>{card.supervisorName}</Text>
+            </View>
+          ) : null}
+        </View>
+      ) : null}
+      {detail || currentStopText ? (
+        <Text style={styles.statusDetail} numberOfLines={2}>
+          {detail}
+          {detail && currentStopText ? ' · ' : ''}
+          {currentStopText ? <Text style={{ color: '#D64545' }}>{currentStopText}</Text> : null}
+        </Text>
+      ) : null}
+      <DetailBlocks card={card} downtime={downtime} stacked={!sideBySide} />
       {/* Running lines only — a stopped or inactive line has no action. */}
       {card.status === 'running' && card.session && onEnd ? (
         <Pressable
           onPress={() => onEnd(card)}
           disabled={ending}
-          style={({ pressed }) => [styles.endBtn, ending && styles.endBtnBusy, pressed && styles.pressed]}
+          style={({ pressed }) => [styles.endBtn, styles.endBtnFull, ending && styles.endBtnBusy, pressed && styles.pressed]}
           accessibilityRole="button"
-          accessibilityLabel={`End production for ${card.lineName}`}
+          accessibilityLabel={`End production on ${card.lineName}`}
           accessibilityState={{ disabled: ending, busy: ending }}
         >
           {ending ? (
@@ -267,6 +317,26 @@ function LineTile({
           )}
         </Pressable>
       ) : null}
+    </View>
+  );
+
+  // Spans the whole row. Capsule + name on the left with the section beside
+  // it — or, on a narrow phone, the section under the capsule.
+  return (
+    <View style={[styles.cell, styles.cellExpanded]}>
+      <View style={styles.expandedPanel}>
+        {sideBySide ? (
+          <View style={styles.expandedRow}>
+            <View style={styles.expandedLeft}>{head}</View>
+            {section}
+          </View>
+        ) : (
+          <>
+            {head}
+            {section}
+          </>
+        )}
+      </View>
     </View>
   );
 }
@@ -456,6 +526,18 @@ export default function LineEfficiencyOverviewScreen() {
               startedAtMs: toMillis(data.startedAt),
               updatedAtMs: toMillis(data.updatedAt),
               sessionInstance: sessionInstanceOf(data),
+              // Slot schedule, for the expanded card's "Last slot" window.
+              otHours: typeof data.otHours === 'number' ? data.otHours : null,
+              productionStartMinutesAbs:
+                typeof data.productionStartMinutesAbs === 'number' ? data.productionStartMinutesAbs : null,
+              plant: data.plant ?? null,
+              workshop: data.workshop ?? null,
+              scheduleProfile: typeof data.scheduleProfile === 'string' ? data.scheduleProfile : null,
+              deletedSlotIndices: Array.isArray(data.deletedSlotIndices) ? data.deletedSlotIndices : null,
+              // Supervisor shown in the expanded card: whoever last synced
+              // the session (follows a handover), else the session starter.
+              supervisorName: data.supervisorName ?? null,
+              currentSupervisorName: data.updatedBy?.name ?? null,
             };
           })
         );
@@ -513,6 +595,9 @@ export default function LineEfficiencyOverviewScreen() {
               partSegment: data.partSegment ?? null,
               createdAtMs: toMillis(data.createdAt),
               updatedAtMs: toMillis(data.updatedAt),
+              // Rejection counter, for the expanded card (null on legacy records).
+              rejections: typeof data.rejections === 'number' ? data.rejections : null,
+              supervisorName: data.supervisor?.name ?? data.sessionSupervisor?.name ?? null,
             };
           });
           ready[i] = true;
@@ -545,11 +630,6 @@ export default function LineEfficiencyOverviewScreen() {
     setRecordsEpoch((n) => n + 1);
   }, [fetchLines]);
 
-  const allCards = useMemo(() => buildLineCards(lines, sessions, records), [lines, sessions, records]);
-  // Client-side over the same data — changing a filter never re-queries.
-  const cards = useMemo(() => filterLineCards(allCards, { plant, workshop, division }), [allCards, plant, workshop, division]);
-  const counts = useMemo(() => summarize(cards), [cards]);
-
   // ── Downtime per running line, from its activeSessions stopsBySlot (the
   // persisted stop intervals) — so it survives refreshes and is the same on
   // every device. The clock ticks only while a line is stopped.
@@ -561,6 +641,40 @@ export default function LineEfficiencyOverviewScreen() {
     const id = setInterval(() => setNowMs(Date.now()), 15000);
     return () => clearInterval(id);
   }, [anyStopped, sessions]);
+
+  // Same cards, same order as buildLineCards, plus the expanded view's
+  // fields (saved slots, rejections) from the same listener data.
+  const allCards = useMemo(() => buildLiveLines(lines, sessions, records, nowMs), [lines, sessions, records, nowMs]);
+  // Client-side over the same data — changing a filter never re-queries.
+  const cards = useMemo(
+    () => filterLineCards(allCards, { plant, workshop, division }) as LiveLine[],
+    [allCards, plant, workshop, division]
+  );
+  const counts = useMemo(() => summarize(cards), [cards]);
+
+  // ── Expanded card (one at a time). Capsule tap toggles; a tap on any
+  // other card collapses the open one.
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const animateLayout = () =>
+    LayoutAnimation.configureNext({
+      duration: 200,
+      create: { type: LayoutAnimation.Types.easeInEaseOut, property: LayoutAnimation.Properties.opacity },
+      update: { type: LayoutAnimation.Types.easeInEaseOut },
+      delete: { type: LayoutAnimation.Types.easeInEaseOut, property: LayoutAnimation.Properties.opacity },
+    });
+  const toggleExpanded = useCallback((lineId: string) => {
+    animateLayout();
+    setExpandedId((cur) => (cur === lineId ? null : lineId));
+  }, []);
+  const onCardPress = useCallback(
+    (lineId: string) => {
+      if (expandedId && expandedId !== lineId) {
+        animateLayout();
+        setExpandedId(null);
+      }
+    },
+    [expandedId]
+  );
   const downtimeByLine = useMemo(() => {
     const map = new Map<string, LineDowntimeSummary>();
     sessions.forEach((s) =>
@@ -577,7 +691,7 @@ export default function LineEfficiencyOverviewScreen() {
   const endingRef = useRef<Set<string>>(new Set());
   const [endingLines, setEndingLines] = useState<Set<string>>(new Set());
   const [endResult, setEndResult] = useState<{ ok: boolean; message: string } | null>(null);
-  const endProduction = useCallback(async (card: LineCard) => {
+  const endProduction = useCallback(async (card: LiveLine) => {
     if (!authUser) return;
     const target: EndProductionTarget = {
       lineId: card.lineId,
@@ -586,7 +700,8 @@ export default function LineEfficiencyOverviewScreen() {
     };
     const outcome = await confirmAndEndProduction(target, {
       inFlight: endingRef.current,
-      confirm: confirmEndProduction,
+      // Always asks first: "End production on DHL-01?"
+      confirm: (_title, message) => confirmEndProduction(`End production on ${card.lineName}?`, message),
       end: (t) => adminEndProductionSession(t, { uid: authUser.uid, name: authUser.name, email: authUser.email }),
       onBusyChange: (lineId, busy) =>
         setEndingLines((prev) => {
@@ -603,9 +718,14 @@ export default function LineEfficiencyOverviewScreen() {
 
   // ── Responsive grid. Percentage widths in a wrapping row, so nothing can
   // overflow horizontally at any breakpoint.
-  const columns =
-    width >= 1200 ? 9 : width >= 900 ? 7 : width >= 700 ? 6 : width >= 520 ? 5 : width >= 380 ? 4 : 3;
+  // Phones: 2 columns under 400 px, 3 up to tablet width; tablets and up
+  // keep their counts.
+  const columns = width >= 1200 ? 9 : width >= 900 ? 7 : width >= 700 ? 6 : width >= 400 ? 3 : 2;
   const tileWidth = `${100 / columns}%`;
+  // An expanded card spans the row (screen width minus the 16 px page
+  // padding each side). Below ~560 px the three detail blocks go under the
+  // capsule instead of beside it.
+  const sideBySide = width - 32 >= 560;
 
   const initialLoading = !linesLoaded || !sessionsLoaded || (recordsLoading && records.length === 0);
   const fatalError = (linesError && lines.length === 0) || (sessionsError && sessions.length === 0)
@@ -790,6 +910,10 @@ export default function LineEfficiencyOverviewScreen() {
                     ending={endingLines.has(card.lineId)}
                     onEnd={isAdmin ? endProduction : null}
                     downtime={card.status !== 'not_running' ? downtimeByLine.get(card.lineId) ?? null : null}
+                    expanded={expandedId === card.lineId}
+                    sideBySide={sideBySide}
+                    onToggle={toggleExpanded}
+                    onCardPress={onCardPress}
                   />
                 ))}
               </View>
@@ -929,6 +1053,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  // In the expanded section: full width, same colours, a real touch target.
+  endBtnFull: { alignSelf: 'stretch', marginTop: 0, minHeight: 44 },
   endBtnBusy: { opacity: 0.6 },
   endBtnText: { color: '#D64545', fontSize: 10.5, fontWeight: '800' },
 
@@ -941,25 +1067,109 @@ const styles = StyleSheet.create({
   // Each cell is exactly 1/columns wide with its own gutter, so a partial
   // last row stays left-aligned at the same tile size.
   grid: { flexDirection: 'row', flexWrap: 'wrap', marginHorizontal: -5 },
-  cell: { paddingHorizontal: 5, paddingVertical: 10 },
-  // No card behind a line: the gauge and its details float directly on the
-  // page background, so the ring is the only shape in each cell.
+  // Compact: a collapsed card is just the capsule and the line name.
+  cell: { paddingHorizontal: 5, paddingVertical: 6 },
+  // No card behind a line: the capsule and its name float directly on the
+  // page background.
   tile: {
-    flex: 1,
     alignItems: 'center',
-    gap: 7,
+    marginTop: 6,
   },
-  ringCenter: {
+
+  // Capsule gauge — the ring's dark track, filled with the band colour.
+  // White text with a soft shadow stays readable over the fill and the track.
+  capsule: {
+    width: '100%',
+    height: CAPSULE_HEIGHT,
+    borderRadius: CAPSULE_HEIGHT / 2,
+    justifyContent: 'center',
+  },
+  capsulePressed: { opacity: 0.8 },
+  capsuleTrack: {
     position: 'absolute',
     top: 0,
-    left: 0,
     right: 0,
     bottom: 0,
+    left: 0,
+    borderRadius: CAPSULE_HEIGHT / 2,
+    backgroundColor: '#2C343C',
+    overflow: 'hidden',
+  },
+  capsuleFill: { position: 'absolute', left: 0, top: 0, bottom: 0 },
+  capsuleContent: {
     alignItems: 'center',
     justifyContent: 'center',
-    paddingHorizontal: RING_STROKE + 3,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
   },
-  ringValue: { fontSize: 13.5, fontWeight: '900' },
+  capsulePct: {
+    flexShrink: 0,
+    textAlign: 'center',
+    color: '#FFFFFF',
+    fontSize: 16,
+    lineHeight: 20,
+    fontWeight: '900',
+    fontVariant: ['tabular-nums'],
+    textShadowColor: 'rgba(0,0,0,0.35)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 2,
+  },
+  capsuleFigures: {
+    flexShrink: 0,
+    textAlign: 'center',
+    color: 'rgba(255,255,255,0.85)',
+    fontSize: 12,
+    lineHeight: 16,
+    fontWeight: '700',
+    fontVariant: ['tabular-nums'],
+    textShadowColor: 'rgba(0,0,0,0.35)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 2,
+  },
+  // Not running / nothing saved: the same grey "—" as before.
+  capsuleTextInactive: { color: '#8A96A3' },
+
+  // Expanded card: the whole grid row, on a subtle panel.
+  cellExpanded: { width: '100%' },
+  expandedPanel: {
+    padding: 12,
+    backgroundColor: '#1D2329',
+    borderWidth: 1,
+    borderColor: '#2C343C',
+    borderRadius: 14,
+  },
+  expandedRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 14 },
+  expandedLeft: { width: 260, maxWidth: '45%' },
+  // Status line, details, blocks and End Production, top to bottom.
+  expandedSection: { flex: 1, minWidth: 0, gap: 10 },
+  expandedSectionStacked: { marginTop: 10 },
+  statusLine: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', columnGap: 12, rowGap: 4 },
+  supervisor: { flexDirection: 'row', alignItems: 'center', gap: 4, flexShrink: 1 },
+  supervisorName: { color: '#ECEFF2', fontSize: 12.5, fontWeight: '700', flexShrink: 1 },
+  statusShift: { color: '#8A96A3', fontSize: 11.5, fontWeight: '700' },
+  statusDetail: { color: '#8A96A3', fontSize: 11.5, fontWeight: '600', fontVariant: ['tabular-nums'] },
+  blocksSide: { flexDirection: 'row', gap: 8 },
+  blockSide: {
+    flex: 1,
+    minWidth: 0,
+    minHeight: CAPSULE_HEIGHT,
+    justifyContent: 'center',
+    gap: 3,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 10,
+    backgroundColor: '#14181C',
+  },
+  blocksStacked: { gap: 6 },
+  blockStacked: {
+    gap: 2,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 10,
+    backgroundColor: '#14181C',
+  },
+  blockLabel: { color: '#8A96A3', fontSize: 11, fontWeight: '700' },
+  blockValue: { color: '#ECEFF2', fontSize: 13.5, fontWeight: '800', fontVariant: ['tabular-nums'] },
   tileName: { color: '#ECEFF2', fontSize: 12, fontWeight: '800', textAlign: 'center', width: '100%' },
   badge: {
     flexDirection: 'row',
@@ -972,13 +1182,7 @@ const styles = StyleSheet.create({
     maxWidth: '100%',
   },
   badgeText: { fontSize: 9.5, fontWeight: '800', flexShrink: 1 },
-  // Actual / Target: readable, but quieter than the ring's percentage.
-  figures: { alignItems: 'center', width: '100%', marginTop: -3 },
-  figuresValue: { color: '#C3CBD3', fontSize: 11.5, fontWeight: '700', fontVariant: ['tabular-nums'] },
-  figuresLabel: { color: '#5C6670', fontSize: 8.5, fontWeight: '700', letterSpacing: 0.4, marginTop: 1 },
-  tileDetail: { color: '#8A96A3', fontSize: 10, fontWeight: '600', textAlign: 'center', width: '100%' },
-  tileMeta: { color: '#8A96A3', fontSize: 9.5, fontWeight: '600', textAlign: 'center', width: '100%' },
-  tileDowntime: { fontSize: 9.5, fontWeight: '700', textAlign: 'center', width: '100%', fontVariant: ['tabular-nums'] },
+  tileBadge: { marginTop: 5 },
 
   // Plant / Workshop filter — same look as the Production page's.
   filterBlock: { gap: 8 },

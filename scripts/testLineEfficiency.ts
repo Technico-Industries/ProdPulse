@@ -11,7 +11,17 @@ import {
   EfficiencyRecord,
   LiveSession,
   RegisteredLine,
+  LIVE_STATUS_COLORS,
   buildLineCards,
+  buildLiveLines,
+  downtimeReasonsOf,
+  getLineStatus,
+  groupLiveLines,
+  lastSavedSlot,
+  capsuleFigures,
+  formatCapsuleCount,
+  formatCapsulePct,
+  plantSummary,
   currentStop,
   efficiencyBand,
   efficiencyOf,
@@ -20,6 +30,7 @@ import {
   productionFigures,
   summarize,
 } from '../src/utils/lineEfficiency';
+import { productionDayMinuteToMillis } from '../src/utils/productionDay';
 
 let passed = 0;
 function test(name: string, fn: () => void) {
@@ -351,6 +362,199 @@ test('F6. missing / zero target handled safely', () => {
   const missing = l1([rec('L1', 10, null)]);
   assert.equal(productionFigures(missing), '10 / —');
   assert.equal(missing.efficiency, null);
+});
+
+// ─── getLineStatus / live lines (phone Lines screen) ────────────────────────
+
+test('S1. getLineStatus: excellent ≥ 90, warning 75–90, poor < 75', () => {
+  const st = (efficiency: number) => getLineStatus({ hasSession: true, efficiency });
+  assert.equal(st(95), 'excellent');
+  assert.equal(st(90), 'excellent'); // inclusive
+  assert.equal(st(89.9), 'warning');
+  assert.equal(st(75), 'warning'); // inclusive
+  assert.equal(st(74.9), 'poor');
+  assert.equal(st(0), 'poor');
+});
+
+test('S2. getLineStatus: > 100% is excellent, value not capped', () => {
+  assert.equal(getLineStatus({ hasSession: true, efficiency: 105 }), 'excellent');
+  assert.equal(getLineStatus({ hasSession: true, efficiency: 250 }), 'excellent');
+  const c = buildLiveLines([line('L1')], [session('L1')], [rec('L1', 105, 100)], 0).find((x) => x.lineId === 'L1')!;
+  assert.equal(c.efficiency, 105);
+  assert.equal(c.liveStatus, 'excellent');
+});
+
+test('S3. getLineStatus: noEntry when nothing saved, or the latest ended slot is missing', () => {
+  assert.equal(getLineStatus({ hasSession: true, efficiency: null }), 'noEntry');
+  assert.equal(getLineStatus({ hasSession: true, efficiency: 98, missedSlot: true }), 'noEntry');
+  assert.equal(getLineStatus({ hasSession: true, efficiency: 40, missedSlot: true }), 'noEntry');
+});
+
+test('S4. getLineStatus: notRunning without a session, whatever the figure', () => {
+  assert.equal(getLineStatus({ hasSession: false, efficiency: null }), 'notRunning');
+  assert.equal(getLineStatus({ hasSession: false, efficiency: 100 }), 'notRunning');
+});
+
+test('S5. status colours: no purple anywhere', () => {
+  assert.deepEqual(LIVE_STATUS_COLORS, {
+    excellent: '#4C9A6A', warning: '#F2A93B', poor: '#D64545', noEntry: '#8A96A3', notRunning: '#5C6670',
+  });
+});
+
+// Assembly Shift A: 07–08 (0), 08–09 (1), 09–10 (2), 10–11 (3), 11–12:15 (4),
+// lunch (5), 12:45–14 (6, labelled 13), 14–15 (7), 15–15:30 (8).
+const at = (hh: number, mm = 0, key = DATE) => productionDayMinuteToMillis(key, hh * 60 + mm);
+const live = (records: EfficiencyRecord[], nowMs: number, s: LiveSession = session('L1')) =>
+  buildLiveLines([line('L1')], [s], records, nowMs).find((x) => x.lineId === 'L1')!;
+
+test('S6. all ended slots saved → banded by %, slot bars saved/current/future', () => {
+  const c = live([slotRec(0, 100, 100), slotRec(1, 92, 100), slotRec(2, 95, 100)], at(10, 30));
+  assert.equal(c.efficiency, 95.7);
+  assert.equal(c.missedSlot, false);
+  assert.equal(c.liveStatus, 'excellent');
+  assert.equal(c.statusColor, '#4C9A6A');
+  assert.deepEqual(c.slots.map((s) => s.state), ['saved', 'saved', 'saved', 'current', 'future', 'future', 'future', 'future']);
+  assert.deepEqual(c.slots.map((s) => s.label), ['07', '08', '09', '10', '11', '13', '14', '15']);
+  assert.equal(c.slots[1].actual, 92);
+  assert.equal(c.slots[1].target, 100);
+});
+
+test('S7. latest ended slot not saved → noEntry since end of last saved slot', () => {
+  const c = live([slotRec(0, 100, 100), slotRec(1, 100, 100)], at(10, 30));
+  assert.equal(c.efficiency, 100); // the % is still known…
+  assert.equal(c.missedSlot, true);
+  assert.equal(c.liveStatus, 'noEntry'); // …but the line needs attention
+  assert.equal(c.noEntrySince, '09:00');
+  assert.equal(c.slots[2].state, 'missing');
+});
+
+test('S8. nothing saved → noEntry since production start', () => {
+  assert.equal(live([], at(9, 30)).noEntrySince, '07:00');
+  assert.equal(live([], at(9, 30)).liveStatus, 'noEntry');
+  // Started late at 09:15: slots before it don't exist, none has ended yet.
+  const late = live([], at(9, 30), session('L1', { productionStartMinutesAbs: 9 * 60 + 15 }));
+  assert.equal(late.missedSlot, false);
+  assert.equal(late.liveStatus, 'noEntry');
+  assert.equal(late.noEntrySince, '09:15');
+  assert.equal(late.slots[0].state, 'current');
+});
+
+test('S9. a deleted slot card is never "missing"', () => {
+  const c = live([slotRec(0, 100, 100), slotRec(1, 100, 100)], at(10, 30), session('L1', { deletedSlotIndices: [2] }));
+  assert.equal(c.missedSlot, false);
+  assert.equal(c.liveStatus, 'excellent');
+});
+
+test('S10. Shift B after midnight uses the same production day', () => {
+  const s = session('L1', { shift: 'B' });
+  const b = (i: number) => slotRec(i, 100, 100, { shift: 'B', id: `b${i}` });
+  // 19–20 … 23–24 saved (slots 0–4); 00–01 (slot 5) ended at 01:00.
+  const c = live([0, 1, 2, 3, 4].map(b), at(25, 10), s);
+  assert.equal(c.missedSlot, true);
+  assert.equal(c.noEntrySince, '00:00');
+  const ok = live([0, 1, 2, 3, 4, 5].map(b), at(25, 10), s);
+  assert.equal(ok.liveStatus, 'excellent');
+});
+
+test('S11. rejection %, last entry, model and supervisor', () => {
+  const c = live(
+    [
+      slotRec(0, 95, 100, { rejections: 5, updatedAtMs: 100, partName: 'Old', supervisorName: 'A' }),
+      slotRec(1, 90, 100, { rejections: 0, updatedAtMs: 200, partName: 'DHL-RH', supervisorName: 'Ravi', lossReasonLabel: 'Material' }),
+    ],
+    at(9, 10)
+  );
+  assert.equal(c.rejections, 5);
+  assert.equal(c.rejectionPct, 2.6); // 5 / (185 + 5)
+  assert.equal(c.lastEntryAtMs, 200);
+  assert.equal(c.partName, 'DHL-RH');
+  assert.equal(c.supervisorName, 'Ravi');
+  assert.deepEqual(c.lossReasons, ['Material']);
+});
+
+test('S12. grouping: no entry first, then lowest %; on track by % ascending', () => {
+  const lines = ['A', 'B', 'C', 'D', 'E', 'F'].map((id) => line(id));
+  const sessions = ['A', 'B', 'C', 'D', 'E'].map((id) => session(id));
+  const records = [rec('A', 60, 100), rec('B', 40, 100), rec('D', 95, 100), rec('E', 80, 100)];
+  const g = groupLiveLines(buildLiveLines(lines, sessions, records, 0));
+  assert.deepEqual(g.needsAttention.map((l) => l.lineId), ['C', 'B', 'A']);
+  assert.deepEqual(g.onTrack.map((l) => l.lineId), ['E', 'D']);
+  assert.deepEqual(g.notRunning.map((l) => l.lineId), ['F']);
+});
+
+test('S13. plant summary is Σactual / Σtarget across running lines', () => {
+  const lines = ['A', 'B', 'C'].map((id) => line(id));
+  const all = buildLiveLines(lines, [session('A'), session('B')], [rec('A', 95, 100), rec('B', 10, 200)], 0);
+  const p = plantSummary(all);
+  assert.equal(p.efficiency, 35); // 105 / 300, not the 52.5 average
+  assert.equal(p.okLines, 1);
+  assert.equal(p.activeLines, 2);
+  assert.equal(p.notRunning, 1);
+  assert.equal(p.status, 'poor');
+});
+
+test('S14. downtime reasons: each stop once, running stop up to now', () => {
+  const r = downtimeReasonsOf(
+    {
+      '0': [{ id: 'x', reason: 'power cut', startAbs: 0, endAbs: 600000, running: false, durationMinutes: 10 } as any],
+      '1': [
+        { id: 'x', reason: 'power cut', startAbs: 0, endAbs: 600000, running: false, durationMinutes: 10 } as any,
+        { reason: 'maintenance', startAbs: 0, running: true },
+      ],
+    },
+    30 * 60000
+  );
+  assert.deepEqual(r, [{ reason: 'Maintenance', minutes: 30 }, { reason: 'Power Cut', minutes: 10 }]);
+});
+
+test('S15. last saved slot: latest window and its quantity (changeover halves summed)', () => {
+  assert.equal(lastSavedSlot(live([], at(9, 30)).slots), null);
+  const c = live(
+    [
+      slotRec(0, 100, 100),
+      slotRec(2, 40, 50, { partSegment: 'before' }),
+      slotRec(2, 70, 72, { partSegment: 'after' }),
+    ],
+    at(10, 30)
+  );
+  assert.deepEqual(lastSavedSlot(c.slots), { label: '09:00–10:00', pcs: 110 });
+});
+
+test('S16. supervisor: current (handover) → latest slot saver → session starter', () => {
+  const recs = [slotRec(0, 100, 100, { supervisorName: 'Ravi', updatedAtMs: 50 })];
+  const s = (over: Partial<LiveSession>) => live(recs, at(8, 10), session('L1', over)).supervisorName;
+  assert.equal(s({ supervisorName: 'Amit', currentSupervisorName: 'Sunil' }), 'Sunil');
+  assert.equal(s({ supervisorName: 'Amit' }), 'Ravi');
+  assert.equal(live([], at(8, 10), session('L1', { supervisorName: 'Amit' })).supervisorName, 'Amit');
+  assert.equal(live([], at(8, 10)).supervisorName, null);
+});
+
+test('C1. capsule %: 1 decimal under 100, whole number from 100', () => {
+  assert.equal(formatCapsulePct(64.6), '64.6%');
+  assert.equal(formatCapsulePct(29), '29.0%');
+  assert.equal(formatCapsulePct(99.9), '99.9%');
+  assert.equal(formatCapsulePct(99.96), '100%'); // rounds into the ≥100 rule
+  assert.equal(formatCapsulePct(100), '100%');
+  assert.equal(formatCapsulePct(105.4), '105%');
+  assert.equal(formatCapsulePct(null), '—');
+});
+
+test('C2. capsule counts: separators below 10,000, compact from 10,000', () => {
+  assert.equal(formatCapsuleCount(250), '250');
+  assert.equal(formatCapsuleCount(1440), '1,440');
+  assert.equal(formatCapsuleCount(9999), '9,999');
+  assert.equal(formatCapsuleCount(12400), '12.4k');
+  assert.equal(formatCapsuleCount(15000), '15k');
+  assert.equal(formatCapsuleCount(999_960), '1M');
+  assert.equal(formatCapsuleCount(1_234_000), '1.2M');
+});
+
+test('C3. capsule figures', () => {
+  assert.equal(capsuleFigures({ status: 'running', actual: 1440, planned: 1440 }), '1,440 / 1,440');
+  assert.equal(capsuleFigures({ status: 'running', actual: 12400, planned: 15000 }), '12.4k / 15k');
+  assert.equal(capsuleFigures({ status: 'running', actual: 250, planned: 0 }), '250 / —');
+  assert.equal(capsuleFigures({ status: 'running', actual: 0, planned: 0 }), '— / —');
+  assert.equal(capsuleFigures({ status: 'not_running', actual: 5, planned: 5 }), '— / —');
 });
 
 console.log(`\n${passed} passed`);

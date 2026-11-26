@@ -40,13 +40,12 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { PROD_AI_BUTTON_CLEARANCE } from '../utils/prodAIPanelLayout';
-import Svg, { Circle } from 'react-native-svg';
 import { collection, onSnapshot, query, where, DocumentData } from 'firebase/firestore';
 import { db } from '../services/firebase';
 import AppDrawer from '../components/AppDrawer';
 import { ADMIN_MENU_ITEMS } from '../constants/adminMenu';
 import { QUALITY_MENU_ITEMS } from '../constants/qualityMenu';
-import { LiveSession, RegisteredLine } from '../utils/lineEfficiency';
+import { LiveSession, RegisteredLine, formatCapsuleCount, formatCapsulePct } from '../utils/lineEfficiency';
 import { ALL_DIVISIONS } from '../constants/lineOptions';
 import { FilterChip, OptionPickerModal } from './LineEfficiencyOverviewScreen';
 import {
@@ -110,44 +109,31 @@ function listenIn<T>(
   return () => unsubs.forEach((u) => u());
 }
 
-// ─── Circular progress ring ──────────────────────────────────────────────────
-// Same dimensions as LineEfficiencyOverviewScreen's EfficiencyRing.
+// ─── Quality capsule ─────────────────────────────────────────────────────────
+// Same capsule as LineEfficiencyOverviewScreen's (no tap / expand here):
+// filled left → right by quality % in the quality colour over the dark
+// track, with two centred lines — quality %, then good / inspected parts.
+// No numberOfLines (on web that becomes an ellipsis); the short formats from
+// lineEfficiency.ts keep the text inside.
 
-const RING_SIZE = 72;
-const RING_STROKE = 7;
+const CAPSULE_HEIGHT = 56;
 
-function QualityRing({ card }: { card: QualityCard }) {
-  const r = (RING_SIZE - RING_STROKE) / 2;
-  const circumference = 2 * Math.PI * r;
-  const fill = card.qualityPct != null ? Math.min(1, Math.max(0, card.qualityPct / 100)) : 0;
+function QualityCapsule({ card }: { card: QualityCard }) {
+  const known = card.qualityPct != null;
+  const fill = known ? Math.min(1, Math.max(0, (card.qualityPct as number) / 100)) : 0;
+  const figures =
+    card.goodParts != null && card.inspectedParts != null && card.inspectedParts > 0
+      ? `${formatCapsuleCount(card.goodParts)} / ${formatCapsuleCount(card.inspectedParts)}`
+      : '— / —';
   return (
-    <View style={{ width: RING_SIZE, height: RING_SIZE }}>
-      <Svg width={RING_SIZE} height={RING_SIZE}>
-        <Circle cx={RING_SIZE / 2} cy={RING_SIZE / 2} r={r} stroke="#2C343C" strokeWidth={RING_STROKE} fill="none" />
-        {fill > 0 ? (
-          <Circle
-            cx={RING_SIZE / 2}
-            cy={RING_SIZE / 2}
-            r={r}
-            stroke={card.color}
-            strokeWidth={RING_STROKE}
-            fill="none"
-            strokeLinecap="round"
-            strokeDasharray={`${circumference} ${circumference}`}
-            strokeDashoffset={circumference * (1 - fill)}
-            // Start at 12 o'clock and run clockwise.
-            transform={`rotate(-90 ${RING_SIZE / 2} ${RING_SIZE / 2})`}
-          />
-        ) : null}
-      </Svg>
-      <View style={styles.ringCenter} pointerEvents="none">
-        <Text
-          style={[styles.ringValue, { color: card.qualityPct != null ? card.color : '#8A96A3' }]}
-          numberOfLines={1}
-          adjustsFontSizeToFit
-        >
-          {card.qualityPct != null ? `${card.qualityPct.toFixed(1)}%` : '—'}
-        </Text>
+    <View style={styles.capsule}>
+      {/* Only this track clips (rounded ends on the fill); the text is never clipped. */}
+      <View style={styles.capsuleTrack} pointerEvents="none">
+        {fill > 0 ? <View style={[styles.capsuleFill, { width: `${fill * 100}%`, backgroundColor: card.color }]} /> : null}
+      </View>
+      <View style={styles.capsuleContent} pointerEvents="none">
+        <Text style={[styles.capsulePct, !known && styles.capsuleTextInactive]}>{known ? formatCapsulePct(card.qualityPct) : '—'}</Text>
+        <Text style={[styles.capsuleFigures, !known && styles.capsuleTextInactive]}>{figures}</Text>
       </View>
     </View>
   );
@@ -186,7 +172,7 @@ function QualityTile({ card, width }: { card: QualityCard; width: string }) {
           card.qualityPct != null ? `${card.qualityPct.toFixed(1)} percent` : 'unavailable'
         }, ${QUALITY_LABELS[card.status]}. ${rejectedText}. ${rejectionText}. ${runText}.`}
       >
-        <QualityRing card={card} />
+        <QualityCapsule card={card} />
         <Text style={styles.tileName} numberOfLines={2}>
           {card.lineName}
         </Text>
@@ -402,8 +388,9 @@ export default function LiveQualityLinesScreen({ role }: { role: 'admin' | 'qual
   const summary = useMemo(() => summarizeQuality(visibleCards), [visibleCards]);
 
   // ── Responsive grid — LineEfficiencyOverviewScreen's breakpoints.
-  const columns =
-    width >= 1200 ? 9 : width >= 900 ? 7 : width >= 700 ? 6 : width >= 520 ? 5 : width >= 380 ? 4 : 3;
+  // Phones: 2 columns under 400 px, 3 up to tablet width (so the capsule
+  // text fits); tablets and up keep their counts.
+  const columns = width >= 1200 ? 9 : width >= 900 ? 7 : width >= 700 ? 6 : width >= 400 ? 3 : 2;
   const tileWidth = `${100 / columns}%`;
 
   const initialLoading = !linesLoaded || !sessionsLoaded;
@@ -690,17 +677,50 @@ const styles = StyleSheet.create({
   grid: { flexDirection: 'row', flexWrap: 'wrap', marginHorizontal: -5 },
   cell: { paddingHorizontal: 5, paddingVertical: 10 },
   tile: { flex: 1, alignItems: 'center', gap: 7 },
-  ringCenter: {
+  // Capsule — same look as the Lines page's.
+  capsule: {
+    width: '100%',
+    height: CAPSULE_HEIGHT,
+    borderRadius: CAPSULE_HEIGHT / 2,
+    justifyContent: 'center',
+  },
+  capsuleTrack: {
     position: 'absolute',
     top: 0,
-    left: 0,
     right: 0,
     bottom: 0,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: RING_STROKE + 3,
+    left: 0,
+    borderRadius: CAPSULE_HEIGHT / 2,
+    backgroundColor: '#2C343C',
+    overflow: 'hidden',
   },
-  ringValue: { fontSize: 13.5, fontWeight: '900' },
+  capsuleFill: { position: 'absolute', left: 0, top: 0, bottom: 0 },
+  capsuleContent: { alignItems: 'center', justifyContent: 'center', paddingHorizontal: 8, paddingVertical: 6 },
+  capsulePct: {
+    flexShrink: 0,
+    textAlign: 'center',
+    color: '#FFFFFF',
+    fontSize: 16,
+    lineHeight: 20,
+    fontWeight: '900',
+    fontVariant: ['tabular-nums'],
+    textShadowColor: 'rgba(0,0,0,0.35)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 2,
+  },
+  capsuleFigures: {
+    flexShrink: 0,
+    textAlign: 'center',
+    color: 'rgba(255,255,255,0.85)',
+    fontSize: 12,
+    lineHeight: 16,
+    fontWeight: '700',
+    fontVariant: ['tabular-nums'],
+    textShadowColor: 'rgba(0,0,0,0.35)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 2,
+  },
+  capsuleTextInactive: { color: '#8A96A3' },
   tileName: { color: '#ECEFF2', fontSize: 12, fontWeight: '800', textAlign: 'center', width: '100%' },
   figures: { alignItems: 'center', width: '100%', marginTop: -3 },
   figuresValue: { color: '#C3CBD3', fontSize: 11, fontWeight: '700', fontVariant: ['tabular-nums'] },
